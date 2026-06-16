@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""pod-adapter — the single point of access to the agent catalog (adapters/*.toml).
+
+Every other script that needs to know "how do I launch agent X", "which agent is in
+this pane", "what's the pretty card for X", or "what models/efforts does X have" calls
+THIS tool instead of parsing TOML itself. That keeps the catalog format in one place
+and lets a user drop a new adapter file in ~/.config/pod/adapters/ without editing code.
+
+Adapters load from $POD_ADAPTERS_DIR (repo defaults) then $POD_USER_ADAPTERS (user
+overrides); same `[agent].id` -> the user file wins. Requires Python 3.11+ (tomllib).
+
+Subcommands:
+  list [--available]            ids, one per line (--available = base_cmd resolves on PATH)
+  detect <pane_cmd> [content]   id of the adapter that claims this pane (priority order)
+  launch <id> [--model S] [--effort S]   the launch command (space-joined argv tokens)
+  card <id> [--model S] [--effort S] [--suffix S]   "Label · Model · effort · suffix"
+  models <id>                   "slug\tlabel" per model (LIVE if the adapter has a
+                                [discover] block; static [[models]] otherwise)
+  efforts <id> <model_slug>     "slug\tlabel" per effort
+  refresh [id]                  re-query live discovery, busting the cache
+  field <id> <key>              one scalar from [agent]/[launch]/[lifecycle]/[defaults]
+  dump [--json]                 the whole resolved catalog (debug)
+
+Exit 0 on a clean answer; non-zero (no output) when the id/field is unknown, so callers
+can `x="$(pod-adapter ... )" || fallback`.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import signal
+import shutil
+import subprocess
+import sys
+import time
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    sys.stderr.write("pod-adapter: needs Python 3.11+ (tomllib). Found %s\n" % sys.version.split()[0])
+    sys.exit(3)
+
+
+def _repo_root():
+    # env wins (set by _pod-paths.sh); else resolve relative to this file (bin/..).
+    r = os.environ.get("POD_REPO")
+    if r:
+        return r
+    return os.path.dirname(os.path.dirname(os.path.abspath(os.path.realpath(__file__))))
+
+
+def _adapter_dirs():
+    root = _repo_root()
+    repo = os.environ.get("POD_ADAPTERS_DIR") or os.path.join(root, "adapters")
+    user = os.environ.get("POD_USER_ADAPTERS") or os.path.join(
+        os.environ.get("POD_CONFIG_DIR", os.path.expanduser("~/.config/pod")), "adapters"
+    )
+    return repo, user
+
+
+def load_adapters():
+    """id -> adapter dict. Repo first, user dir overrides by id."""
+    repo, user = _adapter_dirs()
+    out = {}
+    for d in (repo, user):
+        if not d or not os.path.isdir(d):
+            continue
+        for path in sorted(glob.glob(os.path.join(d, "*.toml"))):
+            if os.path.basename(path).startswith("_"):   # _schema.toml etc. are docs
+                continue
+            try:
+                with open(path, "rb") as f:
+                    data = tomllib.load(f)
+            except Exception as e:
+                sys.stderr.write("pod-adapter: skipping %s (%s)\n" % (path, e))
+                continue
+            ag = data.get("agent", {})
+            aid = ag.get("id")
+            if not aid:
+                continue
+            data["_path"] = path
+            data["_id"] = aid
+            out[aid] = data
+    return out
+
+
+# ---------------------------------------------------------------------------------
+# Live model discovery. An adapter may carry an optional [discover] block that names
+# a command which lists the agent's CURRENTLY served models (e.g. cursor-agent
+# --list-models, or `ollama list` for an openclaw/ollama backend). When present and
+# the command succeeds, its output REPLACES the static [[models]] list — so the "+"
+# picker always shows what the device actually serves, not a hand-maintained list
+# that drifts. Agents whose CLI exposes no enumeration (claude-code, codex) simply
+# omit [discover] and keep their curated [[models]]; that static list is also the
+# fallback whenever a discovery command times out, errors, or returns nothing.
+#
+# Only the models VARY across releases and machines, so only they are discovered.
+# Effort ladders are a stable per-agent vocabulary that no CLI enumerates, so they
+# stay declarative: [discover].efforts is applied to every discovered model (and a
+# static [[models]] entry with a matching slug can override label/efforts).
+#
+# Results are cached under $POD_STATE/discover/<id>.json with a TTL, so the gear
+# menu stays snappy; `pod-adapter refresh [id]` busts the cache and re-queries.
+
+def _state_dir():
+    return os.environ.get("POD_STATE") or os.path.join(
+        os.environ.get("POD_TMP", "/tmp/pod"), "state")
+
+
+def _discover_cache_path(aid):
+    return os.path.join(_state_dir(), "discover", "%s.json" % aid)
+
+
+def _run_discovery(disc):
+    """Run the adapter's discovery command and parse its model list.
+
+    Returns [{slug, label, model}, ...] or None on any failure (so callers fall
+    back to the static [[models]]). The command runs via the shell, so a user can
+    point it at a remote backend ("ssh gpu-box ollama list") in their adapter.
+    """
+    cmd = disc.get("models_cmd")
+    if not cmd:
+        return None
+    # default regex: "<id>" optionally followed by " - <label>"
+    regex = disc.get("models_regex") or r"^(\S+)(?:\s+-\s+(.+))?$"
+    try:
+        pat = re.compile(regex)
+    except re.error:
+        return None
+    # Prepend POD_BIN to PATH so a models_cmd can call sibling helpers (e.g.
+    # "pod-discover-api anthropic") even before bin/ is symlinked onto the user's PATH.
+    env = dict(os.environ)
+    podbin = os.environ.get("POD_BIN") or os.path.dirname(os.path.abspath(__file__))
+    env["PATH"] = podbin + os.pathsep + env.get("PATH", "")
+    try:
+        timeout = float(disc.get("timeout_s", 6))
+        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, env=env,
+                             start_new_session=True)
+        try:
+            stdout, stderr = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Killing only the shell leaves its child holding stdout/stderr open,
+            # which makes communicate() wait forever. Kill the whole discovery
+            # process group so a wedged CLI cannot freeze the picker.
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except (OSError, AttributeError):
+                p.kill()
+            p.communicate()
+            return None
+        r = subprocess.CompletedProcess(cmd, p.returncode, stdout, stderr)
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+    if r.returncode != 0:
+        return None
+    out, seen = [], set()
+    for line in r.stdout.splitlines():
+        m = pat.search(line)
+        if not m:
+            continue                       # header / blank / noise lines just skip
+        mid = (m.group(1) or "").strip()
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        label = mid
+        if m.lastindex and m.lastindex >= 2 and m.group(2):
+            label = m.group(2).strip()
+        out.append({"slug": mid, "label": label, "model": mid})
+    return out or None
+
+
+def _cached_discovery(aid, disc):
+    path = _discover_cache_path(aid)
+    try:
+        age = time.time() - os.stat(path).st_mtime
+        if age < float(disc.get("ttl_s", 21600)):
+            with open(path) as f:
+                return json.load(f).get("models") or None
+    except (OSError, ValueError):
+        pass
+    models = _run_discovery(disc)
+    if models:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                json.dump({"ts": int(time.time()), "models": models}, f)
+        except OSError:
+            pass
+    return models
+
+
+def _merge_discovered(discovered, static, disc):
+    """Discovered models are the spine; a static entry with the same slug lends its
+    prettier label and its effort ladder. Otherwise the [discover].efforts default."""
+    by_slug = {m.get("slug"): m for m in (static or [])}
+    default_efforts = disc.get("efforts", []) or []
+    out = []
+    for d in discovered:
+        s = by_slug.get(d["slug"]) or {}
+        out.append({
+            "slug": d["slug"],
+            "model": d["model"],
+            "label": s.get("label") or d["label"],
+            "efforts": s.get("efforts") or default_efforts,
+        })
+    return out
+
+
+def models_of(adapter):
+    """The effective model list: live (cached) when [discover] is set and works,
+    static otherwise. Memoized on the adapter dict so a single invocation queries
+    at most once."""
+    if "_models" in adapter:
+        return adapter["_models"]
+    static = adapter.get("models", []) or []
+    disc = adapter.get("discover") or {}
+    resolved = static
+    if disc.get("models_cmd"):
+        discovered = _cached_discovery(adapter.get("_id", ""), disc)
+        if discovered:
+            resolved = _merge_discovered(discovered, static, disc)
+    adapter["_models"] = resolved
+    return resolved
+
+
+def _model(adapter, slug):
+    for m in models_of(adapter):
+        if m.get("slug") == slug:
+            return m
+    # tolerant: match by the substituted model value too (e.g. "claude-opus-4-8")
+    for m in models_of(adapter):
+        if slug and m.get("model") == slug:
+            return m
+    return None
+
+
+def _effort(model, slug):
+    for e in (model.get("efforts", []) or []) if model else []:
+        if e.get("slug") == slug:
+            return e
+    return None
+
+
+def cmd_list(adapters, args):
+    for aid in sorted(adapters, key=lambda i: adapters[i].get("agent", {}).get("priority", 1000)):
+        if args.available:
+            base = adapters[aid].get("launch", {}).get("base_cmd", "")
+            # generic-shell's base is a shell expansion ("${SHELL:-...}") — always available.
+            if not base or base.startswith("$") or shutil.which(_first_word(base)):
+                print(aid)
+        else:
+            print(aid)
+
+
+def _first_word(s):
+    return s.split()[0] if s else s
+
+
+def cmd_detect(adapters, args):
+    pane_cmd = args.pane_cmd or ""
+    content = args.content or ""
+    order = sorted(adapters, key=lambda i: adapters[i].get("agent", {}).get("priority", 1000))
+
+    def det(aid):
+        return adapters[aid].get("detect", {})
+
+    def rejected(aid):
+        return bool(content) and any(re.search(p, content) for p in (det(aid).get("reject_content", []) or []))
+
+    def cmd_pats(aid):
+        # the catch-all '.*' is handled only in the final phase, never as a "specific" match.
+        return [p for p in (det(aid).get("pane_cmd_patterns", []) or []) if p != ".*"]
+
+    def con_pats(aid):
+        return det(aid).get("content_patterns", []) or []
+
+    # 4-phase, so the right agent wins and CLAUDE is never mis-ID'd by transcript text:
+    #  1. specific pane_cmd of agents identified PURELY by pane_cmd (claude's version
+    #     string, a unique binary name) — highest confidence; checked before any content
+    #     so a claude window whose transcript merely mentions "codex" stays claude.
+    #  2. content patterns — disambiguates the node/python TUIs (codex vs cursor vs ...).
+    #  3. specific pane_cmd of agents that ALSO have content patterns — weak fallback
+    #     (a bare "node" with no identifying content -> the highest-priority node agent).
+    #  4. the catch-all ('.*' -> generic-shell): any pane is a first-class podmate.
+    for aid in order:
+        if rejected(aid):
+            continue
+        if not con_pats(aid) and cmd_pats(aid) and any(re.search(p, pane_cmd) for p in cmd_pats(aid)):
+            print(aid); return
+    for aid in order:
+        if rejected(aid):
+            continue
+        if content and con_pats(aid) and any(re.search(p, content) for p in con_pats(aid)):
+            print(aid); return
+    for aid in order:
+        if rejected(aid):
+            continue
+        if cmd_pats(aid) and any(re.search(p, pane_cmd) for p in cmd_pats(aid)):
+            print(aid); return
+    for aid in order:
+        if ".*" in (det(aid).get("pane_cmd_patterns", []) or []):
+            print(aid); return
+    sys.exit(1)
+
+
+def cmd_launch(adapters, args):
+    a = adapters.get(args.id)
+    if not a:
+        sys.exit(1)
+    launch = a.get("launch", {})
+    tokens = [launch.get("base_cmd", "")]
+    m = _model(a, args.model) if args.model else None
+    if m and m.get("model"):
+        for t in launch.get("model_arg", []) or []:
+            tokens.append(t.replace("{model}", m["model"]))
+    e = _effort(m, args.effort) if (m and args.effort) else None
+    if e and e.get("value"):
+        for t in launch.get("effort_arg", []) or []:
+            tokens.append(t.replace("{effort}", e["value"]))
+    print(" ".join(t for t in tokens if t))
+
+
+def cmd_card(adapters, args):
+    a = adapters.get(args.id)
+    label = (a.get("agent", {}).get("label") if a else None) or args.id
+    model_label = ""
+    effort_label = ""
+    if a:
+        m = _model(a, args.model) if args.model else None
+        if m:
+            model_label = m.get("label", args.model or "")
+            e = _effort(m, args.effort) if args.effort else None
+            if e:
+                effort_label = e.get("label", args.effort or "")
+            elif args.effort:
+                effort_label = args.effort
+        elif args.model:
+            model_label = args.model
+    else:
+        model_label = args.model or ""
+        effort_label = args.effort or ""
+    parts = [label, model_label, effort_label, args.suffix]
+    print(" · ".join(x for x in parts if x))
+
+
+def cmd_models(adapters, args):
+    a = adapters.get(args.id)
+    if not a:
+        sys.exit(1)
+    for m in models_of(a):
+        print("%s\t%s" % (m.get("slug", ""), m.get("label", "")))
+
+
+def cmd_refresh(adapters, args):
+    """Bust the discovery cache and re-query. With no id, refreshes every adapter
+    that has a [discover] block. Prints "<id>\\t<n> models" per refreshed agent."""
+    ids = [args.id] if args.id else list(adapters)
+    any_disc = False
+    for aid in ids:
+        a = adapters.get(aid)
+        if not a:
+            continue
+        disc = a.get("discover") or {}
+        if not disc.get("models_cmd"):
+            continue
+        any_disc = True
+        try:
+            os.remove(_discover_cache_path(aid))
+        except OSError:
+            pass
+        models = _run_discovery(disc)
+        if models:
+            path = _discover_cache_path(aid)
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as f:
+                    json.dump({"ts": int(time.time()), "models": models}, f)
+            except OSError:
+                pass
+            print("%s\t%d models" % (aid, len(models)))
+        else:
+            sys.stderr.write("%s: discovery returned nothing; static fallback in use\n" % aid)
+    if not any_disc:
+        sys.stderr.write("pod-adapter refresh: no adapter with a [discover] block%s\n"
+                         % ("" if not args.id else " for '%s'" % args.id))
+
+
+def cmd_efforts(adapters, args):
+    a = adapters.get(args.id)
+    if not a:
+        sys.exit(1)
+    m = _model(a, args.model)
+    if not m:
+        sys.exit(1)
+    for e in m.get("efforts", []) or []:
+        print("%s\t%s" % (e.get("slug", ""), e.get("label", "")))
+
+
+def cmd_field(adapters, args):
+    a = adapters.get(args.id)
+    if not a:
+        sys.exit(1)
+    for section in ("agent", "launch", "lifecycle", "defaults", "discover"):
+        if args.key in a.get(section, {}):
+            v = a[section][args.key]
+            if isinstance(v, bool):
+                print("true" if v else "false")
+            elif isinstance(v, list):
+                print(" ".join(str(x) for x in v))
+            else:
+                print(v)
+            return
+    sys.exit(1)
+
+
+def cmd_dump(adapters, args):
+    import json
+    print(json.dumps(adapters, indent=2, default=str))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="pod-adapter")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("list"); s.add_argument("--available", action="store_true")
+    s = sub.add_parser("detect"); s.add_argument("pane_cmd"); s.add_argument("content", nargs="?", default="")
+    s = sub.add_parser("launch"); s.add_argument("id"); s.add_argument("--model", default=""); s.add_argument("--effort", default="")
+    s = sub.add_parser("card"); s.add_argument("id"); s.add_argument("--model", default=""); s.add_argument("--effort", default=""); s.add_argument("--suffix", default="")
+    s = sub.add_parser("models"); s.add_argument("id")
+    s = sub.add_parser("efforts"); s.add_argument("id"); s.add_argument("model")
+    s = sub.add_parser("refresh"); s.add_argument("id", nargs="?", default="")
+    s = sub.add_parser("field"); s.add_argument("id"); s.add_argument("key")
+    s = sub.add_parser("dump"); s.add_argument("--json", action="store_true")
+
+    args = p.parse_args()
+    adapters = load_adapters()
+    {
+        "list": cmd_list, "detect": cmd_detect, "launch": cmd_launch, "card": cmd_card,
+        "models": cmd_models, "efforts": cmd_efforts, "field": cmd_field, "dump": cmd_dump,
+        "refresh": cmd_refresh,
+    }[args.cmd](adapters, args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# pod-mail-gc [<closed-pod-name>] — delete pod-comms state for pods that are no
+# longer live, so a pod's chat (the summary-pane feed) dies WITH the pod and a fresh
+# pod never inherits a dead one's history.
+#
+#   pod-mail-gc <name>   remove $POD_COMMS/<name> outright (the session-closed
+#                        hook path; <name> = #{hook_session_name} of the closed pod).
+#   pod-mail-gc          SWEEP: remove every $POD_COMMS/<pod> whose <pod> is not
+#                        a currently-live tmux session, plus the legacy flat
+#                        channel.log (the pre-namespace global bleed file). Run on
+#                        every pod launch as the crash/kill-server backstop.
+#
+# Hard guards: never touches $POD_COMMS itself, an empty name, '.'/'..', or a dir
+# whose name is a LIVE session. bash 3.2 safe.
+set -u
+
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"; . "$POD_BIN/_pod-common.sh"
+T="$POD_TMUX"
+
+# Sanitized names of every LIVE tmux session. We compare a dir against THESE rather
+# than calling has-session on an already-sanitized dir name: a session whose real
+# name contains a char pod_sanitize maps to '_' (e.g. a space — tmux allows it) would
+# make has-session on the sanitized form return false, and the sweep would rm -rf the
+# LIVE pod's comms dir. Sanitizing both sides makes the match correct.
+LIVE="$("$T" list-sessions -F '#{session_name}' 2>/dev/null | while IFS= read -r s; do pod_sanitize "$s"; printf '\n'; done)"
+
+remove_pod() {
+  name="$(pod_sanitize "${1:-}")"
+  case "$name" in ""|.|..) return 0 ;; esac
+  printf '%s\n' "$LIVE" | grep -Fxq -- "$name" && return 0   # never wipe a live pod
+  dir="$(pod_dir_for "$name")"
+  case "$dir" in "$POD_COMMS"|"$POD_COMMS/"|/|"") return 0 ;; esac   # paranoia
+  [ -d "$dir" ] && rm -rf "$dir"
+  return 0
+}
+
+[ -d "$POD_COMMS" ] || exit 0
+
+if [ -n "${1:-}" ]; then
+  remove_pod "$1"                       # targeted: a pod just closed
+else
+  for d in "$POD_COMMS"/*/; do          # sweep: every dead pod's subtree
+    [ -d "$d" ] || continue
+    remove_pod "$(basename "$d")"
+  done
+  # legacy pre-namespace global bleed file (display log only, no unread state)
+  [ -f "$POD_COMMS/channel.log" ] && rm -f "$POD_COMMS/channel.log"
+fi
+exit 0

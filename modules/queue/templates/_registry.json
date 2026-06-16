@@ -1,0 +1,42 @@
+{
+  "audit": {
+    "description": "Read-only audit — scan a scope, categorize findings, return structured JSON. Use proactively when the task is 'find X across files' and no writes are needed. Lower context tax than running the same search inline.",
+    "permission_mode": "plan",
+    "max_turns": 40,
+    "background": false,
+    "proactive": true,
+    "body_file": "audit.tpl.txt",
+    "required_vars": ["context", "scope", "categories", "output_schema"],
+    "optional_vars": ["constraints", "task_body"]
+  },
+  "execute": {
+    "description": "Apply a previously-audited set of changes. Worker has write access but is constrained to a declared scope. Use when an audit produced a punch list and you want to delegate the mechanical application.",
+    "permission_mode": "acceptEdits",
+    "max_turns": 80,
+    "background": false,
+    "proactive": false,
+    "body_file": "execute.tpl.txt",
+    "required_vars": ["context", "scope", "task_body", "output_schema"],
+    "optional_vars": ["constraints", "rollback_plan"]
+  },
+  "investigate": {
+    "description": "Read-only research + recommendation. Worker investigates a question (codebase / external / both) and returns a recommendation with reasoning. Use for 'should we / why does / where is' questions that need deeper exploration than a single grep.",
+    "permission_mode": "plan",
+    "max_turns": 60,
+    "background": false,
+    "proactive": true,
+    "body_file": "investigate.tpl.txt",
+    "required_vars": ["context", "question", "output_schema"],
+    "optional_vars": ["scope_hint", "constraints"]
+  },
+  "plan": {
+    "description": "Produce a manifest + script + checklist for a change. No execution — the output is the plan, not the diff. Use when the change is large enough to want review before action.",
+    "permission_mode": "plan",
+    "max_turns": 60,
+    "background": false,
+    "proactive": false,
+    "body_file": "plan.tpl.txt",
+    "required_vars": ["context", "objective", "output_schema"],
+    "optional_vars": ["constraints", "scope_hint"]
+  }
+}

@@ -1,0 +1,31 @@
+You are a pod worker. Planning task — produce a manifest + execution script + verification checklist. No execution.
+
+CONTEXT:
+{{context}}
+
+OBJECTIVE:
+{{objective}}
+
+SCOPE HINT:
+{{scope_hint}}
+
+CONSTRAINTS:
+- Read-only. No Write/Edit. No git commits. No execution of the plan you produce.
+- The output IS the plan — the manager reviews it before any execute-worker is dispatched.
+{{constraints}}
+
+PLAN SHAPE:
+1. Manifest — every file/path/system that will change, with current state vs. target state.
+2. Execution script — shell or Python that applies the manifest (do NOT run it).
+3. Verification checklist — assertions the manager can run after execution to confirm success.
+4. Rollback — how to undo if step 2 fails midway.
+5. Risk assessment — what could break that isn't in the manifest.
+
+COMPLETION PROTOCOL:
+- Write your structured result to your task directory: $POD_INBOX/{{task_id}}/result.json (default $POD_INBOX is /tmp/pod/inbox) with this shape:
+{{output_schema}}
+- Embed the full execution script as a string in the JSON (don't write it to a separate file).
+- As your ABSOLUTE LAST action: `touch $POD_INBOX/{{task_id}}/DONE`.
+- If blocked or partial, write status accordingly and STILL touch DONE.
+
+Begin.

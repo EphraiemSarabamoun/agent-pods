@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# mgr-dispatch — fire a queued task at a tmux worker window.
+#
+# The worker is driven by `tmux send-keys` to its exact window: type the trigger
+# literally, then submit with Enter. (This is a tmux-only deck — there is no
+# GUI-terminal dispatch path.)
+#
+# Usage:
+#   mgr-dispatch [--task <id>] [--tmux-window <@id>] [--print-only]
+#
+# Defaults:
+#   --task   = highest-priority unblocked queued task (lex-first queue file)
+#   worker   = first idle worker in $POD_STATE/workers.json
+#
+# Side effects on success: marks the worker busy, archives the queue file to
+# $POD_STATE/dispatched/, appends a dispatch event to $POD_STATE/log.jsonl.
+
+set -euo pipefail
+POD_BIN="$(cd "$(dirname "$0")/../../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+T="$POD_TMUX"
+
+INBOX_ROOT="$POD_INBOX"
+QUEUE_DIR="$POD_INBOX/_queue"
+WORKERS_PATH="$POD_STATE/workers.json"
+LOG_PATH="$POD_STATE/log.jsonl"
+DISPATCHED="$POD_STATE/dispatched"
+GROUP_PATH="$POD_STATE/tmux_group.json"
+
+# The trigger message a worker reads after dispatch (points it at its staged prompt).
+TRIGGER_TPL="Read $POD_INBOX/{{task_id}}/prompt.txt and execute the task it describes end-to-end. Write result.json, touch DONE as your last action."
+
+# manager window (so we never dispatch into the manager seat) — from group state.
+MGR_WIN="$(jq -r '.manager_window // empty' "$GROUP_PATH" 2>/dev/null || true)"
+
+TASK_ID=""; TMUX_WINDOW=""; PRINT_ONLY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --task)        TASK_ID="$2"; shift 2 ;;
+    --tmux-window) TMUX_WINDOW="$2"; shift 2 ;;
+    --print-only)  PRINT_ONLY=1; shift ;;
+    *) echo "ERROR: unrecognized arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+# Resolve task: explicit --task wins; otherwise pop the lex-first queue entry.
+QUEUE_FILE=""
+if [ -n "$TASK_ID" ]; then
+  QUEUE_FILE=$(find "$QUEUE_DIR" -maxdepth 1 -name "*-${TASK_ID}.json" 2>/dev/null | head -1)
+  [ -n "$QUEUE_FILE" ] || { echo "ERROR: ${TASK_ID} not in queue (looked in ${QUEUE_DIR})" >&2; exit 1; }
+else
+  QUEUE_FILE=$(ls "$QUEUE_DIR" 2>/dev/null | sort | head -1)
+  [ -n "$QUEUE_FILE" ] || { echo "queue empty — nothing to dispatch" >&2; exit 0; }
+  QUEUE_FILE="${QUEUE_DIR}/${QUEUE_FILE}"
+  TASK_ID=$(jq -r .task_id "$QUEUE_FILE")
+fi
+
+PROMPT_PATH="${INBOX_ROOT}/${TASK_ID}/prompt.txt"
+[ -f "$PROMPT_PATH" ] || { echo "ERROR: ${PROMPT_PATH} missing — task staged but prompt vanished" >&2; exit 1; }
+
+# Resolve worker record: explicit --tmux-window wins; else first idle.
+REC=""
+if [ -n "$TMUX_WINDOW" ]; then
+  REC=$(jq -c --arg tw "$TMUX_WINDOW" 'first(.workers[] | select(.tmux_window==$tw))' "$WORKERS_PATH")
+else
+  REC=$(jq -c '[.workers[] | select(.status=="idle")] | sort_by(.registered_at) | .[0] // empty' "$WORKERS_PATH")
+fi
+[ -n "$REC" ] && [ "$REC" != "null" ] || { echo "no matching/idle worker — register one or pass --tmux-window" >&2; exit 1; }
+
+R_TMUX_WIN=$(echo "$REC" | jq -r '.tmux_window // empty')
+[ -n "$R_TMUX_WIN" ] || { echo "ERROR: worker record has no tmux_window" >&2; exit 1; }
+
+TRIGGER="${TRIGGER_TPL//\{\{task_id\}\}/$TASK_ID}"
+
+echo "==> Dispatching ${TASK_ID} to ${R_TMUX_WIN}"
+echo "    prompt: ${PROMPT_PATH}"
+
+# Never dispatch into the manager seat.
+if [ -n "$MGR_WIN" ] && [ "$R_TMUX_WIN" = "$MGR_WIN" ]; then
+  echo "ERROR: refusing to dispatch into the manager window (${MGR_WIN})" >&2; exit 1
+fi
+if [ "$PRINT_ONLY" -eq 1 ]; then
+  echo "    [print-only] ${T} send-keys -t ${R_TMUX_WIN} -l \"${TRIGGER}\" ; send-keys -t ${R_TMUX_WIN} Enter"
+  exit 0
+fi
+# type the trigger literally, then submit with Enter. The gap lets the REPL
+# register the text before the submit so Enter can't race ahead of it (a race
+# that was observed historically — hence the guard). Measured against a live
+# agent TUI: submit was 8/8 reliable at gaps of 0, 0.05, and 0.1, so 0.5 was
+# overly conservative. 0.1 keeps a 2x margin over the smallest tested gap while
+# being imperceptible. Do NOT drop to 0 — that removes the margin the race
+# guard exists for.
+"$T" send-keys -t "$R_TMUX_WIN" -l "$TRIGGER"
+sleep 0.1
+"$T" send-keys -t "$R_TMUX_WIN" Enter
+
+# Mark the worker busy — match on its tmux_window handle.
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+TMP=$(mktemp)
+jq --arg tw "$R_TMUX_WIN" --arg tid "$TASK_ID" --arg now "$NOW" '
+  .workers |= map(
+    if (.tmux_window == $tw)
+    then .status = "busy" | .current_task_id = $tid | .started_at = $now
+    else . end)
+' "$WORKERS_PATH" > "$TMP" && mv "$TMP" "$WORKERS_PATH"
+
+# Archive queue file + log the dispatch.
+mkdir -p "$DISPATCHED"
+mv "$QUEUE_FILE" "${DISPATCHED}/${TASK_ID}.json"
+jq -nc --arg ts "$NOW" --arg tid "$TASK_ID" --arg tgt "$R_TMUX_WIN" --arg mode "tmux" \
+  '{ts: $ts, event: "dispatched", task_id: $tid, target: $tgt, mode: $mode}' \
+  >> "$LOG_PATH"
+
+echo "==> Dispatched. Worker is now busy."

@@ -1,0 +1,46 @@
+# Cursor Agent (Cursor's headless CLI). Poll agent, no hooks. Paid accounts expose
+# named models through live discovery below; free accounts may still be restricted
+# to `auto`. The static model entry is only the offline/not-logged-in fallback.
+[agent]
+id       = "cursor"
+label    = "Cursor Agent"
+priority = 30
+
+[launch]
+base_cmd   = "cursor-agent"
+model_arg  = ["--model", "{model}"]
+effort_arg = []
+
+[detect]
+pane_cmd_patterns = ['^(cursor-agent|node)$']
+content_patterns  = ['(?i)cursor']
+reject_content    = []
+
+[defaults]
+model             = "auto"
+effort            = ""
+card_scrape_regex = ''
+
+[lifecycle]
+mode            = "poll"
+installer       = ""
+native_delivery = false
+state_source    = "poll"
+
+# Live discovery: ask cursor-agent itself what it serves. Output lines look like
+# "gpt-5.3-codex-high - Codex 5.3 High" and "auto - Auto (current)"; the regex takes
+# the slug (group 1) and the pretty label (group 2), dropping the "Available models"
+# header and the trailing "(current)" marker. Cursor encodes reasoning effort INTO
+# the model slug (…-low / …-high / …-xhigh), so there is no separate effort axis.
+[discover]
+models_cmd   = "cursor-agent --list-models"
+models_regex = '^(\S+)\s+-\s+(.+?)(?:\s+\(current\))?$'
+timeout_s    = 30
+efforts      = []
+
+# Fallback only — used verbatim if discovery fails (offline, not logged in, etc.).
+[[models]]
+slug  = "auto"
+label = "Auto"
+model = "auto"
+efforts = []

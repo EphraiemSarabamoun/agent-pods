@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# pod-discover-api <anthropic|openai> — print "<model-id> - <label>" lines for the
+# models the caller's credentials can reach, by calling the provider's REST
+# /v1/models endpoint. Used as a [discover].models_cmd so the "+" picker can show
+# the user's LIVE Claude / Codex models instead of a hand-maintained list.
+#
+# Credential resolution (first hit wins). This deliberately REUSES a login the CLI
+# already has when that login is an API key, before asking for anything new:
+#   anthropic: $ANTHROPIC_API_KEY
+#              -> ~/.config/pod/keys/anthropic        (captured by `pod-login`)
+#              -> a Claude Code stored key IF it's an sk-ant-api… (API login)
+#   openai:    $OPENAI_API_KEY
+#              -> ~/.config/pod/keys/openai           (captured by `pod-login`)
+#              -> ~/.codex/auth.json .OPENAI_API_KEY  (present on api-key codex logins)
+#
+# IMPORTANT: subscription (OAuth) logins — Claude Max, ChatGPT — store a short-lived
+# OAuth token that does NOT authenticate against /v1/models (it 401s). So for a pure
+# subscription user this script exits non-zero and the adapter falls back to its
+# curated [[models]]. `pod-login <agent>` walks them through adding an API key.
+#
+# Keys are handed to curl via a stdin config (-K -), never on the argv, so they don't
+# leak into `ps`. Requires curl + jq (both already hard deps of agent-pods).
+set -u
+
+prov="${1:-}"
+keydir="${POD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/pod}/keys"
+
+_read_keyfile() { [ -f "$1" ] && tr -d ' \t\r\n' < "$1"; }
+
+resolve_key() {
+  case "$1" in
+    anthropic)
+      [ -n "${ANTHROPIC_API_KEY:-}" ] && { printf '%s' "$ANTHROPIC_API_KEY"; return 0; }
+      local k; k="$(_read_keyfile "$keydir/anthropic")"
+      [ -n "$k" ] && { printf '%s' "$k"; return 0; }
+      # Claude Code's own store, but ONLY if it logged in with an API key (sk-ant-api…),
+      # never the sk-ant-oat… OAuth token (which can't list models).
+      local raw; raw="$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null \
+                        || cat "$HOME/.claude/.credentials.json" 2>/dev/null)"
+      k="$(printf '%s' "$raw" | jq -r '[.. | strings] | map(select(startswith("sk-ant-api"))) | .[0] // empty' 2>/dev/null)"
+      [ -n "$k" ] && { printf '%s' "$k"; return 0; }
+      ;;
+    openai)
+      [ -n "${OPENAI_API_KEY:-}" ] && { printf '%s' "$OPENAI_API_KEY"; return 0; }
+      local k; k="$(_read_keyfile "$keydir/openai")"
+      [ -n "$k" ] && { printf '%s' "$k"; return 0; }
+      k="$(jq -r '.OPENAI_API_KEY // empty' "$HOME/.codex/auth.json" 2>/dev/null)"
+      case "$k" in sk-*) printf '%s' "$k"; return 0 ;; esac
+      ;;
+  esac
+  return 1
+}
+
+[ -n "$prov" ] || { echo "usage: pod-discover-api <anthropic|openai>" >&2; exit 64; }
+
+key="$(resolve_key "$prov")" || true
+if [ -z "${key:-}" ]; then
+  echo "pod-discover-api: no $prov API key found — run 'pod-login' to add one (a subscription login can't list models)." >&2
+  exit 2
+fi
+
+case "$prov" in
+  anthropic)
+    body="$(printf 'header = "x-api-key: %s"\nheader = "anthropic-version: 2023-06-01"\n' "$key" \
+            | curl -fsS -K - "https://api.anthropic.com/v1/models?limit=1000" 2>/dev/null)" \
+      || { echo "pod-discover-api: anthropic /v1/models call failed (bad/expired key, or offline)." >&2; exit 3; }
+    # API already returns newest-first; id + human display_name.
+    printf '%s' "$body" | jq -r '.data[]? | "\(.id) - \(.display_name)"'
+    ;;
+  openai)
+    body="$(printf 'header = "Authorization: Bearer %s"\n' "$key" \
+            | curl -fsS -K - "https://api.openai.com/v1/models" 2>/dev/null)" \
+      || { echo "pod-discover-api: openai /v1/models call failed (bad key, or offline)." >&2; exit 3; }
+    # /v1/models also lists embeddings/tts/whisper/image models — keep only the
+    # chat/reasoning/codex families a coding agent would actually run. No display
+    # names on this endpoint, so the id doubles as the label.
+    printf '%s' "$body" | jq -r '.data[]?.id | select(test("gpt|codex|^o[0-9]"))' \
+      | sort -r | sed 's/.*/& - &/'
+    ;;
+  *)
+    echo "pod-discover-api: unknown provider '$prov' (use anthropic|openai)" >&2; exit 64 ;;
+esac

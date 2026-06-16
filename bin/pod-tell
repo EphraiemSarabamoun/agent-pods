@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# pod-tell <recipient> <message...> — send a message to a podmate.
+#   recipient = window name (Steve) | window id (@2)
+#             | chat (quiet general message: reaches everyone, NO unread badge)
+#             | all / everyone (@everyone broadcast: badges every tab — reserve for
+#               things every agent genuinely must see)
+#
+# Sender is auto-resolved from the calling window. The message is appended to the
+# recipient's mailbox AND to this pod's channel.log (the summary-pane chat feed). Then a
+# background pod-deliver per recipient surfaces it: a hook-capable agent gets it as
+# additionalContext (skip send-keys); everyone else gets a send-keys notification when
+# idle. THE INVERSION: every recipient is deliverable — there is no "foreign, skipped"
+# anymore; pod-deliver decides HOW per agent.
+#
+# A direct or @everyone message also stamps the recipient's tab with a red unread
+# PILL (the @unread window option, count of stamped messages), cleared at the
+# recipient's next prompt (pod-mail-check) or idle tick (pod-foreign-state). The quiet
+# `chat` tier carries an "fyi " mbox prefix so it never inflates that count and never
+# badges. bash 3.2 safe.
+#
+# PERF: two tmux round-trips regardless of recipient count — one display-message for
+# the sender, one list-windows snapshot of the pod; everything else runs in-memory.
+set -uo pipefail
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"; . "$POD_BIN/_pod-common.sh"
+T="$POD_TMUX"
+
+to="${1:-}"; shift || true
+msg="$*"
+{ [ -n "$to" ] && [ -n "$msg" ]; } || { echo "usage: pod-tell <name|@id|chat|all> <message>"; exit 1; }
+
+# --- sender: ONE combined display-message ---
+me="?"; me_id=""; sess="${POD_SESSION:-$POD_SESSION_PREFIX}"
+pane="${TMUX_PANE:-}"
+if [ -n "$pane" ]; then
+  meta="$("$T" display-message -p -t "$pane" '#{window_name}|#{window_id}|#{session_name}' 2>/dev/null)"
+  IFS='|' read -r r_me r_id r_sess <<<"$meta"
+  [ -n "$r_me" ]   && me="$r_me"
+  [ -n "$r_id" ]   && me_id="$r_id"
+  [ -n "$r_sess" ] && sess="$r_sess"
+fi
+MAILDIR="$(pod_dir_for "$sess")"; CHAN="$(pod_chan_for "$sess")"
+mkdir -p "$MAILDIR" || { echo "pod-tell: cannot create mail dir $MAILDIR"; exit 1; }
+ts="$(date +%H:%M)"
+
+# --- pod window table: ONE list-windows. Exact-match (=) so a sibling pod whose name
+# is a prefix can't leak in. ---
+TABLE="$("$T" list-windows -t "=$sess" -F '#{window_id}|#{window_name}' 2>/dev/null)"
+
+# --- resolve targets from the snapshot ---
+disp="$to"; targets=""
+case "$to" in
+  chat|fyi)
+    # quiet tier: same fan-out as a broadcast, but the mbox line carries an "fyi "
+    # prefix (excluded from the '^\[' badge count) and NO @unread pill is stamped.
+    disp="chat"
+    targets="$(printf '%s\n' "$TABLE" | awk -F'|' 'NF{print $1}')" ;;
+  all|everyone|@all|@everyone)
+    disp="all"
+    targets="$(printf '%s\n' "$TABLE" | awk -F'|' 'NF{print $1}')" ;;
+  @*)
+    # window-ids are server-global; confirm this id is in THIS pod before delivering.
+    line="$(printf '%s\n' "$TABLE" | awk -F'|' -v id="$to" '$1==id{print; exit}')"
+    [ -n "$line" ] || { echo "pod-tell: $to is not a window in pod '$sess'"; exit 1; }
+    targets="$to"; disp="${line#*|}" ;;
+  *)
+    targets="$(printf '%s\n' "$TABLE" | awk -F'|' -v n="$to" '$2==n{print $1}')"
+    [ -n "$targets" ] || { echo "pod-tell: no window named '$to' in pod '$sess'"; exit 1; } ;;
+esac
+
+# --- deposit + nudge delivery, one pass over the snapshot ---
+tset=" $(printf '%s ' $targets)"
+n=0; badge=()
+while IFS='|' read -r wid wn; do
+  [ -n "$wid" ] || continue
+  case "$tset" in *" $wid "*) : ;; *) continue ;; esac   # not addressed
+  [ "$wid" = "$me_id" ] && continue                      # never deliver to myself
+  if [ "$disp" = chat ]; then
+    # quiet tier: the "fyi " prefix keeps it out of the '^\[' badge count, so a later
+    # direct send's pill count is never inflated by chatter. Still delivered.
+    echo "fyi [$ts] $me: $msg" >> "$MAILDIR/${wid}.mbox"
+  else
+    echo "[$ts] $me: $msg" >> "$MAILDIR/${wid}.mbox"
+    # red unread PILL: stamp the recipient's live unread count (the '^\['-stamped
+    # messages — fyi lines don't match, so quiet chat never inflates it; never 0, we
+    # just appended ≥1). Batched into ONE chained tmux call below; cleared at the
+    # recipient's next prompt (pod-mail-check) / idle tick (pod-foreign-state).
+    cnt="$(grep -c '^\[' "$MAILDIR/${wid}.mbox" 2>/dev/null)"
+    case "$cnt" in (*[!0-9]*|""|0) cnt=1 ;; esac
+    badge+=(set-option -w -t "$wid" @unread "$cnt" ";")
+  fi
+  # nudge: surface it now (idle recipients get it immediately; pod-deliver no-ops for
+  # native-delivery agents and defers busy ones). The 3s poller is the backstop.
+  ( "$POD_BIN/pod-deliver" "$wid" >/dev/null 2>&1 & )
+  n=$((n + 1))
+done < <(printf '%s\n' "$TABLE")
+# one tmux invocation: N chained @unread set-options + an immediate strip repaint
+[ "${#badge[@]}" -gt 0 ] && "$T" "${badge[@]}" refresh-client -S 2>/dev/null || true
+
+echo "[$ts] $me → $disp: $msg" >> "$CHAN"     # always log for visibility
+echo "delivered to $disp ($n recipient(s))"
+# tier nudge: @everyone badges every tab — general FYI belongs in the quiet chat tier.
+[ "$disp" = all ] && echo "note: 'all' badges every tab — for general FYI use: pod-tell chat \"...\""

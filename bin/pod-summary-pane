@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# pod-summary-pane on|off|toggle|follow [session] — dock the pod summary as a
+# live, NON-MODAL pane instead of a modal popup.
+#
+# Why: `tmux display-popup` grabs the client's keyboard until dismissed, so a popup
+# summary blocks typing to agents and clicking tabs. This docks `pod-summary --pane`
+# as a narrow BLACK column on the right edge of the current window with the summary
+# card at its top — panes must tile as rectangles, so this is the closest tmux gets
+# to a non-modal "top-right box" (the rest of the column is empty black). Focus
+# stays in the agent pane (split -d), the card auto-refreshes every 2s, and a
+# session-scoped session-window-changed hook calls `follow` to drag it along
+# whenever the current window changes (tab click, C-b cycle, ⏎-open from inside).
+# Drag the pane border to resize — `follow` preserves the live width on each move.
+#
+#   on      dock the strip in the session's current window (no-op if already up)
+#   off     kill the strip + drop the follow hook
+#   toggle  what the ☰ button / C-a s fire
+#   follow  move the strip to the session's current window (hook target; idempotent)
+#
+# The strip pane is tagged with the pane user option @pod_summary=1 — that tag is
+# the single source of truth for "is the sidebar up". The hook self-cleans: if
+# follow finds no tagged pane (strip killed by hand, window died), it unhooks.
+# bash 3.2 safe; tmux ≥3.0 (pane user options).
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+T="$POD_TMUX"
+
+cmd="${1:-toggle}"
+sess="${2:-${POD_SESSION:-$POD_SESSION_PREFIX}}"
+
+find_pane() {
+  "$T" list-panes -s -t "=$sess" -F '#{pane_id}|#{@pod_summary}' 2>/dev/null \
+    | awk -F'|' '$2=="1"{print $1; exit}'
+}
+
+# The draggable boundary is the resize affordance (the terminal owns the mouse
+# pointer; tmux can't request a resize cursor), so make the edge unmissable: a
+# heavy cyan border on the HOST WINDOW. Window scope is deliberate — tmux
+# attributes a shared border cell to the FIRST pane in window order (the agent),
+# so a pane-scoped style on the card never wins; window scope covers both panes
+# and both active/inactive cases. Styled on dock/follow, cleaned on leave/undock.
+style_host() {
+  "$T" set -w -t "$1" pane-border-style 'fg=colour45' 2>/dev/null
+  "$T" set -w -t "$1" pane-active-border-style 'fg=colour45' 2>/dev/null
+  "$T" set -w -t "$1" pane-border-lines heavy 2>/dev/null
+}
+unstyle_host() {
+  "$T" set -wu -t "$1" pane-border-style 2>/dev/null
+  "$T" set -wu -t "$1" pane-active-border-style 2>/dev/null
+  "$T" set -wu -t "$1" pane-border-lines 2>/dev/null
+}
+
+do_on() {
+  [ -n "$(find_pane)" ] && return 0
+  # column width: 62 cols fits "idx name dot summary…", clamped to half the window
+  local winw w pane
+  winw="$("$T" display-message -p -t "=$sess:" '#{window_width}' 2>/dev/null)"
+  w=62; [ -n "$winw" ] && [ "$w" -gt $((winw / 2)) ] && w=$((winw / 2)); [ "$w" -lt 30 ] && w=30
+  # -h right of the agent pane, -d keep focus in the agent pane
+  pane="$("$T" split-window -h -d -l "$w" -t "=$sess:" -P -F '#{pane_id}' \
+        "$POD_BIN/pod-summary --pane $sess")" || return 1
+  "$T" set -p -t "$pane" @pod_summary 1
+  # per-pane style overrides the pod's per-worker window body color -> black card.
+  # NB: `select-pane -P` would also FOCUS the pane (it's still a select); the
+  # pane-scoped option sets the style without touching focus. BOTH styles needed:
+  # pod-add-worker sets window-style AND window-active-style per window, and tmux
+  # resolves the ACTIVE pane via window-active-style — overriding only window-style
+  # made the card flip to the worker's body color the moment it was clicked into.
+  "$T" set -p -t "$pane" window-style 'fg=colour231,bg=black'
+  "$T" set -p -t "$pane" window-active-style 'fg=colour231,bg=black'
+  style_host "$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
+  "$T" set-hook -t "$sess" session-window-changed \
+       "run-shell -b '$POD_BIN/pod-summary-pane follow $sess'"
+}
+
+do_off() {
+  local pane w
+  pane="$(find_pane)"
+  "$T" set-hook -u -t "$sess" session-window-changed 2>/dev/null
+  if [ -n "$pane" ]; then
+    w="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
+    [ -n "$w" ] && unstyle_host "$w"
+    "$T" kill-pane -t "$pane" 2>/dev/null
+  fi
+  return 0
+}
+
+do_follow() {
+  local pane curwin panewin w
+  pane="$(find_pane)"
+  if [ -z "$pane" ]; then
+    # strip is gone (killed by hand / died with its window) — self-clean the hook
+    "$T" set-hook -u -t "$sess" session-window-changed 2>/dev/null
+    return 0
+  fi
+  curwin="$("$T" display-message -p -t "=$sess:" '#{window_id}' 2>/dev/null)"
+  panewin="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
+  [ -n "$curwin" ] && [ "$curwin" != "$panewin" ] || return 0
+  # preserve the LIVE width so a manual border-drag resize sticks across moves
+  w="$("$T" display-message -p -t "$pane" '#{pane_width}' 2>/dev/null)"
+  "$T" join-pane -h -d -l "${w:-62}" -s "$pane" -t "$curwin" 2>/dev/null
+  unstyle_host "$panewin"
+  style_host "$curwin"
+}
+
+case "$cmd" in
+  on)     do_on ;;
+  off)    do_off ;;
+  toggle) if [ -n "$(find_pane)" ]; then do_off; else do_on; fi ;;
+  follow) do_follow ;;
+  *) echo "usage: pod-summary-pane on|off|toggle|follow [session]"; exit 1 ;;
+esac

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# pod-name [session] — print a random friendly first name not already in use by a
+# window in this pod, so two live agents never share a name. Reserved: the manager
+# name (POD_MANAGER_NAME). Every spawn path names a worker with this, so
+# the TAB reads as a human name while the real identity rides in #{@card}.
+#
+# bash 3.2 safe: positional params + /dev/urandom entropy.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+T="$POD_TMUX"
+S="${1:-${POD_SESSION:-$POD_SESSION_PREFIX}}"
+
+NAMES="Amy Tyler Riley Noah Mia Liam Zoe Ethan Ava Owen Maya Leo Ruby Finn Nora Eli \
+Iris Cole Jade Max Lily Sam Tess Jude Wren Beau Faye Reid Ivy Dean Hazel Cruz June \
+Knox Greta Roman Stella Miles Clara Hugo Daisy Otis Willa Felix Lena Asa Romy Theo \
+Nina Gus Elsie Rex Bea Jonah Esme Arlo Mabel Dex Opal"
+
+# names already on a tab, plus the reserved manager name (space-padded for whole-word match).
+used=" $POD_MANAGER_NAME $("$T" list-windows -t "$S" -F '#{window_name}' 2>/dev/null | tr '\n' ' ') "
+
+free=""
+for nm in $NAMES; do
+  case "$used" in *" $nm "*) : ;; *) free="$free $nm" ;; esac
+done
+
+# Entropy from /dev/urandom, not $RANDOM: $RANDOM seeds from PID+time, so two spawns in
+# the same second pick correlated (often identical) names.
+rand="$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -dc 0-9)"
+[ -n "$rand" ] || rand="$RANDOM"
+
+set -- $free
+if [ "$#" -eq 0 ]; then
+  printf 'Agent%s' "$(( rand % 90 + 10 ))"   # pool exhausted (>~60 live agents)
+  exit 0
+fi
+idx=$(( rand % $# ))
+shift "$idx"
+printf '%s' "$1"

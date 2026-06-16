@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# pod-mail — read + clear MY unread pod messages. Any instance runs it; it figures
+# out which window it is from $TMUX_PANE (same trick as `pod`). Read messages are
+# archived to <id>.read and the mailbox is cleared.
+set -uo pipefail
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"; . "$POD_BIN/_pod-common.sh"
+T="$POD_TMUX"
+pane="${TMUX_PANE:-}"
+[ -n "$pane" ] || { echo "pod-mail: no TMUX_PANE — run me from inside a pod window"; exit 0; }
+me_id="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)" || exit 0
+mbox="$(pod_mbox "$me_id")"
+if [ ! -s "$mbox" ]; then echo "no new pod-mail"; exit 0; fi
+# Atomic drain: rename the mailbox aside FIRST (mv is atomic within the same dir), then
+# read the snapshot. A pod-tell appending concurrently re-creates a fresh mailbox
+# (>> creates on demand), so its message can't be destroyed in the old
+# read-display-then-truncate gap.
+snap="${mbox}.reading.$$"
+mv "$mbox" "$snap" 2>/dev/null || { echo "no new pod-mail"; exit 0; }
+echo "pod-mail:"
+sed 's/^/  /' "$snap"
+cat "$snap" >> "$(pod_read "$me_id")" 2>/dev/null || true
+rm -f "$snap"

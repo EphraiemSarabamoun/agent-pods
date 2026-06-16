@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+# pod-feed — render the pod chat feed (channel.log) as ANSI lines, NEWEST FIRST.
+# Embedded by pod-summary under the agent cards (the docked summary pane is the pod's
+# mission control; this renders the chat below the roster). Deliberately tiny and
+# tmux-free: zero subprocesses, so pod-summary can call it every 2s tick for free.
+#
+#   argv[1] = path to channel.log      argv[2] = LINE budget (default 12)
+#   argv[3] = scroll offset — skip the N NEWEST messages (default 0); when >0 a
+#             dim "↑ N newer hidden" indicator heads the feed (clamped so the
+#             oldest message is always reachable)
+#   env POD_COLS         = wrap width (default 100)
+#   env POD_AGENT_COLORS = newline-separated "Name=N" pairs — each agent's tab
+#                          color (the bg colour of its window-status-style),
+#                          built and passed by pod-summary each tick. Names absent
+#                          from the map (departed agents) fall back to the md5
+#                          palette so old messages still color stably.
+#   env POD_MANAGER_NAME = window 0's name; the stable token "manager" renders as
+#                          this name.
+#
+# COLORS are BRIGHTENED for the black pane: tab colors are dark jewel-tone
+# backgrounds; bright() keeps the exact hue (scales the 6x6x6 cube channels so the
+# max hits 5; greys lift to 250) so each name still reads as that agent's tab color,
+# just luminous. WRAPPING, not clipping: a message word-wraps to the pane width with
+# a hanging indent under the body, and argv[2] is a total LINE budget — newest
+# messages first; the message that hits the budget edge shows the head that fits
+# (dim … cue), never blank rows. Names + @Name tags share one bold fg font, no
+# background pills; broadcasts render a per-letter rainbow @everyone. Lines without
+# the "→" arrow (full-auto flips, system notes from pod-kill-worker /
+# pod-sync-pod-name) are NOTIFICATIONS, not chat: no sender→recipient shape — a
+# colored ⚡/✋ glyph if present, @mentions (the rendered "cc @<manager>" tail) still
+# in their agent colors. Legacy "full-auto switch → manager:" arrow lines are
+# converted to that notification shape at render time. Every emitted line ends in
+# \033[K — the in-place-repaint contract pod-summary relies on.
+import os, sys, re, hashlib
+
+chan   = sys.argv[1] if len(sys.argv) > 1 else ""
+LINES  = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 12
+OFFSET = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 0
+COLS  = max(24, int(os.environ.get("POD_COLS") or 100))
+WIDTH = COLS - 1
+INDENT = 7   # continuation lines hang under the body, past " HH:MM "
+
+R = "\033[0m"; DIM = "\033[2m"; B = "\033[1m"
+# md5 fallback palette, only for names with no live tab (departed agents).
+# NO PURPLES — purple is reserved for the manager.
+PALETTE = [39, 208, 46, 196, 214, 51, 33, 118, 220, 159, 50, 215, 84, 45, 229, 203]
+RAINBOW = [196, 208, 220, 46, 39, 99, 201]
+
+def bright(n):
+    # same hue, max luminance: scale the 256-color cube channels so max(r,g,b)=5;
+    # greyscale-ramp colors lift to a light grey; basic ANSI 0-7 take their bright twin
+    if 232 <= n <= 255: return max(n, 250)
+    if 16 <= n <= 231:
+        v = n - 16; r, g, b = v // 36, (v % 36) // 6, v % 6
+        m = max(r, g, b)
+        if m == 0: return 252
+        r, g, b = (min(5, int(round(c * 5.0 / m))) for c in (r, g, b))
+        return 16 + 36 * r + 6 * g + b
+    return n + 8 if n < 8 else n
+
+TABCOLS = {}
+for ln in os.environ.get("POD_AGENT_COLORS", "").splitlines():
+    name, _, col = ln.rpartition("=")
+    if name and col.isdigit():
+        TABCOLS[name] = int(col)
+MGR = os.environ.get("POD_MANAGER_NAME", "")
+MGR_ALIASES = {"manager"}
+canon  = lambda n: MGR if (MGR and n.lower() in MGR_ALIASES) else n
+acolor = lambda n: bright(TABCOLS.get(n, PALETTE[int(hashlib.md5(n.encode()).hexdigest(), 16) % len(PALETTE)]))
+sender = lambda n: f"{B}\033[38;5;{acolor(n)}m{n}{R}"
+tag    = lambda n: f"{B}\033[38;5;{acolor(n)}m@{n}{R}"   # same font as the sender, @-prefixed
+
+def rainbow(word="@everyone"):
+    return B + "".join(f"\033[38;5;{RAINBOW[i % len(RAINBOW)]}m{c}" for i, c in enumerate(word)) + R
+
+# mention matcher: KNOWN agent names first (longest first, so multi-word names like
+# "Claude Code" match whole — a bare \w+ split "@Claude Code" at the space and
+# mis-colored it), then a generic word as the fallback.
+_known = sorted(set(list(TABCOLS) + ([MGR] if MGR else []) + list(MGR_ALIASES)), key=len, reverse=True)
+_alt   = "".join(re.escape(n) + "|" for n in _known if n)
+MENT = re.compile(r'@(' + _alt + r'[A-Za-z0-9_\-]+)', re.IGNORECASE)
+ment = lambda t: MENT.sub(lambda m: rainbow() if m.group(1).lower() in ("all", "everyone")
+                          else tag(canon(m.group(1))), t)
+
+def wrap(styled, width, indent):
+    # ANSI-aware word wrap: walks visible chars, breaks at the last space (hard
+    # break mid-word only when a single word exceeds the width), re-emits the
+    # style stack at each continuation start so colors survive the break. The
+    # re-emitted stack is REPLAYED to the break point (not the current scan
+    # position) — sampling the live tracker instead drops a color whenever the
+    # span's reset has already been scanned past the break.
+    lines = []; cur = []; vis = 0
+    sp_pos = -1          # index in cur of the last breakable space
+    pad = " " * indent
+    def replay(tokens):  # style state after a token run
+        st = []
+        for t in tokens:
+            if t.startswith("\033"):
+                if t == R: st = []
+                else: st.append(t)
+        return st
+    def flush(upto, carry):
+        nonlocal cur, vis, sp_pos
+        line = "".join(cur[:upto])
+        lines.append(line + (R if "\033" in line else ""))
+        cur = [pad] + replay(cur[:upto]) + carry
+        vis = indent + sum(1 for t in carry if not t.startswith("\033"))
+        sp_pos = -1
+    i, n = 0, len(styled)
+    while i < n:
+        if styled[i] == "\033":
+            j = styled.find("m", i); j = j if j != -1 else i
+            cur.append(styled[i:j + 1]); i = j + 1; continue
+        ch = styled[i]
+        if vis >= width:
+            if sp_pos > 0: flush(sp_pos, cur[sp_pos + 1:])   # break at word, eat the space
+            else:          flush(len(cur), [])               # hard break (giant word)
+        cur.append(ch); vis += 1
+        if ch == " ": sp_pos = len(cur) - 1
+        i += 1
+    if cur: flush(len(cur), [])
+    return lines
+
+LINE = re.compile(r'^\[(\d{1,2}:\d{2})\]\s+(.*?)\s+→\s+(.*?):\s?(.*)$')
+NOTE = re.compile(r'^\[(\d{1,2}:\d{2})\]\s?(.*)$')
+
+def notification(ts, text):
+    # VIBRANT notification register: body color-coded by type — amber for ⚡/✋
+    # full-auto flips, soft red for terminations, azure for renames — with the
+    # timestamp kept dim so the line still reads as system, not chat (no
+    # sender→recipient shape either). Mentions keep their agent colors (each tag
+    # ends in a reset, so re-assert the accent after every substitution); the ⚡/✋
+    # glyph renders gold. Legacy "(system):" prefixes are stripped (notifications
+    # carry no speaker label), and glyph lines keep only their HEADLINE — the " —
+    # explanation" clause is dropped (it lives in the manager's mbox), the " · cc"
+    # tail is kept.
+    text = re.sub(r'^\(system\):?\s*', '', text)
+    if text[:1] in ("⚡", "✋") and " — " in text:
+        head, _, rest = text.partition(" — ")
+        i = rest.rfind(" · cc")
+        text = head + (rest[i:] if i != -1 else "")
+    acc = 214                                        # amber (default / switch flips)
+    if   text.startswith("terminated"):  acc = 203   # soft red
+    elif text.startswith("pod renamed"): acc = 39    # azure
+    elif text.startswith("⊕"):           acc = 84    # task assignment (mgr-dispatch)
+    elif text.startswith("»"):           acc = 45    # manager typed input (pod_send_input)
+    A = f"\033[38;5;{acc}m"
+    body = MENT.sub(lambda m: (rainbow() if m.group(1).lower() in ("all", "everyone")
+                               else tag(canon(m.group(1)))) + A, text)
+    for g in ("⚡", "✋"):
+        body = body.replace(g, f"{R}{B}\033[38;5;220m{g}{R}{A}")
+    head = f" {DIM}{ts}{R} " if ts else " "
+    return f"{head}{A}{body}{R}"
+def render_one(raw):
+    m = LINE.match(raw)
+    if m and m.group(2) == "full-auto switch":      # legacy arrow lines -> notification
+        ts, _, disp, body = m.groups()
+        glyph = "✋" if "OFF" in body else "⚡"
+        return notification(ts, f"{glyph} {body} · cc @{canon(disp)}")  # notification() trims the clause
+    if m:
+        ts, who, disp, body = m.groups()
+        if disp == "chat":      # quiet tier (pod-tell chat): no arrow, no @tag, no badge
+            return f" {DIM}{ts}{R} {sender(canon(who))}{DIM}:{R} {ment(body)}"
+        to = rainbow() if disp.lower() in ("all", "everyone", "") else tag(canon(disp))
+        return f" {DIM}{ts}{R} {sender(canon(who))} {DIM}→{R} {to} {ment(body)}"
+    nm = NOTE.match(raw)
+    return notification(*nm.groups()) if nm else f" {DIM}{raw}{R}"
+
+msgs = []
+if chan and os.path.exists(chan):
+    msgs = [l for l in open(chan, errors="replace").read().splitlines() if l.strip()]
+msgs.reverse()                                            # NEWEST FIRST
+
+# CACHE MODE (POD_FEED_CACHE=1): emit EVERY message's wrapped lines, newest
+# first, as "ord|more|plen|line" (ord = message index, more=1 while the message
+# continues, plen = visible width) and exit. pod-summary rebuilds this once per
+# 2s tick and assembles scroll views in pure bash — scroll frames spawn nothing.
+if os.environ.get("POD_FEED_CACHE"):
+    STRIP = re.compile(r"\033\[[0-9;]*m")
+    out = []
+    for i, raw in enumerate(msgs):
+        ls = wrap(render_one(raw), WIDTH, INDENT)
+        for j, l in enumerate(ls):
+            out.append(f"{i}|{1 if j < len(ls) - 1 else 0}|{len(STRIP.sub('', l))}|{l}")
+    sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+    sys.exit(0)
+
+# BOTTOM STOP: the max useful offset is the view where the OLDEST message sits
+# fully rendered at the foot of the budget — anything past it just drains the
+# pane down to a lone message. Walk from the oldest accumulating wrapped heights
+# until the budget (minus the indicator row, present whenever offset > 0) is spent.
+MAXOFF = 0
+if msgs:
+    acc = 0; K = 0
+    for raw in reversed(msgs):                            # oldest → newer
+        h = len(wrap(render_one(raw), WIDTH, INDENT))
+        lim = LINES if K + 1 == len(msgs) else LINES - 1  # full view ⇒ no indicator
+        if acc + h > lim:
+            break
+        acc += h; K += 1
+    MAXOFF = min(len(msgs) - K, len(msgs) - 1)
+OFFSET = min(OFFSET, MAXOFF)
+
+OUT = []
+if OFFSET > 0 and msgs:
+    msgs = msgs[OFFSET:]
+    OUT.append(f" {DIM}↑ {OFFSET} newer hidden · d=newer r=live{R}")
+if not msgs:
+    OUT.append(f' {DIM}no messages yet — pod-tell all "hello pod"{R}')
+for raw in msgs:
+    if len(OUT) >= LINES:
+        break
+    rendered = render_one(raw)
+    chunk = wrap(rendered, WIDTH, INDENT)
+    room = LINES - len(OUT)
+    if len(chunk) > room:
+        # partial display: a message that doesn't fully fit shows the HEAD that
+        # does instead of leaving blank rows; a dim … cue marks the cut when the
+        # last line has a column to spare.
+        OUT.extend(chunk[:room])
+        if len(re.sub(r"\033\[[0-9;]*m", "", OUT[-1])) < WIDTH:
+            OUT[-1] += f"{DIM}…{R}"
+        break
+    OUT.extend(chunk)
+else:
+    # every message rendered: when scrolled, mark the bottom of history so the
+    # reader knows nothing older exists (the since-pod-start guarantee, visible)
+    if OFFSET > 0 and len(OUT) < LINES:
+        OUT.append(f" {DIM}— start of pod —{R}")
+sys.stdout.write("\n".join(l + "\033[K" for l in OUT) + "\n")

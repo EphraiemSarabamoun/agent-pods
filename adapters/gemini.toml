@@ -1,0 +1,38 @@
+# Gemini CLI (Google). Poll agent, no hooks. Adjust model slugs to whatever your
+# Gemini CLI build exposes (gemini --list-models or the docs).
+[agent]
+id       = "gemini"
+label    = "Gemini CLI"
+priority = 40
+
+[launch]
+base_cmd   = "gemini"
+model_arg  = ["-m", "{model}"]
+effort_arg = []
+
+[detect]
+pane_cmd_patterns = ['^(gemini|node)$']
+content_patterns  = ['(?i)gemini']
+reject_content    = []
+
+[defaults]
+model             = "gemini-2.5-pro"
+effort            = ""
+card_scrape_regex = ''
+
+[lifecycle]
+mode            = "poll"
+installer       = ""
+native_delivery = false
+state_source    = "poll"
+
+[[models]]
+slug  = "pro"
+label = "2.5 Pro"
+model = "gemini-2.5-pro"
+efforts = []
+[[models]]
+slug  = "flash"
+label = "2.5 Flash"
+model = "gemini-2.5-flash"
+efforts = []

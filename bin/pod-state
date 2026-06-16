@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# pod-state <idle|busy|wait> — stamp THIS pane's live work-state onto its tmux window
+# so the pod status strip shows idle-at-a-glance. For agents with lifecycle hooks
+# (Claude Code), wire:
+#   UserPromptSubmit -> busy   (a turn started)
+#   Stop             -> idle   (turn finished; back at the prompt)
+#   Notification     -> wait   (a permission/attention prompt). Some agents also route
+#                              their idle "waiting for input" timeout here; that means
+#                              FREE, so we re-map it to idle from the payload.
+#
+# The strip reads #{@cc_state} per window: idle=green ● busy=orange ◐ wait=yellow ◆
+# unset=grey ○. Agents WITHOUT hooks get this dot from pod-foreign-state instead.
+#
+# No-op outside tmux. MUST never fail a hook, so every path exits 0.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || true
+state="${1:-idle}"
+[ -n "${TMUX:-}" ] || exit 0
+T="${POD_TMUX:-$(command -v tmux 2>/dev/null || echo tmux)}"
+pane="${TMUX_PANE:-}"
+[ -n "$pane" ] || exit 0
+
+# A Notification hook fires "wait", but some agents route TWO events here: an idle
+# "waiting for your input" timeout (FREE -> idle/green) and a real permission prompt
+# (blocked -> wait/yellow). Re-decide from the JSON payload on stdin. Only read when
+# stdin is a pipe (the hook case) so a manual `pod-state wait` can't block on cat.
+if [ "$state" = "wait" ] && [ ! -t 0 ]; then
+  payload="$(cat 2>/dev/null)"
+  decided="$(printf '%s' "$payload" | python3 -c '
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nt = (d.get("notification_type") or "").lower()
+msg = (d.get("message") or "").lower()
+print("idle" if nt == "idle_prompt" or "waiting for your input" in msg else "wait")
+' 2>/dev/null)"
+  [ "$decided" = "idle" ] && state="idle"
+fi
+
+win="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
+[ -n "$win" ] || exit 0
+# Stamp @state_since (epoch) ONLY on a real transition, so the summary pane's activity
+# timer ("busy 12m") measures the current state, not the last hook fire.
+prev="$("$T" show-options -w -t "$win" -qv @cc_state 2>/dev/null)"
+"$T" set-option -w -t "$win" @cc_state "$state" 2>/dev/null || true
+[ "$prev" = "$state" ] || "$T" set-option -w -t "$win" @state_since "$(date +%s)" 2>/dev/null || true
+# Force an immediate status-line redraw so the dot flips now. -S = status line only.
+"$T" refresh-client -S 2>/dev/null || true
+# Now that this window is idle, deliver any queued gold-star prompt. Backgrounded so
+# pod-star's settle sleep never touches this hook's timeout; a no-op when nothing's
+# pending. (pod-star is alongside this script in POD_BIN.)
+if [ "$state" = "idle" ] && [ -x "$POD_BIN/pod-star" ]; then
+  ( "$POD_BIN/pod-star" --deliver-pending "$win" >/dev/null 2>&1 & )
+fi
+exit 0

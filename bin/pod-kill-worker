@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# pod-kill-worker <window_id|name|kill_<window_id>> — terminate a pod worker.
+#
+# The inverse of pod-add-worker: kills the worker's tmux window (which terminates
+# the agent process running in it) and removes it from the worker registry
+# (workers.json). Wired to the clickable red "x" on each window tab by pod-launch;
+# also runnable by hand (`pod-kill-worker Steve`).
+#
+# Refuses to kill window 0 (the manager / home base). Idempotent + defensive:
+# no-op if the target window or the registry is absent. bash 3.2 safe.
+set -uo pipefail
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"; . "$POD_BIN/_pod-common.sh"
+T="$POD_TMUX"
+S="${POD_SESSION:-$POD_SESSION_PREFIX}"
+WORKERS="$POD_STATE/workers.json"
+
+arg="${1:-}"
+win="${arg#kill_}"                       # accept the click range form "kill_@7" or a bare id/name
+[ -n "$win" ] || { echo "usage: pod-kill-worker <window_id|name>"; exit 1; }
+
+# resolve a window NAME to its id (so `pod-kill-worker Steve` works)
+case "$win" in
+  @*) : ;;
+  *)
+    resolved="$("$T" list-windows -t "$S" -F '#{window_id}|#{window_name}' 2>/dev/null \
+                | awk -F'|' -v n="$win" '$2==n{print $1; exit}')"
+    [ -n "$resolved" ] && win="$resolved" ;;
+esac
+
+# the window must exist
+widx="$("$T" display-message -p -t "$win" '#{window_index}' 2>/dev/null || echo '')"
+[ -n "$widx" ] || { echo "pod-kill-worker: no such window '$win' in pod '$S'"; exit 1; }
+
+# never kill the manager (window index 0)
+if [ "$widx" = "0" ]; then
+  echo "pod-kill-worker: refusing to terminate the manager (window 0)"
+  exit 1
+fi
+
+wname="$("$T" display-message -p -t "$win" '#{window_name}' 2>/dev/null || echo "$win")"
+
+# deregister from workers.json (idempotent; matches pod-add-worker's inline-python pattern)
+if [ -f "$WORKERS" ]; then
+  python3 - "$win" "$WORKERS" <<'PY'
+import json, sys, os, fcntl, tempfile
+wid, path = sys.argv[1], sys.argv[2]
+# Lock the SHARED workers.json.lock — the same file pod-add-worker and
+# pod-sync-label lock. flock only excludes processes locking the same file, so a
+# lock on a different fd (e.g. the json itself) wouldn't serialize against them.
+lf = open(path + ".lock", "w")
+fcntl.flock(lf, fcntl.LOCK_EX)
+try:
+    try:
+        d = json.load(open(path))
+        if not isinstance(d, dict):
+            sys.exit(0)
+    except Exception:
+        sys.exit(0)
+    ws = d.get("workers", [])
+    keep = [w for w in ws if w.get("tmux_window") != wid]
+    if len(keep) != len(ws):
+        d["workers"] = keep
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".workers.", suffix=".tmp")
+        with os.fdopen(fd, "w") as tf:
+            json.dump(d, tf, indent=2)
+        os.replace(tmp, path)            # atomic
+finally:
+    fcntl.flock(lf, fcntl.LOCK_UN)
+    lf.close()
+PY
+fi
+
+# log the termination to the KILLED window's pod channel so it shows in that pod's
+# summary-pane feed. Resolve the pod from the window itself — POD_SESSION isn't set in
+# the tmux run-shell context the ✕ button fires from, and the message belongs to the
+# target's pod, not whatever pod happened to invoke this.
+wsess="$("$T" display-message -p -t "$win" '#{session_name}' 2>/dev/null || echo "$S")"
+CHAN="$(pod_chan_for "$wsess")"; mkdir -p "$(dirname "$CHAN")"
+echo "[$(date +%H:%M)] (system): terminated pod agent $wname ($win)" >> "$CHAN" 2>/dev/null || true
+
+# kill the window LAST (this SIGHUPs the pane, ending the agent process in it)
+"$T" kill-window -t "$win" 2>/dev/null
+echo "terminated $wname ($win)"

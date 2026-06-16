@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+# pod-spawn-menu-build [client] — open the pod "+" quick-pick as a native tmux
+# display-menu, generated from the quick-pick slots file ($POD_SLOTS).
+#
+# Shows EXACTLY the 10 curated slots, keyed 0-9. Picking one runs pod-add-worker
+# with that slot's resolved launch command. The slots are edited via the settings
+# (gear) button -> pod-settings-menu; the universe of agents/models/efforts they
+# draw from lives in the adapter catalog (queried via pod-adapter).
+#
+# A single FLAT menu, every item selectable (slot 0 is seeded, so the first /
+# initially-highlighted item is always selectable -> no "starting choice invalid").
+# Single-level (no nested display-menu) is deliberate — it dodges the deep
+# quote-nesting and the run-shell client-context loss that bit earlier work.
+#
+# Set POD_MENU_PRINT=1 to print the tmux argv (one per line) instead of opening the
+# menu — used to validate the generated command without popping a menu at someone.
+import json, os, subprocess, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+# Resolve from the environment (set by _pod-paths.sh), with repo-relative fallbacks.
+POD_BIN = os.environ.get("POD_BIN") or HERE
+POD_REPO = os.environ.get("POD_REPO") or os.path.dirname(POD_BIN)
+SLOTS = os.environ.get("POD_SLOTS") or os.path.join(
+    os.environ.get("POD_CONFIG_DIR", os.path.expanduser("~/.config/pod")), "slots.json"
+)
+ADD = os.path.join(POD_BIN, "pod-add-worker")
+SETTINGS = os.path.join(POD_BIN, "pod-settings-menu")
+STATE = os.environ.get("POD_STATE") or os.path.join(
+    os.environ.get("POD_TMP", "/tmp/pod"), "state"
+)
+# Prefer $POD_TMUX from env; else resolve on PATH (no hardcoded path).
+TMUX = os.environ.get("POD_TMUX") or "tmux"
+
+client = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
+
+# Self-heal: on a fresh setup the slots file doesn't exist yet (it's normally
+# written by the gear/settings menu). Seed catalog defaults so the "+" picker
+# never crashes with FileNotFoundError before the user has curated any slots.
+if not os.path.exists(SLOTS):
+    subprocess.run([os.path.join(POD_BIN, "pod-seed-slots")])
+
+with open(SLOTS) as f:
+    data = json.load(f)
+slots = (data.get("slots") or [])[:10]
+
+# NO -c: tmux resolves the current client automatically here, exactly like the ✕
+# button's `tmux confirm-before` does from the same backgrounded run-shell context.
+# Passing -c "<#{client_name} tty>" made display-menu return 1.
+argv = [TMUX, "display-menu", "-T", data.get("title", "Spawn agent (0-9)")]
+_ = client  # accepted for compat; intentionally unused (see note above)
+
+for i, s in enumerate(slots):
+    key = str(i)  # 0-9, the slot index doubles as the mnemonic
+    label = s.get("label") or "(empty)"
+    cmd = s.get("cmd", "")
+    if cmd:
+        # The tab gets a random human name (pod-add-worker -> pod-name); the real
+        # identity rides in --label (the slot's pretty "Agent · Model · effort"),
+        # which pod-add-worker stamps into #{@card} for the status bar. `label` keeps
+        # the value computed above (with its "(empty)" fallback) — do NOT re-fetch it.
+        #
+        # run-shell arg is single-quoted; --label and --cmd values are double-quoted
+        # (they carry no quotes: words, '·', paths, flags). EVERY flag is omitted when
+        # its value is empty, so a blank value can't make the flag swallow the FOLLOWING
+        # flag as its argument in pod-add-worker's `--x) X="${2:-}"; shift 2` parser.
+        agent_arg  = f"--agent {s['agent']} "   if s.get("agent")  else ""
+        model_arg  = f"--model {s['model']} "   if s.get("model")  else ""
+        effort_arg = f"--effort {s['effort']} " if s.get("effort") else ""
+        item = (f"run-shell -b '{ADD} {agent_arg}{model_arg}{effort_arg}"
+                f"--label \"{label}\" --cmd \"{cmd}\"'")
+    else:
+        # empty slot (shouldn't happen post-seed): clicking it jumps straight into
+        # editing that slot via the settings drill-down.
+        item = f"run-shell -b '{SETTINGS} --step agent --slot {i}'"
+    argv += [f"{key}  ·  {label}", key, item]
+
+if os.environ.get("POD_MENU_PRINT"):
+    for a in argv:
+        print(a)
+    sys.exit(0)
+
+# Run display-menu and log tmux's stderr + exit code, so a non-pop is debuggable.
+log = os.path.join(STATE, "pod-spawn-menu.log")
+os.makedirs(os.path.dirname(log), exist_ok=True)
+with open(log, "a") as lf:
+    lf.write("argv=%r\n" % (argv,))
+    r = subprocess.run(argv, stderr=lf)
+    lf.write("exit=%d\n" % r.returncode)
+sys.exit(r.returncode)

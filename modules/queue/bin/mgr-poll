@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# mgr-poll — sweep $POD_INBOX/*/DONE for newly-completed tasks.
+#
+# For each DONE sentinel found that corresponds to a worker currently
+# `busy` in workers.json:
+#   - Mark the worker `idle` (clear current_task_id + started_at).
+#   - Append a completion event to log.jsonl.
+#   - Print the freed task_id.
+#
+# Idempotent: re-running after no new completions is a no-op.
+#
+# Usage:
+#   mgr-poll                    # standard sweep, prints freed task ids
+#   mgr-poll --quiet            # silent unless something freed
+#   mgr-poll --json             # emit JSON array of freed task ids
+
+set -euo pipefail
+POD_BIN="$(cd "$(dirname "$0")/../../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+
+INBOX_ROOT="$POD_INBOX"
+WORKERS_PATH="$POD_STATE/workers.json"
+LOG_PATH="$POD_STATE/log.jsonl"
+
+QUIET=0
+EMIT_JSON=0
+for arg in "$@"; do
+  case "$arg" in
+    --quiet) QUIET=1 ;;
+    --json)  EMIT_JSON=1 ;;
+    *) echo "ERROR: unrecognized arg: $arg" >&2; exit 2 ;;
+  esac
+done
+
+# Read currently-busy task ids from workers.json.
+busy_tasks=$(jq -r '[.workers[] | select(.status=="busy") | .current_task_id] | .[]?' "$WORKERS_PATH" 2>/dev/null || true)
+
+freed=()
+if [ -n "$busy_tasks" ]; then
+  while IFS= read -r tid; do
+    [ -z "$tid" ] && continue
+    if [ -f "${INBOX_ROOT}/${tid}/DONE" ] || [ -f "${INBOX_ROOT}/${tid}/EXECUTED" ]; then
+      freed+=("$tid")
+    fi
+  done <<< "$busy_tasks"
+fi
+
+if [ "${#freed[@]}" -eq 0 ]; then
+  [ "$QUIET" -eq 1 ] || echo "no newly-completed tasks"
+  [ "$EMIT_JSON" -eq 1 ] && echo "[]"
+  exit 0
+fi
+
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+TMP=$(mktemp)
+
+# Build a jq filter that flips every freed task's worker to idle.
+freed_json=$(printf '%s\n' "${freed[@]}" | jq -R . | jq -s .)
+jq --argjson freed "$freed_json" --arg now "$NOW" '
+  .workers |= map(
+    if (.current_task_id as $t | $freed | index($t))
+    then .status = "idle" | .current_task_id = null | .started_at = null
+    else .
+    end
+  )
+' "$WORKERS_PATH" > "$TMP" && mv "$TMP" "$WORKERS_PATH"
+
+# Append completion events + remove the now-stale dispatched archive entry.
+# (The dispatched file means "in-flight"; once DONE, leaving it would later mislabel
+#  a re-staged same-id task as in-flight. log.jsonl keeps the durable audit trail.)
+for tid in "${freed[@]}"; do
+  jq -nc --arg ts "$NOW" --arg tid "$tid" \
+    '{ts: $ts, event: "completed", task_id: $tid}' \
+    >> "$LOG_PATH"
+  rm -f "${POD_STATE}/dispatched/${tid}.json" 2>/dev/null || true
+done
+
+if [ "$EMIT_JSON" -eq 1 ]; then
+  printf '%s\n' "${freed[@]}" | jq -R . | jq -s .
+else
+  for tid in "${freed[@]}"; do
+    echo "$tid"
+  done
+fi

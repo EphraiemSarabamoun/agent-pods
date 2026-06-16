@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# pod-deliver <window_id> [--mode none|buffer|submit] [--dry-run] — surface unread
+# pod-mail to an agent that has NO lifecycle hooks (codex, cursor, a shell, ...), by
+# typing a one-line notification into its pane with tmux send-keys.
+#
+# This is what makes pod-comms universal: hook-capable agents (Claude Code) get mail
+# injected as additionalContext by their own hook and are SKIPPED here; everyone else
+# gets the floor — a send-keys notification, delivered only when it's safe.
+#
+# Delivery mode (auto-resolved per recipient, override with --mode):
+#   none    @pod_native_delivery=1 -> the agent surfaces mail itself; do nothing.
+#   buffer  type the line, do NOT press Enter (a plain shell: visible at the prompt,
+#           never executed). Safe but the recipient won't "act" until a human submits.
+#   submit  type the line AND press Enter (an idle AI agent at its prompt gets a turn).
+#           Default for AI poll-agents; gated hard (see below). Set POD_DELIVER_SUBMIT=0
+#           to force every agent to buffer mode (most conservative).
+#
+# SAFETY GATES (all must pass for submit; buffer skips the settle re-check):
+#   1. non-empty window id            (EMPTY-TARGET FOOTGUN: blank -t hits the ACTIVE window)
+#   2. recipient @cc_state == idle    (never interrupt a working agent)
+#   3. pane not in a full-screen app  (vim/less/man/... would eat the keystrokes as commands)
+#   4. (submit only) the pane is settled across a 0.4s re-check (nobody is typing right now)
+#   5. NEVER send Enter in buffer mode -> a clobber is at worst editable text, never a run.
+#
+# Notifies once per batch of unread lines via a per-mailbox high-water mark, so the
+# poller calling this every cycle doesn't re-ping the same mail. bash 3.2 safe.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"; . "$POD_BIN/_pod-common.sh"
+T="$POD_TMUX"
+
+win=""; mode=""; dry=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --mode) mode="${2:-}"; shift 2 ;;
+    --dry-run) dry=1; shift ;;
+    @*|[0-9]*) win="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+[ -n "$win" ] || { echo "usage: pod-deliver <window_id> [--mode ...] [--dry-run]" >&2; exit 1; }   # gate 1
+
+# resolve recipient pod + mailbox (the recipient's OWN pod, from the window's session).
+sess="$("$T" display-message -p -t "$win" '#{session_name}' 2>/dev/null)"
+[ -n "$sess" ] || exit 0
+maildir="$(pod_dir_for "$sess")"
+mbox="$maildir/${win}.mbox"
+hwf="$maildir/${win}.hw"
+[ -f "$mbox" ] || exit 0
+
+# how many lines are unread vs already-notified (high-water).
+count="$(awk 'END{print NR+0}' "$mbox" 2>/dev/null || echo 0)"
+hw="$(cat "$hwf" 2>/dev/null || echo 0)"
+case "$hw" in ''|*[!0-9]*) hw=0 ;; esac
+if [ "$count" -eq 0 ]; then printf '0' > "$hwf" 2>/dev/null || true; exit 0; fi   # pod-mail drained it
+if [ "$count" -lt "$hw" ]; then hw=0; fi                                           # shrank -> reset
+[ "$count" -gt "$hw" ] || exit 0                                                   # nothing new
+
+# resolve delivery mode if not forced.
+if [ -z "$mode" ]; then
+  nd="$("$T" show-options -wqv -t "$win" @pod_native_delivery 2>/dev/null)"
+  if [ "$nd" = "1" ]; then
+    mode="none"
+  else
+    aid="$("$T" show-options -wqv -t "$win" @agent_id 2>/dev/null)"
+    [ -n "$aid" ] || aid="$("$POD_BIN/pod-detect" "$win" 2>/dev/null)"
+    adv="$("$POD_ADAPTER" field "$aid" deliver 2>/dev/null || true)"   # optional adapter override
+    if [ -n "$adv" ]; then mode="$adv"
+    elif [ "$aid" = "generic-shell" ]; then mode="buffer"
+    else mode="submit"; fi
+  fi
+fi
+[ "${POD_DELIVER_SUBMIT:-1}" = "0" ] && [ "$mode" = "submit" ] && mode="buffer"
+[ "$mode" = "none" ] && { printf '%s' "$count" > "$hwf" 2>/dev/null || true; exit 0; }
+
+# gate 2: only deliver to an idle recipient.
+st="$("$T" show-options -wqv -t "$win" @cc_state 2>/dev/null)"
+[ "$st" = "idle" ] || exit 0
+
+# gate 3: don't type into a full-screen program (it would interpret keystrokes).
+pcmd="$("$T" display-message -p -t "$win" '#{pane_current_command}' 2>/dev/null)"
+case "$pcmd" in
+  vi|vim|nvim|view|less|more|most|man|emacs|nano|pico|micro|htop|top|atop|btop|watch|fzf|git) exit 0 ;;
+esac
+
+# build the one-line notification from the NEW (un-notified) mailbox lines.
+newcnt=$(( count - hw ))
+last="$(awk -v s="$hw" 'NR>s{l=$0} END{print l}' "$mbox" 2>/dev/null)"
+last="$(printf '%s' "$last" | tr '\n\r\t' '   ' | cut -c1-200)"
+if [ "$newcnt" -gt 1 ]; then
+  note="[pod-mail] $newcnt new. latest: $last  (run pod-mail to read all)"
+else
+  note="[pod-mail] $last  (run pod-mail to read all)"
+fi
+
+if [ "$dry" = "1" ]; then
+  echo "would deliver (mode=$mode) to $win: $note"
+  exit 0
+fi
+
+# gate 4 (submit only): make sure nobody is actively typing/streaming right now.
+if [ "$mode" = "submit" ]; then
+  h1="$("$T" capture-pane -p -t "$win" 2>/dev/null | cksum | awk '{print $1}')"
+  sleep 0.4
+  h2="$("$T" capture-pane -p -t "$win" 2>/dev/null | cksum | awk '{print $1}')"
+  [ "$h1" = "$h2" ] || exit 0          # screen changed -> active -> retry next cycle
+fi
+
+# deliver. -l = literal text (no key interpretation). gate 5: Enter ONLY in submit mode.
+"$T" send-keys -t "$win" -l "$note" 2>/dev/null || exit 0
+if [ "$mode" = "submit" ]; then
+  sleep 0.15                            # let the literal text land before Enter (race guard)
+  "$T" send-keys -t "$win" Enter 2>/dev/null || true
+fi
+
+printf '%s' "$count" > "$hwf" 2>/dev/null || true   # high-water: don't re-ping these lines

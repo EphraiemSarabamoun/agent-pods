@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# pod — roster of the agents sharing this tmux session (the "POD").
+#
+# Any window can run `pod` to see its podmates: the manager (window 0) and every
+# worker window in the same session. Marks which one is "you" and enriches each with
+# its identity card + live status / current-task / color from the registry.
+#
+# Terminology: the POD is the live cluster of co-located agent instances (one tmux
+# session). The FLEET (if you run agent-pods across machines) is the host mesh.
+#
+# Works from any window. bash 3.2 safe (no mapfile / associative arrays).
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+T="$POD_TMUX"
+WORKERS_JSON="$POD_STATE/workers.json"
+GRP="$POD_STATE/tmux_group.json"
+
+SESS=""; ME=""
+if [ -n "${TMUX:-}" ]; then
+  # Pin the query to the CALLING pane ($TMUX_PANE), not the session's active window,
+  # so "you" lands on the right instance.
+  if [ -n "${TMUX_PANE:-}" ]; then
+    SESS="$("$T" display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null)"
+    ME="$("$T" display-message -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null)"
+  else
+    SESS="$("$T" display-message -p '#{session_name}' 2>/dev/null)"
+    ME="$("$T" display-message -p '#{window_id}' 2>/dev/null)"
+  fi
+elif [ -f "$GRP" ]; then
+  SESS="$(jq -r '.pod // .session // empty' "$GRP" 2>/dev/null)"
+fi
+
+if [ -z "$SESS" ]; then
+  echo "not in a pod (no tmux session detected)"
+  exit 0
+fi
+
+roster="$("$T" list-windows -t "$SESS" \
+  -F '#{window_id}|#{window_index}|#{window_name}|#{window_active}' 2>/dev/null)"
+if [ -z "$roster" ]; then
+  echo "POD '$SESS' — no windows found (session may have ended)"
+  exit 0
+fi
+
+n="$(printf '%s\n' "$roster" | awk -F'|' '$1!=""{c++} END{print c+0}')"
+echo "POD '$SESS' — $n instance(s):"
+printf '%s\n' "$roster" | while IFS='|' read -r wid widx wname wact; do
+  [ -z "$wid" ] && continue
+  tag="";  [ "$widx" = "0" ] && tag=" (manager)"
+  act="";  [ "$wact" = "1" ] && act=" *active"
+  you="";  [ -n "$ME" ] && [ "$wid" = "$ME" ] && you="   <-- you"
+  # identity card (agent · model · effort), cached on the window by pod-detect / the
+  # spawn path / the statusLine hook. Fall back to the agent label, then nothing.
+  card="$("$T" show-options -wqv -t "$wid" @card 2>/dev/null)"
+  [ -n "$card" ] || card="$("$T" show-options -wqv -t "$wid" @agent 2>/dev/null)"
+  info=""; [ -n "$card" ] && info=" · $card"
+  # live status from the registry, when registered (status / task / color)
+  if [ -f "$WORKERS_JSON" ]; then
+    reg="$(jq -r --arg w "$wid" '.workers[]? | select(.tmux_window==$w) | (if .status then " · "+.status else "" end) + (if .current_task_id then " · "+.current_task_id else "" end) + (if .color then " ("+.color+")" else "" end)' "$WORKERS_JSON" 2>/dev/null | head -1)"
+    [ -n "$reg" ] && info="$info$reg"
+  fi
+  stars="$("$T" show-options -wqv -t "$wid" @stars 2>/dev/null)"
+  star=""; { [ -n "$stars" ] && [ "$stars" -gt 0 ] 2>/dev/null; } && star="  ⭐×$stars"
+  printf "  [%s:%s]%s%s%s%s%s\n" "$widx" "$wname" "$tag" "$info" "$star" "$act" "$you"
+done

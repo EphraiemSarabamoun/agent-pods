@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# pod-login [agent-id] — set up LIVE model discovery for an agent that pulls its
+# models from a provider REST API (claude-code -> anthropic, codex -> openai).
+#
+# It first checks whether a usable key already exists (env var, a key the CLI itself
+# stored, or one you added before) — if so, you're already done. Otherwise it explains
+# why a key is needed (subscription logins can't enumerate models), points you at the
+# provider's key page, reads your key WITHOUT echoing it, VALIDATES it with a live
+# /v1/models call, and only then stores it at ~/.config/pod/keys/<provider> (chmod 600).
+#
+# With no agent-id it walks every installed agent that supports API discovery.
+# Nothing here is destructive: skip any agent and it keeps its curated model list.
+set -u
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ADAPTER="${POD_ADAPTER:-$HERE/pod-adapter}"
+DISCOVER="${POD_DISCOVER_API:-$HERE/pod-discover-api}"
+KEYDIR="${POD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/pod}/keys"
+
+console_url() {
+  case "$1" in
+    anthropic) echo "https://console.anthropic.com/settings/keys" ;;
+    openai)    echo "https://platform.openai.com/api-keys" ;;
+    *)         echo "(your provider's API-keys page)" ;;
+  esac
+}
+
+provider_name() {
+  case "$1" in anthropic) echo "Anthropic" ;; openai) echo "OpenAI" ;; *) echo "$1" ;; esac
+}
+
+# The subscription whose login canNOT list models (so the user understands why a key
+# is needed), named per provider.
+subscription_name() {
+  case "$1" in
+    anthropic) echo "Claude Pro/Max subscription" ;;
+    openai)    echo "ChatGPT subscription" ;;
+    *)         echo "subscription" ;;
+  esac
+}
+
+# Resolve the provider an agent authenticates against, from its [discover].auth field.
+provider_of() { "$ADAPTER" field "$1" auth 2>/dev/null; }
+
+# True if discovery already works for this provider (a key resolves AND the call 200s).
+already_live() { "$DISCOVER" "$1" >/dev/null 2>&1; }
+
+login_one() {
+  local agent="$1" prov; prov="$(provider_of "$agent")"
+  if [ -z "$prov" ]; then
+    echo "  $agent: no API discovery (curated model list) — nothing to log in to."
+    return 0
+  fi
+
+  if already_live "$prov"; then
+    local n; n="$("$DISCOVER" "$prov" 2>/dev/null | grep -c . || echo 0)"
+    echo "  $agent: already logged in via $prov ($n models live). ✓"
+    return 0
+  fi
+
+  echo ""
+  echo "  $agent -> $(provider_name "$prov")"
+  echo "  A $(subscription_name "$prov") login can't list models, so agent-pods needs an"
+  echo "  $(provider_name "$prov") API key to show your live model list. Create one here:"
+  echo "      $(console_url "$prov")"
+  if [ ! -t 0 ]; then
+    echo "  (non-interactive shell — re-run 'pod-login $agent' in a terminal to paste a key.)"
+    return 0
+  fi
+  printf '  Paste your %s API key (or press Enter to skip and keep the curated list): ' "$(provider_name "$prov")"
+  local key; IFS= read -rs key; echo
+  if [ -z "$key" ]; then
+    echo "  skipped — $agent keeps its curated models."
+    return 0
+  fi
+
+  # Validate before persisting: stage the key in a temp file the resolver will read,
+  # run discovery, keep it only if the live call returns at least one model.
+  mkdir -p "$KEYDIR"; chmod 700 "$KEYDIR" 2>/dev/null || true
+  local tmp; tmp="$(mktemp "$KEYDIR/.$prov.try.XXXXXX")"
+  printf '%s' "$key" > "$tmp"; chmod 600 "$tmp"
+  local n; n="$(_validate "$prov" "$tmp")"
+  if [ "${n:-0}" -ge 1 ]; then
+    mv -f "$tmp" "$KEYDIR/$prov"; chmod 600 "$KEYDIR/$prov"
+    echo "  ✓ $agent logged in — $n live $prov models. Stored at $KEYDIR/$prov (chmod 600)."
+    "$ADAPTER" refresh "$agent" >/dev/null 2>&1 || true
+  else
+    rm -f "$tmp"
+    echo "  ✗ that key didn't authenticate against $prov /v1/models — nothing stored. Try again."
+    return 1
+  fi
+}
+
+# Validate a candidate key file by pointing the resolver's keyfile at it and counting
+# returned models. Keeps key handling in one place (pod-discover-api).
+_validate() {
+  local prov="$1" candidate="$2"
+  local sandbox; sandbox="$(mktemp -d)"
+  mkdir -p "$sandbox/keys"; cp "$candidate" "$sandbox/keys/$prov"; chmod 600 "$sandbox/keys/$prov"
+  # Unset env keys so we validate THIS candidate, not an ambient one.
+  local count
+  count="$(env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY \
+           POD_CONFIG_DIR="$sandbox" "$DISCOVER" "$prov" 2>/dev/null | grep -c . || true)"
+  rm -rf "$sandbox"
+  printf '%s' "${count:-0}"
+}
+
+main() {
+  echo "agent-pods login — live model discovery"
+  if [ "$#" -ge 1 ]; then
+    login_one "$1"; return $?
+  fi
+  # No agent given: every installed agent that declares [discover].auth.
+  local any=0
+  while IFS= read -r a; do
+    [ -z "$a" ] && continue
+    if [ -n "$(provider_of "$a")" ]; then any=1; login_one "$a"; fi
+  done < <("$ADAPTER" list --available 2>/dev/null)
+  [ "$any" = 0 ] && echo "  no installed agent uses API discovery (cursor/ollama discover with no login)."
+  return 0
+}
+
+main "$@"

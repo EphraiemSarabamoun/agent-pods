@@ -1,0 +1,33 @@
+# OpenCode (open-source terminal agent). Poll agent. --model usually takes a
+# provider/model id; adjust to your configured providers.
+[agent]
+id       = "opencode"
+label    = "OpenCode"
+priority = 46
+
+[launch]
+base_cmd   = "opencode"
+model_arg  = ["--model", "{model}"]
+effort_arg = []
+
+[detect]
+pane_cmd_patterns = ['^(opencode|node|bun)$']
+content_patterns  = ['(?i)opencode']
+reject_content    = []
+
+[defaults]
+model             = ""
+effort            = ""
+card_scrape_regex = ''
+
+[lifecycle]
+mode            = "poll"
+installer       = ""
+native_delivery = false
+state_source    = "poll"
+
+[[models]]
+slug  = "default"
+label = "Default"
+model = ""
+efforts = []

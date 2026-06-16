@@ -1,0 +1,32 @@
+# generic-shell — the catch-all. ALWAYS present, ALWAYS last (priority 9999), so any
+# pane that no other adapter claims is still a first-class podmate: it shows in the
+# roster, gets a color, a poll-based state dot, and pod-mail via send-keys. Spawn one
+# to get a plain shell window in the deck (run anything in it), or as the default
+# manager seat. This is what makes agent-pods work even with NO AI agent installed.
+[agent]
+id       = "generic-shell"
+label    = "Shell"
+priority = 9999
+
+[launch]
+base_cmd   = "${SHELL:-/bin/bash}"   # a shell expansion, evaluated at spawn (not by pod-adapter)
+model_arg  = []
+effort_arg = []
+
+[detect]
+pane_cmd_patterns = ['.*']           # matches anything -> the last-resort claim
+content_patterns  = []
+reject_content    = []
+
+[defaults]
+model             = ""
+effort            = ""
+card_scrape_regex = ''
+
+[lifecycle]
+mode            = "poll"
+installer       = ""
+native_delivery = false
+state_source    = "poll"
+
+# no [[models]] — a shell has no model/effort to pick.

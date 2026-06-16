@@ -1,0 +1,519 @@
+#!/usr/bin/env bash
+# pod-summary [--pane] [session] — "who worked on what" panel for the pod.
+#
+# Lists every agent in the pod (manager + workers) with its identity + live state +
+# a brief headline of what it's working on (the @work stamp from pod-work), then the
+# pod chat feed (newest first, rendered by pod-feed) in the rows left below.
+#
+# TWO MODES:
+#
+# • pane mode (--pane, the ☰ default): runs inside a black column docked on the
+#   RIGHT edge by pod-summary-pane, the card at its top (the closest tmux gets to a
+#   non-modal top-right box — panes tile as rectangles). NON-MODAL — keyboard focus
+#   stays in the agent pane, so you keep typing to agents and clicking tabs while
+#   this stays visible; pod-summary-pane's session-window-changed hook drags the
+#   pane along to whichever window you switch to. Auto-refreshes every 2s. If you
+#   click INTO the pane it becomes interactive: j/k or arrows move the cursor, digit
+#   jumps to that window index, ⏎/o opens the agent (summary stays docked), x
+#   terminates (inline y/n confirm; window 0 refused), q closes the sidebar
+#   (undocks + unhooks).
+#
+# • popup mode (no flag): a modal `tmux display-popup -E` — same keys, but ⏎/q close
+#   it. Kept for ad-hoc `pod-summary` runs.
+#
+# Terminate reuses pod-kill-worker so registry cleanup is identical to the red ✕
+# path. When stdin isn't a TTY (piped in a test) it paints once and exits.
+# bash 3.2 safe.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"; . "$POD_BIN/_pod-common.sh"
+T="$POD_TMUX"
+
+MODE=popup
+case "${1:-}" in --pane) MODE=pane; shift ;; esac
+sess="${1:-${POD_SESSION:-$POD_SESSION_PREFIX}}"
+
+# Activity timer: time in the CURRENT state (@state_since, stamped by pod-state on
+# every transition) rendered dashboard-coarse so the 2s tick never jitters: under a
+# minute -> EMPTY (fresh flips stay calm), then 4m / 59m, then hours collapse to 2h.
+# 3 visible cols max, right-aligned by the caller so units stack.
+# Sets AGE_OUT (no stdout: a $(...) capture would fork a subshell per row per tick).
+age_fmt() {
+  AGE_OUT=""
+  case "${1:-}" in ''|*[!0-9]*) return ;; esac
+  local d=$(( NOW_EPOCH - $1 )); [ "$d" -lt 0 ] && d=0
+  if   [ "$d" -lt 60 ];     then :
+  elif [ "$d" -lt 3600 ];   then AGE_OUT="$(( d / 60 ))m"
+  elif [ "$d" -lt 359999 ]; then AGE_OUT="$(( d / 3600 ))h"
+  else AGE_OUT="99h"; fi
+}
+
+WID=(); WIDX=(); WNAME=(); STATE=(); HEAD=(); TAG=(); AGE=(); n=0; AGENT_COLORS=""; MGR_NAME=""
+COLS=120; ROWS=40; RULE=""; LIMIT=12; HDRTIME=""
+load_rows() {
+  WID=(); WIDX=(); WNAME=(); STATE=(); HEAD=(); TAG=(); AGE=(); AGENT_COLORS=""; MGR_NAME=""
+  read -r NOW_EPOCH HDRTIME <<EOF
+$(date '+%s %H:%M:%S')
+EOF
+  # terminal geometry + the rule are per-TICK globals now, not per-frame forks:
+  # scroll frames must spawn nothing (the lag was tput+awk+date+python per frame).
+  # A resize is picked up at the next 2s tick — acceptable staleness.
+  COLS="$( { command -v tput >/dev/null && tput cols; } 2>/dev/null || echo 120)"
+  ROWS="$( { command -v tput >/dev/null && tput lines; } 2>/dev/null || echo 40)"
+  local rw=$((COLS - 4)); [ "$rw" -gt 58 ] && rw=58; [ "$rw" -lt 10 ] && rw=10
+  RULE="$(awk -v n="$rw" 'BEGIN{while(n-->0)printf "─"}')"
+  # the pod's FULL AUTO switch (session option @full_auto): the manager's 👑 crown
+  # shows ONLY in full auto, mirroring the strip's window-0 crown gate in pod-launch.
+  # One fork per 2s tick — in load_rows (the tick path), NOT draw_frame (the
+  # zero-fork scroll hot path). Read via window-0 scope (option inheritance: window
+  # -> session) with the SAME =$sess:0 target form list-windows uses below —
+  # `show-options -t "=$sess"` errors "no such session" on this tmux (the `=` exact
+  # prefix isn't honored for session targets), silently returning empty and never
+  # lighting the crown. Empty/unset reads as not-auto -> no crown.
+  FULLAUTO="$("$T" display-message -p -t "=$sess:0" '#{@full_auto}' 2>/dev/null)"
+  # EVERYTHING rides ONE list-windows call. \x1f (US, the unit separator) because
+  # @work is FREE TEXT and can contain '|' (the old @card pipe caveat, generalized).
+  # MUST be \x1f, NOT tab: tab is IFS-WHITESPACE, so bash 3.2 collapses runs of it
+  # and DROPS empty fields — an empty field would shift the read and corrupt the
+  # card. \x1f is non-whitespace: it splits cleanly and PRESERVES empty fields.
+  # (\x01 was an earlier attempt — bash 3.2 ate it; \x1f survives the tmux→read
+  # pipeline.) The free-text @work field rides LAST; `work` takes the remainder.
+  local SEP=$'\x1f'
+  while IFS="$SEP" read -r wid widx wname state since card style work; do
+    [ -n "$wid" ] || continue
+    # each agent's EXACT tab color (bg colour of its window-status-style) + the
+    # manager's name — handed to pod-feed so feed names/@tags match the strip.
+    local c; c="${style#*bg=colour}"; c="${c%%[!0-9]*}"
+    [ -n "$c" ] && AGENT_COLORS="${AGENT_COLORS}${wname}=${c}
+"
+    [ "$widx" = "0" ] && MGR_NAME="$wname"
+    # the headline: WHAT this agent is working on (the @work stamp). Until its first
+    # prompt @work is empty -> a calm placeholder.
+    local head
+    head="$work"
+    [ -n "$head" ] || head="(nothing yet)"
+    # Compact identity tag from @card ("Agent · Model · effort[ · suffix]"):
+    # agent "logo" (closest single-width NON-EMOJI Unicode mark in the brand's
+    # color — emoji-presentation codepoints render double-width in many terminals
+    # and would shear the dot column) + a model code (versions dropped on purpose:
+    # F not F5 — the glyph + family is the signal) + effort suffix (-l/-m/-h/-xh/-u).
+    # Local/unknown models fall through to the generic rule: first letter upper +
+    # the :NNb size (qwen3.6:35b -> Q35) or the family digits (r1-redteam -> R1).
+    # Worst case ⬡G5.5-xh = 8 visible cols; padded to 8 so the state dots stay
+    # aligned; un-carded windows get a blank pad. ANSI is stored as literal \033
+    # escapes — the row printf renders the field with %b.
+    local agent rest model eff r2 code esuf glyph gc gvis tag pad sp c1 d
+    agent="${card%% · *}"
+    rest="${card#* · }"; [ "$rest" = "$card" ] && rest=""
+    model="${rest%% · *}"
+    eff=""; r2="${rest#* · }"; [ "$r2" != "$rest" ] && eff="${r2%% · *}"
+    code=""
+    case "$model" in
+      Fable*)         code=F ;;
+      Opus*)          code=O ;;
+      Sonnet*)        code=S ;;
+      Haiku*)         code=H ;;
+      GPT*|Codex*)    code="G${model//[!0-9.]/}"; code="${code:0:4}"; code="${code%.}" ;;  # GPT-5.5 -> G5.5
+      Gemini*Flash*)  code=GF ;;
+      Gemini*Pro*)    code=GP ;;
+      Composer*)      code="C${model//[!0-9.]/}"; code="${code:0:4}"; code="${code%.}" ;;  # Composer 2.5 -> C2.5
+      ?*)
+        # generic fallback (local models, future unknowns): first letter upper +
+        # parameter size from a ":NNb" suffix, else the first token's digits
+        c1="${model:0:1}"; case "$c1" in [a-z]) c1="$(printf '%s' "$c1" | tr a-z A-Z)" ;; esac
+        case "$model" in
+          *:*[bB]) d="${model##*:}"; d="${d//[!0-9]/}" ;;
+          *)       d="${model%% *}"; d="${d//[!0-9.]/}"; d="${d%.}" ;;
+        esac
+        code="${c1}${d}"; code="${code:0:4}" ;;
+    esac
+    esuf=""
+    case "$eff" in
+      [Ll]ow)           esuf="-l"  ;;
+      [Mm]ed*)          esuf="-m"  ;;
+      [Hh]igh)          esuf="-h"  ;;
+      [Xx]high)         esuf="-xh" ;;
+      [Mm]ax|[Uu]ltra*) esuf="-u"  ;;
+    esac
+    [ -n "$code" ] || esuf=""   # never a bare effort suffix
+    glyph=""; gc=""
+    case "$agent" in
+      Claude*)      glyph=✶; gc=173 ;;   # Anthropic starburst, terracotta
+      Codex*)       glyph=⬡; gc=36  ;;   # OpenAI hex knot, teal
+      Antigravity*) glyph=✦; gc=39  ;;   # Gemini sparkle, azure
+      Cursor*)      glyph=❖; gc=250 ;;   # Cursor cube facets, white
+      OpenClaw*)    glyph=ψ; gc=203 ;;   # the claw, lobster red
+    esac
+    tag=""; gvis=0
+    [ -n "$glyph" ] && { tag="\033[38;5;${gc}m${glyph}\033[0m"; gvis=1; }
+    [ -n "$code" ]  && tag="${tag}\033[2m${code}${esuf}\033[0m"
+    pad=$(( 8 - gvis - ${#code} - ${#esuf} )); [ "$pad" -lt 0 ] && pad=0
+    sp=""; [ "$pad" -gt 0 ] && printf -v sp '%*s' "$pad" ''
+    age_fmt "$since"
+    WID+=("$wid"); WIDX+=("$widx"); WNAME+=("$wname"); STATE+=("$state"); HEAD+=("$head"); TAG+=("${tag}${sp}"); AGE+=("$AGE_OUT")
+  done < <("$T" list-windows -t "=$sess" -F "#{window_id}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{@cc_state}${SEP}#{@state_since}${SEP}#{@card}${SEP}#{window-status-style}${SEP}#{@work}" 2>/dev/null)
+  n=${#WID[@]}
+  LIMIT=$((ROWS - n - 7))   # header + rule + cards + rule + hints(≤2) + spacer + spare
+  load_feed
+}
+
+# ── feed cache: the chat is wrapped ONCE per tick (the python spawn that used to
+# run per frame), then scroll frames assemble views from the in-memory array with
+# zero process spawns. Cache line shape: "ord|more|plen|rendered" — ord = message
+# index newest-first, more=1 while the message continues on the next line, plen =
+# visible width (for the … cue). rendered may contain '|'; parse 3 fields, the
+# remainder is the line.
+FEEDC=(); FEED_NLINES=0; FEED_TOTAL_C=0
+load_feed() {
+  FEEDC=(); local i=0 l
+  while IFS= read -r l; do FEEDC[$i]="$l"; i=$((i+1)); done < <(
+    POD_COLS="$COLS" POD_AGENT_COLORS="$AGENT_COLORS" POD_MANAGER_NAME="$MGR_NAME" \
+    POD_FEED_CACHE=1 "$POD_BIN/pod-feed" "$(pod_chan_for "$sess")" 2>/dev/null)
+  FEED_NLINES=$i
+  if [ "$i" -gt 0 ]; then FEED_TOTAL_C=$(( ${FEEDC[$((i-1))]%%|*} + 1 )); else FEED_TOTAL_C=0; fi
+}
+
+# feed_maxoff — the BOTTOM STOP: smallest offset where the OLDEST message renders
+# fully at the foot of the budget. Walks the cache tail message-by-message; pure
+# bash arithmetic. Result in MAXOFF.
+feed_maxoff() {
+  local i ord cnt K=0 acc=0 lim
+  MAXOFF=0
+  [ "$FEED_NLINES" -gt 0 ] || return 0
+  i=$((FEED_NLINES - 1))
+  while [ "$i" -ge 0 ]; do
+    ord="${FEEDC[$i]%%|*}"; cnt=0
+    while [ "$i" -ge 0 ] && [ "${FEEDC[$i]%%|*}" = "$ord" ]; do cnt=$((cnt+1)); i=$((i-1)); done
+    if [ $((K + 1)) -eq "$FEED_TOTAL_C" ]; then lim="$LIMIT"; else lim=$((LIMIT - 1)); fi
+    [ $((acc + cnt)) -gt "$lim" ] && break
+    acc=$((acc + cnt)); K=$((K + 1))
+  done
+  MAXOFF=$((FEED_TOTAL_C - K))
+  [ "$MAXOFF" -ge "$FEED_TOTAL_C" ] && MAXOFF=$((FEED_TOTAL_C - 1))
+  [ "$MAXOFF" -lt 0 ] && MAXOFF=0
+}
+
+# feed_view — build the feed region (indicator, slice from FEED_OFF, partial-cut
+# … cue, start-of-pod marker) from the cache into FEED_OUT (real escape bytes,
+# every line ending \033[K — the in-place-repaint contract). A string, not
+# stdout, so paint_feed can emit it without a $(…) subshell fork. Zero spawns:
+# this is the scroll hot path.
+feed_view() {
+  local out=0 i=0 ord more plen rest line
+  local D=$'\033[2m' RS=$'\033[0m' EK=$'\033[K' NL=$'\n'
+  FEED_OUT=""
+  [ "$LIMIT" -ge 1 ] || return 0
+  if [ "$FEED_NLINES" -eq 0 ]; then
+    FEED_OUT=" ${D}no messages yet — pod-tell chat \"hello pod\"${RS}${EK}${NL}"; return 0
+  fi
+  if [ "$FEED_OFF" -gt 0 ]; then
+    FEED_OUT=" ${D}↑ ${FEED_OFF} newer hidden · d=newer r=live${RS}${EK}${NL}"; out=1
+    while [ "$i" -lt "$FEED_NLINES" ] && [ "${FEEDC[$i]%%|*}" -lt "$FEED_OFF" ]; do i=$((i+1)); done
+  fi
+  while [ "$i" -lt "$FEED_NLINES" ] && [ "$out" -lt "$LIMIT" ]; do
+    line="${FEEDC[$i]}"
+    ord="${line%%|*}"; rest="${line#*|}"
+    more="${rest%%|*}"; rest="${rest#*|}"
+    plen="${rest%%|*}"; rest="${rest#*|}"
+    if [ $((out + 1)) -ge "$LIMIT" ] && [ "$more" = "1" ]; then
+      # budget ends mid-message: cut here, dim … cue when a column is spare
+      if [ "$plen" -lt $((COLS - 1)) ]; then FEED_OUT="${FEED_OUT}${rest}${D}…${RS}${EK}${NL}"
+      else FEED_OUT="${FEED_OUT}${rest}${EK}${NL}"; fi
+      return 0
+    fi
+    FEED_OUT="${FEED_OUT}${rest}${EK}${NL}"
+    out=$((out + 1)); i=$((i + 1))
+  done
+  if [ "$FEED_OFF" -gt 0 ] && [ "$i" -ge "$FEED_NLINES" ] && [ "$out" -lt "$LIMIT" ]; then
+    FEED_OUT="${FEED_OUT} ${D}— start of pod —${RS}${EK}${NL}"
+  fi
+}
+
+# paint_feed — the scroll FAST PATH: reposition to the feed region and repaint
+# only it. Header/cards stay untouched on screen (less terminal churn) and there
+# is no $(…) subshell — a scroll frame is one dd + pure bash + one printf.
+# Layout mirror of draw_frame: header(1) rule(1) cards(n) rule(1) hints(2 pane /
+# 1 popup) spacer(1) → feed starts at row n+7 (pane) / n+6 (popup). Only valid
+# while msg is empty (a status note changes the hint-block height) — else full draw.
+paint_feed() {
+  if [ -n "$msg" ]; then draw "$cur"; return; fi
+  local row=$((n + 7)); [ "$MODE" = pane ] || row=$((n + 6))
+  feed_view
+  printf '\033[%d;1H%s\033[0J' "$row" "$FEED_OUT"
+}
+
+# draw_frame <cursor_index> — emit one frame. Interactive frames (cur >= 0) repaint
+# IN PLACE: home the cursor (no \033[2J — a full clear lets the terminal render a
+# blank frame between clear and redraw = the 2s flicker), erase each line's tail
+# with \033[K, and erase everything below the frame with \033[0J.
+draw_frame() {
+  # ZERO process spawns in here — this is the scroll hot path. Geometry (COLS/
+  # ROWS), RULE, HDRTIME, LIMIT, and the feed cache are all per-tick globals from
+  # load_rows; the only fork per frame is draw()'s own $(…) capture.
+  local cur="$1" i=0 dot crown ptr namesty head maxw eol='' tagcol tagf agef hb ow np
+  # identity-tag column (logo + model code + effort suffix, 8 visible cols) and the
+  # activity timer (3 cols, right-aligned after the dot) only when there's room;
+  # below 55 cols the layout degrades to the bare original (55 = 22 base prefix +
+  # 9 tag column + 4 timer column + the 20-col headline floor, so the gate itself
+  # can never push a card into a wrap).
+  tagcol=0; [ "$COLS" -ge 55 ] && tagcol=1
+  maxw=$((COLS - 22)); [ "$tagcol" = 1 ] && maxw=$((COLS - 35)); [ "$maxw" -lt 20 ] && maxw=20
+  if [ "$cur" -ge 0 ]; then printf '\033[?25l\033[H'; eol='\033[K'; fi
+  # header: bold plain — pod badge + header both neutral (window 0 owns purple).
+  printf '\033[1m  %s Pod\033[0m \033[2m%s\033[0m'"$eol"'\n' "$sess" "$HDRTIME"
+  printf '  %s'"$eol"'\n' "$RULE"
+  while [ "$i" -lt "$n" ]; do
+    crown="  "; [ "${WIDX[$i]}" = "0" ] && [ "$FULLAUTO" = "1" ] && crown="👑"
+    case "${STATE[$i]}" in
+      idle) dot='\033[92m●\033[0m' ;; busy) dot='\033[93m◐\033[0m' ;;
+      wait) dot='\033[93m◆\033[0m' ;; *)   dot='\033[90m○\033[0m' ;;
+    esac
+    if [ "$i" = "$cur" ]; then ptr='\033[1;96m▸\033[0m'; namesty='\033[7;1m'; else ptr=' '; namesty='\033[1m'; fi
+    # per-row headline budget: maxw assumes an 11-col name and a 1-digit window
+    # index; longer names (the manager's, usually) and 2-digit indexes (window 10+)
+    # eat the overflow here so a card NEVER wraps — a wrapped row would break the
+    # frame's row count and shove the feed off by a line.
+    ow=0
+    [ "${#WNAME[$i]}" -gt 11 ] && ow=$(( ${#WNAME[$i]} - 11 ))
+    [ "${#WIDX[$i]}" -gt 1 ]   && ow=$(( ow + ${#WIDX[$i]} - 1 ))
+    hb=$((maxw - ow)); [ "$hb" -lt 8 ] && hb=8
+    head="${HEAD[$i]}"; [ "${#head}" -gt "$hb" ] && head="${head:0:$hb}…"
+    tagf=""; agef=" "
+    if [ "$tagcol" = 1 ]; then
+      tagf="${TAG[$i]} "
+      # activity timer: dim, right-aligned 3 cols after the dot ("busy for 18m").
+      # Same gate as the tag column; empty age renders as plain spacing.
+      printf -v agef ' \033[2m%3s\033[0m ' "${AGE[$i]}"
+    fi
+    # name styled with EXACTLY one trailing space, rest of the padding outside the
+    # styled span — %-11s inside the style dragged the selected row's reverse-video
+    # highlight across all the padding spaces (highlight = name + one space, no more).
+    np=""; [ "${#WNAME[$i]}" -lt 11 ] && printf -v np '%*s' $(( 11 - ${#WNAME[$i]} )) ''
+    printf ' %b%b \033[2m%s\033[0m %b%s \033[0m%s%b%b%b\033[2m%s\033[0m'"$eol"'\n' \
+      "$ptr" "$crown" "${WIDX[$i]}" "$namesty" "${WNAME[$i]}" "$np" "$tagf" "$dot" "$agef" "$head"
+    i=$((i + 1))
+  done
+  printf '  %s'"$eol"'\n' "$RULE"
+  if [ "$cur" -ge 0 ]; then
+    if [ -n "$msg" ]; then printf '  \033[93m%s\033[0m'"$eol"'\n' "$msg"
+    elif [ "$MODE" = pane ]; then
+      printf '  \033[2mclick in · ⏎ open · x kill · wheel/u/d chat · q undock\033[0m'"$eol"'\n'
+      printf '  \033[2;36m◂ drag the cyan edge to resize\033[0m'"$eol"'\n'
+    else
+      printf '  \033[2m↑↓/jk move · ⏎/o open · x terminate · r refresh · q close\033[0m'"$eol"'\n'
+    fi
+  else
+    printf '  \033[2mpress any key to close\033[0m\n'
+  fi
+  # ── pod chat, newest first — fills exactly the rows left in the pane so the
+  # frame never scrolls (a short pane gets cards only). Assembled from the per-tick
+  # cache in pure bash; lines are pre-wrapped to POD_COLS and end in \033[K.
+  if [ "$LIMIT" -ge 1 ]; then
+    printf '%b\n' "$eol"
+    feed_view
+    printf '%s' "$FEED_OUT"
+  fi
+  [ "$cur" -ge 0 ] && printf '\033[0J'
+}
+
+# draw <cursor_index> — render a frame as ONE write so the terminal never shows a
+# half-painted state (the other half of the flicker fix).
+draw() {
+  local frame
+  frame="$(draw_frame "$1")"
+  printf '%s' "$frame"
+}
+
+# my current window id (pane mode moves around, so resolve fresh each time)
+my_window() { "$T" display-message -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null; }
+
+act_open() {
+  "$T" select-window -t "${WID[$cur]}" 2>/dev/null
+  if [ "$MODE" = pane ]; then
+    # follow synchronously so the sidebar lands with the switch (the async
+    # session-window-changed hook also fires; follow is idempotent).
+    "$POD_BIN/pod-summary-pane" follow "$sess" >/dev/null 2>&1
+  else
+    exit 0
+  fi
+}
+
+act_kill() {
+  if [ "${WIDX[$cur]}" = "0" ]; then
+    msg="window 0 is the manager — not killable"
+    return
+  fi
+  printf '\n  \033[1;91mterminate %s (%s)? (y/n)\033[0m ' "${WNAME[$cur]}" "${WID[$cur]}"
+  local a=""
+  IFS= read -rsn1 a 2>/dev/null || a=""
+  if [ "$a" = "y" ] || [ "$a" = "Y" ]; then
+    # pane mode: if the sidebar is docked in the window being killed, hop to the
+    # manager window and move ourselves there FIRST, or kill-window takes us with it.
+    if [ "$MODE" = pane ] && [ "${WID[$cur]}" = "$(my_window)" ]; then
+      "$T" select-window -t "${WID[0]}" 2>/dev/null
+      "$POD_BIN/pod-summary-pane" follow "$sess" >/dev/null 2>&1
+    fi
+    msg="$("$POD_BIN/pod-kill-worker" "${WID[$cur]}" 2>&1 | tail -1)"
+  else
+    msg="cancelled"
+  fi
+}
+
+msg=""
+FEED_OFF=0    # chat scroll: how many NEWEST messages are hidden (wheel/u=older d=newer r=live)
+FEED_TOTAL=0  # cache total at last scroll — anchors the view while scrolled
+
+# feed_scroll <delta> — scroll the chat by <delta> messages (+ = older). While
+# scrolled (FEED_OFF>0) the view is ANCHORED: the drift term folds newly arrived
+# messages into FEED_OFF so the "↑ N newer hidden" count grows instead of the
+# view shoving (the tick calls this with delta 0 for pure drift correction, AFTER
+# load_rows refreshed the cache). Clamped to the bottom stop — scrolling halts the
+# moment the oldest message is fully on screen. Pure bash: scroll hot path.
+feed_scroll() {
+  local delta="$1"
+  [ "$FEED_OFF" -gt 0 ] && FEED_OFF=$((FEED_OFF + FEED_TOTAL_C - FEED_TOTAL))
+  FEED_OFF=$((FEED_OFF + delta))
+  feed_maxoff
+  [ "$FEED_OFF" -gt "$MAXOFF" ] && FEED_OFF=$MAXOFF
+  [ "$FEED_OFF" -lt 0 ] && FEED_OFF=0
+  FEED_TOTAL=$FEED_TOTAL_C
+}
+
+# count_tok <string> <token> — occurrences of token in string, pure bash (the
+# burst drain calls this on whole chunks of buffered input; spawning grep per
+# wheel event is exactly the lag this exists to remove). Result in COUNT.
+count_tok() {
+  local s="$1" t="$2" c=0
+  while [ "${s#*"$t"}" != "$s" ]; do s="${s#*"$t"}"; c=$((c+1)); done
+  COUNT=$c
+}
+load_rows
+
+# non-TTY (piped/test): single paint, old behavior
+if ! [ -t 0 ]; then
+  draw -1
+  exit 0
+fi
+
+# Interactive: switch to the ALTERNATE screen buffer. tmux pushes the cleared
+# screen into pane history on every \033[2J, so the 2s repaint loop was stacking
+# a duplicate frame into scrollback per tick (visible on scroll-up). The alt
+# screen has no history — repaints leave no trail. Restore screen + cursor on exit.
+#
+# Also enable MOUSE reporting (1000 = button presses incl. wheel, 1006 = SGR
+# encoding). This is what makes the wheel scroll the chat: tmux's default
+# WheelUp/DownPane binding routes alt-screen panes to `send-keys -M`, which only
+# DELIVERS if the pane opted into a mouse mode — without this the wheel event is
+# silently dropped (there is NO wheel→arrow translation in tmux 3.6b). With
+# mouse_any_flag set, wheel events arrive on stdin as SGR sequences
+# (\033[<64/65;x;yM) whether the pane is focused OR just hovered; clicks still
+# focus the pane first (MouseDown1Pane select-pane runs before the forward) and
+# their reports are swallowed by the parser below.
+printf '\033[?1049h\033[?1006;1000h'
+# Raw-ish tty for the whole session: -echo kills the raw "64;12;5M" digits that
+# the kernel was echoing whenever mouse reports landed BETWEEN reads (read -s is
+# only silent while a read is pending — during the ~50ms repaint the tty echoed);
+# -icanon min 0 time 0 makes the tty non-blocking for dd, which is what lets the
+# burst drain below grab a whole momentum-scroll flood in one gulp on bash 3.2
+# (no fractional read -t there; bash's own read -n calls set their termios per
+# call and are unaffected). Restore the saved state on exit.
+STTY_SAVE="$(stty -g 2>/dev/null || true)"
+stty -echo -icanon min 0 time 0 2>/dev/null || true
+trap 'printf "\033[?1000;1006l\033[?1049l\033[?25h"; [ -n "$STTY_SAVE" ] && stty "$STTY_SAVE" 2>/dev/null' EXIT
+
+cur=0
+draw_due=full
+while :; do
+  [ "$n" -eq 0 ] && exit 0
+  [ "$cur" -ge "$n" ] && cur=$((n - 1))
+  [ "$cur" -lt 0 ] && cur=0
+  # feed = scroll fast path (only the chat region repaints); everything else
+  # takes the full frame.
+  case "$draw_due" in feed) paint_feed ;; *) draw "$cur" ;; esac
+  draw_due=full
+  key=""
+  if [ "$MODE" = pane ]; then
+    # 2s refresh tick: timeout reloads live state; keys only arrive when the
+    # pane is focused (clicked into), so unfocused it's a pure live display.
+    IFS= read -rsn1 -t 2 key 2>/dev/null || { msg=""; load_rows; feed_scroll 0; continue; }
+  else
+    IFS= read -rsn1 key 2>/dev/null || exit 0
+  fi
+  case "$key" in
+    $'\x1b')
+      # arrow keys arrive as ESC [ A/B (or ESC O A/B); a bare ESC closes the popup.
+      # bash 3.2's read -t is integer-only, so a lone ESC takes ~1s to register.
+      seq=""
+      IFS= read -rsn2 -t 1 seq 2>/dev/null || seq=""
+      if [ "$seq" = "[<" ]; then
+        # SGR mouse report (\033[<btn;x;yM|m) forwarded by tmux because we
+        # enabled 1000;1006 above. Consume through the trailing M/m — leaking
+        # the digits into the key loop would fire window-jumps — then dispatch:
+        # wheel up (64) = newer, wheel down (65) = older (feed is newest-first).
+        # Everything else (clicks, releases) is swallowed; the click's focus
+        # side-effect already happened in tmux's MouseDown1Pane binding.
+        mseq="" mch=""
+        while IFS= read -rsn1 -t 1 mch 2>/dev/null; do
+          case "$mch" in M|m) break ;; esac
+          mseq="$mseq$mch"
+        done
+        W=0
+        case "$mseq" in
+          64\;*) W=-1 ;;
+          65\;*) W=1 ;;
+        esac
+        if [ "$MODE" = pane ]; then
+          # BURST DRAIN — exactly ONE gulp per frame. The tty is min 0 time 0
+          # (non-blocking), so a single dd grabs everything buffered since the
+          # last frame; wheel + arrow tokens are counted in pure bash and
+          # applied as one feed_scroll, then the loop paints and comes back for
+          # the next slice. The batch size self-paces to the event rate.
+          # DO NOT loop the dd until empty: under a CONTINUOUS stream (real
+          # trackpad momentum, ~60 ev/s) a drain-until-dry loop never exits —
+          # one gulp per frame is the whole fix. Stray typed keys inside an
+          # active flood are consumed with the chunk — deliberate; leaked digits
+          # would window-jump.
+          chunk="$(dd bs=512 count=1 2>/dev/null)"
+          if [ -n "$chunk" ]; then
+            count_tok "$chunk" $'\x1b[<64;'; W=$((W - COUNT))
+            count_tok "$chunk" $'\x1b[<65;'; W=$((W + COUNT))
+            count_tok "$chunk" $'\x1b[A'; W=$((W - COUNT))
+            count_tok "$chunk" $'\x1bOA'; W=$((W - COUNT))
+            count_tok "$chunk" $'\x1b[B'; W=$((W + COUNT))
+            count_tok "$chunk" $'\x1bOB'; W=$((W + COUNT))
+          fi
+        fi
+        if [ "$W" -ne 0 ]; then feed_scroll "$W"; draw_due=feed; fi
+        continue
+      fi
+      # pane mode: keyboard arrows also scroll the CHAT (down = older); card nav
+      # stays on j/k + digits. Popup mode keeps arrows = card nav.
+      case "$seq" in
+        '[A'|'OA') if [ "$MODE" = pane ]; then feed_scroll -1; draw_due=feed
+                   else [ "$cur" -gt 0 ] && cur=$((cur - 1)); fi ;;
+        '[B'|'OB') if [ "$MODE" = pane ]; then feed_scroll 1; draw_due=feed
+                   else [ "$cur" -lt $((n - 1)) ] && cur=$((cur + 1)); fi ;;
+        '') [ "$MODE" = pane ] || exit 0 ;;
+      esac ;;
+    k) [ "$cur" -gt 0 ] && cur=$((cur - 1)) ;;
+    j) [ "$cur" -lt $((n - 1)) ] && cur=$((cur + 1)) ;;
+    [0-9])
+      i=0
+      while [ "$i" -lt "$n" ]; do
+        [ "${WIDX[$i]}" = "$key" ] && cur=$i
+        i=$((i + 1))
+      done ;;
+    ''|o) act_open ;;          # Enter (read -n1 returns empty on newline) or o
+    x) act_kill; load_rows ;;
+    u) feed_scroll 5; draw_due=feed ;;    # chat: page OLDER (wheel/arrows do single steps)
+    d) feed_scroll -5; draw_due=feed ;;   # chat: page NEWER
+    r) msg=""; FEED_OFF=0; load_rows ;;
+    q)
+      if [ "$MODE" = pane ]; then
+        # undock via off: drops the hook, restores the host window's border
+        # styles, and kills this pane (we die at the kill-pane — that's the point)
+        exec "$POD_BIN/pod-summary-pane" off "$sess"
+      fi
+      exit 0 ;;
+  esac
+done
+exit 0

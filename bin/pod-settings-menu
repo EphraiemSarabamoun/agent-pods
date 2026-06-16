@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+# pod-settings-menu — edit the 10 pod "+" quick-pick slots via chained tmux menus.
+#
+# The settings (gear) button on the pod status strip runs this with no args, which
+# opens the slot picker. Each selection pops the next flat display-menu, drilling:
+#
+#   slot (0-9)  ->  agent  ->  model (of that agent)  ->  effort (of that model)  ->  save
+#
+# A model with no efforts skips straight to save. The save step resolves the launch
+# command + pretty label from the adapter catalog (pod-adapter launch / pod-adapter
+# card), writes the slot into the quick-pick slots file ($POD_SLOTS), and confirms via
+# a tmux status message. The "+" menu (pod-spawn-menu-build) then renders the new slot.
+#
+# Every catalog read goes through pod-adapter (the single TOML reader): list of agents,
+# a model list, an effort list, a launch command, a card label. This file never parses
+# the adapter TOML itself.
+#
+# Mechanics mirror pod-spawn-menu-build exactly (see its header):
+#   - argv built as a Python list -> subprocess.run([...]) (no outer shell quoting)
+#   - every menu's FIRST item is selectable (no "starting choice invalid")
+#   - each item's command is `run-shell -b '<self> --step ... '` (next menu / save)
+#
+# CHAINED-menu nuance (different from the single "+" menu): each step DOES thread
+# `-c <client>` through. A menu item's backgrounded run-shell has no reliable "current
+# client" to auto-resolve, which is what made the 2nd+ menu flaky ("nothing happens").
+# So unlike the one-shot "+" menu (which omits -c), the settings chain keeps the client.
+#
+# Set POD_MENU_PRINT=1 to print the tmux argv instead of opening a menu.
+import argparse, json, os, subprocess, sys, tempfile
+
+SELF = os.path.realpath(__file__)
+HERE = os.path.dirname(SELF)
+# Resolve from the environment (set by _pod-paths.sh), with repo-relative fallbacks.
+POD_BIN = os.environ.get("POD_BIN") or HERE
+POD_REPO = os.environ.get("POD_REPO") or os.path.dirname(POD_BIN)
+ADAPTER = os.environ.get("POD_ADAPTER") or os.path.join(POD_BIN, "pod-adapter")
+SLOTS = os.environ.get("POD_SLOTS") or os.path.join(
+    os.environ.get("POD_CONFIG_DIR", os.path.expanduser("~/.config/pod")), "slots.json"
+)
+STATE = os.environ.get("POD_STATE") or os.path.join(
+    os.environ.get("POD_TMP", "/tmp/pod"), "state"
+)
+# $POD_TMUX is exported by _pod-paths.sh (the launcher/status-action set it); fall back
+# to bare "tmux" on PATH if this is somehow run without that env.
+TMUX = os.environ.get("POD_TMUX") or "tmux"
+LOG = os.path.join(STATE, "pod-settings-menu.log")
+# Client (tty) the menus pop on. Set from --client in main() and threaded through
+# every chained step so each display-menu uses `-c <client>` — a menu item's
+# backgrounded run-shell has no reliable "current client" to auto-resolve, which is
+# what made the 2nd+ menu flaky ("nothing happens"). Empty => fall back to auto-resolve.
+CLIENT = ""
+
+# mnemonic keys for the agent/model/effort menus (the slot menu uses its 0-9 index)
+KEYS = [str(i) for i in range(1, 10)] + [chr(c) for c in range(ord("a"), ord("z") + 1)]
+
+
+def load_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def _adapter(*args):
+    """Run pod-adapter and return stdout (stripped). Empty string on any failure, so
+    callers can treat a missing id/field as "nothing to show"."""
+    try:
+        out = subprocess.run([ADAPTER, *args], capture_output=True, text=True)
+    except Exception:
+        return ""
+    if out.returncode != 0:
+        return ""
+    return out.stdout.rstrip("\n")
+
+
+def list_agents():
+    """Available agent ids (base_cmd resolves on PATH), one per line."""
+    txt = _adapter("list", "--available")
+    return [ln for ln in txt.splitlines() if ln.strip()]
+
+
+def agent_label(agent_id):
+    """The pretty agent label only (card with no model/effort = just the label)."""
+    lbl = _adapter("card", agent_id)
+    return lbl or agent_id
+
+
+def agent_models(agent_id):
+    """[(slug, label), ...] for the agent's models."""
+    out = []
+    for ln in _adapter("models", agent_id).splitlines():
+        if not ln.strip():
+            continue
+        slug, _, label = ln.partition("\t")
+        out.append((slug, label or slug))
+    return out
+
+
+def model_efforts(agent_id, model_slug):
+    """[(slug, label), ...] for the model's efforts (empty if none)."""
+    out = []
+    for ln in _adapter("efforts", agent_id, model_slug).splitlines():
+        if not ln.strip():
+            continue
+        slug, _, label = ln.partition("\t")
+        out.append((slug, label or slug))
+    return out
+
+
+def run_menu(title, items):
+    """items = list of (label, key, command). Opens (or prints) the display-menu."""
+    argv = [TMUX, "display-menu"]
+    if CLIENT:
+        argv += ["-c", CLIENT]
+    argv += ["-T", title]
+    for label, key, command in items:
+        argv += [label, key, command]
+    if os.environ.get("POD_MENU_PRINT"):
+        for a in argv:
+            print(a)
+        return 0
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as lf:
+        lf.write("argv=%r\n" % (argv,))
+        r = subprocess.run(argv, stderr=lf)
+        lf.write("exit=%d\n" % r.returncode)
+    return r.returncode
+
+
+def self_cmd(**kw):
+    """Build the `run-shell -b '<self> --step ...'` command for a menu item.
+    All values (step names, ints, slugs, agent ids) are space-free, so they sit
+    unquoted inside the single-quoted run-shell argument."""
+    parts = [SELF]
+    for k, v in kw.items():
+        if v is None or v == "":
+            continue
+        parts.append(f"--{k}")
+        parts.append(str(v))
+    if CLIENT and "client" not in kw:
+        parts += ["--client", CLIENT]   # keep the client alive across the chain
+    return "run-shell -b '" + " ".join(parts) + "'"
+
+
+def step_slot(slots):
+    items = []
+    for i in range(10):
+        s = slots[i] if i < len(slots) else {}
+        label = s.get("label") or "(empty)"
+        items.append((f"{i}  ·  {label}", str(i), self_cmd(step="agent", slot=i)))
+    return run_menu("Edit which quick-pick (0-9)?", items)
+
+
+def step_agent(slot):
+    items = []
+    for aid, key in zip(list_agents(), KEYS):
+        items.append((agent_label(aid), key,
+                      self_cmd(step="model", slot=slot, agent=aid)))
+    if not items:
+        return 1
+    return run_menu(f"Slot {slot} — pick agent", items)
+
+
+def step_model(slot, agent_id):
+    models = agent_models(agent_id)
+    items = []
+    for (slug, label), key in zip(models, KEYS):
+        # a model WITH efforts goes to the effort step; one WITHOUT skips to save.
+        if model_efforts(agent_id, slug):
+            cmd = self_cmd(step="effort", slot=slot, agent=agent_id, model=slug)
+        else:
+            cmd = self_cmd(step="save", slot=slot, agent=agent_id, model=slug)
+        items.append((label, key, cmd))
+    if not items:
+        # an agent with no models (e.g. generic-shell) -> save with no model/effort.
+        return step_save(slot, agent_id, "", "")
+    return run_menu(f"Slot {slot} — pick model ({agent_label(agent_id)})", items)
+
+
+def step_effort(slot, agent_id, model_slug):
+    efforts = model_efforts(agent_id, model_slug)
+    if not efforts:
+        return 1
+    items = []
+    for (slug, label), key in zip(efforts, KEYS):
+        items.append((label, key,
+                      self_cmd(step="save", slot=slot, agent=agent_id,
+                               model=model_slug, effort=slug)))
+    return run_menu(f"Slot {slot} — pick effort ({model_slug})", items)
+
+
+def step_save(slot, agent_id, model_slug, effort_slug):
+    # Resolve the launch command + pretty card from the catalog (single TOML reader).
+    cmd = _adapter("launch", agent_id, "--model", model_slug, "--effort", effort_slug)
+    label = _adapter("card", agent_id, "--model", model_slug, "--effort", effort_slug)
+    if not cmd:
+        return 1
+    if not label:
+        label = agent_id
+
+    # POD_MENU_PRINT is a true DRY-RUN: print the resolved slot, write NOTHING. (Without
+    # this guard, validating a save would clobber the real slots file.)
+    if os.environ.get("POD_MENU_PRINT"):
+        print(f"[dry-run] slot {slot}: {label} :: {cmd}")
+        return 0
+
+    data = load_json(SLOTS)
+    slots = data.setdefault("slots", [])
+    while len(slots) <= slot:
+        slots.append({})
+    slots[slot] = {
+        "agent": agent_id,
+        "model": model_slug,
+        "effort": effort_slug,
+        "label": label,
+        "cmd": cmd,
+    }
+    # Atomic write (temp + os.replace) so a reader never sees a half-written slots file.
+    d = os.path.dirname(SLOTS) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".slots.", suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, SLOTS)
+
+    msg = [TMUX, "display-message"]
+    if CLIENT:
+        msg += ["-c", CLIENT]
+    msg.append(f"Slot {slot} → {label}")
+    subprocess.run(msg)
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--step", default="slot",
+                   choices=["slot", "agent", "model", "effort", "save"])
+    p.add_argument("--slot", type=int, default=0)
+    p.add_argument("--agent", default="")
+    p.add_argument("--model", default="")
+    p.add_argument("--effort", default="")
+    p.add_argument("--client", default="")  # tty to pop menus on (see CLIENT note)
+    a = p.parse_args()
+    global CLIENT
+    CLIENT = a.client
+    if not (0 <= a.slot <= 9):
+        sys.exit(1)
+
+    if a.step == "slot":
+        slots = load_json(SLOTS).get("slots", [])
+        sys.exit(step_slot(slots))
+    if a.step == "agent":
+        sys.exit(step_agent(a.slot))
+    if a.step == "model":
+        sys.exit(step_model(a.slot, a.agent))
+    if a.step == "effort":
+        sys.exit(step_effort(a.slot, a.agent, a.model))
+    if a.step == "save":
+        sys.exit(step_save(a.slot, a.agent, a.model, a.effort))
+
+
+if __name__ == "__main__":
+    main()

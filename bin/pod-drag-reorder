@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# pod-drag-reorder — reorder pod windows by dragging a tab along the status strip
+# (MouseDrag1Status), or by keyboard (M-C / M-V move the focused window left /
+# right). Both paths share this one script (mouse and keyboard share ONE code path).
+#
+#   pod-drag-reorder <target_window_id> <session_name>    mouse-drag path
+#   pod-drag-reorder --left|--right <session_name>        keyboard path
+#
+# The dragged window is the session's ACTIVE window: MouseDown1Status's select fires
+# on PRESS, so by the time drag events arrive the window under the user's finger is
+# already active. Each drag event over a DIFFERENT tab swaps the two; crossing tabs
+# cell by cell bubbles the dragged window along (insertion for slow drags; a fast
+# flick transposes with the tab under the pointer). After each swap we re-select the
+# dragged window so the next drag event keeps dragging the same window.
+#
+# WHY swap-window, not move-window: swap exchanges two winlinks in place — no
+# unlink/link, and renumber-windows has no gap to compact.
+#
+# IMMOVABLE: the manager (the index-0 invariant pod-kill-worker's guard and
+# _mgr-runtime's manager fallback rely on). Refused as src OR tgt.
+set -uo pipefail
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+T="$POD_TMUX"
+
+mode=drag tgt="" sess=""
+case "${1:-}" in
+  --left|--right) mode="${1#--}"; sess="${2:-}" ;;
+  *)              tgt="${1:-}";   sess="${2:-}" ;;
+esac
+[ -n "$sess" ] || exit 0
+
+# Pods only — the binding is server-global; bystander sessions keep stock behavior
+# (drag does nothing). NB: read session options via display-message formats with the
+# "=<name>:" target — `show-options -t "=name"` errors "no such session" on tmux 3.6b.
+[ "$("$T" display-message -p -t "=${sess}:" '#{@is_pod}' 2>/dev/null)" = "1" ] || exit 0
+
+# src = the session's active window (see header)
+src="$("$T" display-message -p -t "=${sess}:" '#{window_id}' 2>/dev/null)"
+[ -n "$src" ] || exit 0
+
+# debug tap: `touch /tmp/pod-drag-debug` to trace what the binding expanded.
+[ -e /tmp/pod-drag-debug ] && \
+  printf '%s mode=%s sess=%s src=%s tgt=%s\n' "$(date +%T)" "$mode" "$sess" "$src" "$tgt" >> /tmp/pod-drag-debug.log
+
+# keyboard path: tgt = index-neighbour of src, no wrap (list-windows output is
+# index-ordered; awk picks the line before/after src)
+[ "$mode" = "drag" ] || tgt="$("$T" list-windows -t "=${sess}:" -F '#{window_id}' 2>/dev/null \
+    | awk -v s="$src" -v d="$mode" 'prev==s&&d=="right"{print;exit} $0==s&&d=="left"{print prev;exit} {prev=$0}')"
+[ -n "$tgt" ] || exit 0
+[ "$src" = "$tgt" ] && exit 0          # the common drag event: still over own tab
+
+# never cross sessions (window ids are server-global; tgt must live in this pod)
+[ "$("$T" display-message -p -t "$tgt" '#{session_name}' 2>/dev/null)" = "$sess" ] || exit 0
+
+# immovables, as src OR tgt (see header)
+mgr="$("$T" display-message -p -t "=${sess}:" '#{@pod_manager_win}' 2>/dev/null)"
+[ -n "$mgr" ] || mgr="$("$T" list-windows -t "=${sess}:" -F '#{window_id}|#{window_index}' 2>/dev/null \
+                       | awk -F'|' '$2=="0"{print $1; exit}')"
+{ [ "$src" = "$mgr" ] || [ "$tgt" = "$mgr" ]; } && exit 0
+
+# per-pod mkdir lock: drag events fire per status-line cell — serialize swaps and
+# DROP (don't queue) events arriving while one is in flight. Stale-steal after 3s so
+# a killed holder can't wedge dragging forever. mtime read works on BSD (stat -f %m)
+# and GNU (stat -c %Y) coreutils.
+lock="${TMPDIR:-/tmp}/pod-drag-reorder.${sess//[!A-Za-z0-9._-]/_}.lock"
+if ! mkdir "$lock" 2>/dev/null; then
+  mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
+  age=$(( $(date +%s) - mtime ))
+  { [ "$age" -gt 3 ] && rm -rf "$lock" 2>/dev/null && mkdir "$lock" 2>/dev/null; } || exit 0
+fi
+trap 'rmdir "$lock" 2>/dev/null' EXIT
+
+# ONE chained client command: -d stops tmux's own focus-follow, the select pins focus
+# on the DRAGGED window; chaining avoids a one-frame flash of the target window.
+"$T" swap-window -d -s "$src" -t "$tgt" \; select-window -t "$src" 2>/dev/null
+exit 0

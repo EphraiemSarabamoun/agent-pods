@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# mgr-stage — populate a prompt template into $POD_INBOX/<task-id>/prompt.txt.
+#
+# Usage:
+#   mgr-stage <template-name> --id <task-id> [<key>=<value>]...
+#   mgr-stage <template-name>                [<key>=<value>]...   # auto-id
+#
+# Template-name: one of audit|execute|investigate|plan (or any file at
+# $POD_INBOX/_templates/<name>.tpl.txt). The queue module's own templates live
+# in modules/queue/templates/; copy or symlink them into $POD_INBOX/_templates
+# at setup so they resolve here.
+#
+# Substitution: every {{key}} in the template is replaced with the matching
+# value. {{task_id}} is always available (the resolved task id).
+#
+# Returns the task-id on stdout (one line, no decoration) so the caller can
+# pipe it into mgr-queue / mgr-dispatch.
+#
+# Examples:
+#   tid=$(mgr-stage audit --id rename-audit-1 \
+#                         context="Audit prefixed names ..." \
+#                         task_body="Find every ..." \
+#                         categories="rename | keep | drop")
+#   echo "Staged: $tid"
+
+set -euo pipefail
+POD_BIN="$(cd "$(dirname "$0")/../../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+
+TEMPLATES_DIR="$POD_INBOX/_templates"
+INBOX_ROOT="$POD_INBOX"
+
+if [ $# -lt 1 ]; then
+  echo "usage: mgr-stage <template-name> [--id <task-id>] [<key>=<value>]..." >&2
+  exit 2
+fi
+
+TEMPLATE_NAME="$1"; shift
+# Look in the inbox's _templates first (user-customized), then fall back to the queue
+# module's shipped templates — so the queue works out of the box with no seeding step.
+TEMPLATE_PATH="${TEMPLATES_DIR}/${TEMPLATE_NAME}.tpl.txt"
+[ -f "$TEMPLATE_PATH" ] || TEMPLATE_PATH="${POD_MODULES}/queue/templates/${TEMPLATE_NAME}.tpl.txt"
+[ -f "$TEMPLATE_PATH" ] || { echo "ERROR: template '$TEMPLATE_NAME' not found in ${TEMPLATES_DIR} or ${POD_MODULES}/queue/templates" >&2; exit 1; }
+
+TASK_ID=""
+KV_PAIRS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --id) TASK_ID="$2"; shift 2 ;;
+    *=*)  KV_PAIRS+=("$1"); shift ;;
+    *)    echo "ERROR: unrecognized arg: $1 (expected --id <id> or key=value)" >&2; exit 2 ;;
+  esac
+done
+
+# Auto-allocate task-id if not given: <template-name>-<N> where N is the
+# next free integer (scans existing inbox dirs).
+if [ -z "$TASK_ID" ]; then
+  N=1
+  while [ -d "${INBOX_ROOT}/${TEMPLATE_NAME}-${N}" ]; do
+    N=$((N + 1))
+  done
+  TASK_ID="${TEMPLATE_NAME}-${N}"
+fi
+
+TASK_DIR="${INBOX_ROOT}/${TASK_ID}"
+PROMPT_PATH="${TASK_DIR}/prompt.txt"
+[ -d "$TASK_DIR" ] && [ -f "$PROMPT_PATH" ] && {
+  echo "ERROR: ${PROMPT_PATH} already exists. Refuse to overwrite. Use a different --id or rm the dir first." >&2
+  exit 1
+}
+mkdir -p "$TASK_DIR"
+
+# Read template into memory; substitute {{task_id}} and every key=value pair.
+content="$(cat "$TEMPLATE_PATH")"
+
+# Substitute {{task_id}} first so user-supplied vars can reference it transitively if needed.
+content="${content//\{\{task_id\}\}/$TASK_ID}"
+
+# Substitute user pairs. Use Bash parameter expansion (no sed regex hell).
+for kv in "${KV_PAIRS[@]:-}"; do
+  [ -z "$kv" ] && continue
+  key="${kv%%=*}"
+  val="${kv#*=}"
+  placeholder="{{${key}}}"
+  content="${content//${placeholder}/${val}}"
+done
+
+# Warn (but don't fail) if any {{key}} placeholders remain unsubstituted.
+remaining_keys=$(printf '%s' "$content" | grep -oE '\{\{[a-zA-Z0-9_]+\}\}' | sort -u || true)
+if [ -n "$remaining_keys" ]; then
+  echo "WARN: unsubstituted placeholders in ${PROMPT_PATH}: $(echo $remaining_keys | tr '\n' ' ')" >&2
+fi
+
+printf '%s' "$content" > "$PROMPT_PATH"
+
+# (durability layer removed — staged prompts live only under $POD_INBOX.)
+
+# Print task-id to stdout (single line, parseable).
+echo "$TASK_ID"

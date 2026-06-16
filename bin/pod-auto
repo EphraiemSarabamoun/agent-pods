@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# pod-auto — flip a pod's FULL AUTO switch (the strip's ⚡ AUTO / ✋ MAN pill).
+#
+#   FULL AUTO ON  -> the manager (window 0) may run the pod autonomously: the queue
+#                    auto-drains to idle workers (mgr-pick-next / mgr-dispatch
+#                    auto-pick), and an autonomous loop (see docs/autonomy.md)
+#                    resumes.
+#   MANUAL  (OFF) -> you are the manager. Automatic worker-picking is disabled
+#                    (mgr-dispatch still works with an explicit --tmux-window — a
+#                    deliberate act), a running pod-task loop pauses on its next
+#                    wake, and the queue holds.
+#
+# State is ONE tmux session option, @full_auto ("1"/"0"), stamped 0 at pod creation
+# by pod-launch. The strip pill + badge tint render from it; the dispatch guards
+# read it via mgr_pod_auto_state (fail-OPEN for non-pods, so plain tmux sessions
+# and headless seats never notice this switch exists).
+#
+# Usage:
+#   pod-auto [on|off|toggle|status] [--pod <name>] [--client <name>]
+#   pod-auto install --pod <name>        # retrofit the pill onto a LIVE pod that
+#                                        # was launched before the pill existed
+#
+# Flip side effects (transitions only — repeat flips are idempotent no-ops):
+#   - status-strip redraw on every attached client (+ a flash on the clicking one)
+#   - manager window renamed to POD_MANAGER_NAME / POD_MANAGER_NAME_AUTO to signal mode
+#   - manager notification: OFF -> mbox note (an armed pod-task-wait exits "auto-off"
+#     within ~3s, pausing the loop); ON with a paused pod-task for THIS pod -> a
+#     resume trigger TYPED into the manager's REPL; ON otherwise -> mbox note.
+#   The mbox is appended DIRECTLY (pod-tell skips delivery when sender == recipient,
+#   which would silently drop a click made while window 0 is focused).
+# bash 3.2 safe.
+set -uo pipefail
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+. "$POD_BIN/_mgr-runtime.sh"   # mgr_pod_auto_state, mgr_manager_window, pod_dir_for, pod_chan_for, pod_name
+. "$POD_BIN/_pod-strip.sh"     # POD_STRIP_LEFT / POD_STRIP_RIGHT / POD_STRIP_RIGHT_LEN (single source)
+T="$POD_TMUX"
+
+STATE="$POD_STATE/pod-task.json"
+GROUP="$POD_STATE/tmux_group.json"
+
+# The manager's display name communicates the operating mode. Default AUTO == MANUAL
+# (rename is a visible no-op) unless the user configures a distinct POD_MANAGER_NAME_AUTO.
+MGR_NAME_MANUAL="$POD_MANAGER_NAME"
+MGR_NAME_AUTO="${POD_MANAGER_NAME_AUTO:-$POD_MANAGER_NAME}"
+
+ACTION=""; POD_ARG=""; CLIENT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    on|off|toggle|status|install) ACTION="$1"; shift ;;
+    --install) ACTION="install"; shift ;;
+    --pod)    POD_ARG="${2:-}"; shift 2 ;;
+    --client) CLIENT="${2:-}"; shift 2 ;;
+    -h|--help|*)
+      echo "usage: pod-auto [on|off|toggle|status|install] [--pod <name>] [--client <name>]" >&2
+      exit 2 ;;
+  esac
+done
+[ -n "$ACTION" ] || ACTION="status"
+POD="${POD_ARG:-$(pod_name)}"
+
+flash() {  # best-effort one-liner in the clicking client's status line
+  [ -n "$CLIENT" ] && "$T" display-message -c "$CLIENT" "$1" 2>/dev/null
+  return 0
+}
+
+refresh_pod_clients() {  # option changes don't reliably dirty the status line
+  local c
+  for c in $("$T" list-clients -t "=$POD" -F '#{client_name}' 2>/dev/null); do
+    "$T" refresh-client -S -t "$c" 2>/dev/null || true
+  done
+}
+
+rename_manager() {  # $1 = name to set, $2 = canonical name expected now
+  [ "$MGR_NAME_AUTO" = "$MGR_NAME_MANUAL" ] && return 0   # nothing to signal
+  local want="$1" expect="$2" mgrwin cur
+  mgrwin="$(mgr_manager_window "$POD")"
+  [ -n "$mgrwin" ] || return 0
+  cur="$("$T" display-message -p -t "$mgrwin" '#{window_name}' 2>/dev/null)"
+  [ "$cur" = "$expect" ] || return 0
+  "$T" rename-window -t "$mgrwin" "$want" 2>/dev/null || true
+}
+
+notify_manager() {  # direct mbox append in pod-tell's "[HH:MM] sender: msg" format
+  local msg="$1" mgrwin maildir ts glyph
+  mgrwin="$(mgr_manager_window "$POD")"
+  [ -n "$mgrwin" ] || return 0
+  maildir="$(pod_dir_for "$POD")"
+  mkdir -p "$maildir" 2>/dev/null || return 0
+  ts="$(date +%H:%M)"
+  # the channel line is a NOTIFICATION, not a chat message: no sender->recipient
+  # shape — switch glyph + HEADLINE ONLY (everything before the first " — " clause;
+  # the full instruction stays in the manager's mbox) + a semantic "cc @manager"
+  # target that pod-feed resolves to window 0's current name + color.
+  case "$msg" in (*OFF*) glyph="✋" ;; (*) glyph="⚡" ;; esac
+  printf '[%s] full-auto switch: %s\n' "$ts" "$msg" >> "$maildir/${mgrwin}.mbox"
+  printf '[%s] %s %s · cc @manager\n' "$ts" "$glyph" "${msg%% — *}" >> "$(pod_chan_for "$POD")"
+}
+
+# A paused pod-task belongs to THIS pod when its "pod" field matches, or — for state
+# files written before the field existed — when this pod is the recorded primary. A
+# secondary pod's flip must never resume the primary's task.
+paused_task_for_pod() {
+  [ -f "$STATE" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  [ "$(jq -r '.status // empty' "$STATE" 2>/dev/null)" = "paused" ] || return 1
+  local tpod
+  tpod="$(jq -r '.pod // empty' "$STATE" 2>/dev/null)"
+  if [ -n "$tpod" ]; then
+    [ "$tpod" = "$POD" ]
+  else
+    [ "$(jq -r '.session // empty' "$GROUP" 2>/dev/null)" = "$POD" ]
+  fi
+}
+
+send_resume_trigger() {  # typed into the manager REPL; self-contained so a fresh/compacted manager can recover from the state file alone
+  local mgrwin trigger
+  mgrwin="$(mgr_manager_window "$POD")"
+  [ -n "$mgrwin" ] || return 0
+  trigger="[pod-auto] FULL AUTO is back ON for pod ${POD} — resume the paused pod-task: read ${STATE}, set status to \"running\", run mgr-pick-next --all-idle, then re-arm pod-task-wait in the background."
+  # literal type + gap + Enter: the mgr-dispatch race-guard pattern (do not drop the gap)
+  "$T" send-keys -t "$mgrwin" -l "$trigger" 2>/dev/null || return 0
+  sleep 0.1
+  "$T" send-keys -t "$mgrwin" Enter 2>/dev/null
+  return 0
+}
+
+case "$ACTION" in
+  status)
+    st="$(mgr_pod_auto_state "$POD")"
+    case "$st" in
+      none) echo "${POD}: not a pod (no @is_pod stamp) — full-auto does not apply" ;;
+      on)   echo "${POD}: full-auto ON ⚡" ;;
+      off)  echo "${POD}: full-auto OFF ✋ (manual)" ;;
+    esac
+    if [ "$st" != "none" ]; then
+      "$T" show-options -t "=${POD}:" -v status-right 2>/dev/null | grep -q 'range=user|fullauto' \
+        || echo "  (strip predates the pill — relaunch the pod or run: pod-auto install --pod ${POD})"
+    fi
+    exit 0 ;;
+
+  install)
+    "$T" has-session -t "=$POD" 2>/dev/null || { echo "pod-auto: no session '$POD'" >&2; exit 1; }
+    [ "$("$T" show-options -t "=${POD}:" -qv @is_pod 2>/dev/null)" = "1" ] \
+      || { echo "pod-auto: '$POD' is not a stamped pod (@is_pod) — refusing to restyle" >&2; exit 1; }
+    [ -n "$("$T" show-options -t "=${POD}:" -qv @full_auto 2>/dev/null)" ] || "$T" set -t "$POD" @full_auto 0
+    "$T" set -t "$POD" status-left         "$POD_STRIP_LEFT"
+    "$T" set -t "$POD" status-right        "$POD_STRIP_RIGHT"
+    "$T" set -t "$POD" status-right-length "$POD_STRIP_RIGHT_LEN"
+    # server-global like the launcher's chord block; rebinding is idempotent
+    "$T" bind-key    a   run-shell -b "$POD_BIN/pod-status-action fullauto '#{session_name}' '#{client_name}'"
+    "$T" bind-key -n M-a run-shell -b "$POD_BIN/pod-status-action fullauto '#{session_name}' '#{client_name}'"
+    refresh_pod_clients
+    echo "installed the full-auto pill on pod '$POD' (mode: $(mgr_pod_auto_state "$POD"))"
+    exit 0 ;;
+esac
+
+# ---- on | off | toggle ----
+cur="$(mgr_pod_auto_state "$POD")"
+if [ "$cur" = "none" ]; then
+  echo "pod-auto: '$POD' is not a pod (no @is_pod stamp) — nothing to flip"
+  flash "not a pod — full-auto does not apply here"
+  exit 0
+fi
+
+new="$ACTION"
+[ "$ACTION" = "toggle" ] && { [ "$cur" = "on" ] && new="off" || new="on"; }
+if [ "$new" = "$cur" ]; then
+  echo "pod '$POD': full-auto already ${cur}"
+  exit 0
+fi
+
+if [ "$new" = "on" ]; then
+  "$T" set -t "$POD" @full_auto 1
+  rename_manager "$MGR_NAME_AUTO" "$MGR_NAME_MANUAL"
+  refresh_pod_clients
+  flash "${POD}: ⚡ FULL AUTO ON"
+  if paused_task_for_pod; then
+    send_resume_trigger
+    echo "pod '$POD': full-auto ON ⚡ — resume trigger sent to the manager (paused pod-task found)"
+  else
+    notify_manager "FULL AUTO turned ON — treat work objectives as autonomous-loop objectives from here."
+    echo "pod '$POD': full-auto ON ⚡"
+  fi
+else
+  "$T" set -t "$POD" @full_auto 0
+  rename_manager "$MGR_NAME_MANUAL" "$MGR_NAME_AUTO"
+  refresh_pod_clients
+  flash "${POD}: ✋ MANUAL — you're the manager"
+  notify_manager "FULL AUTO turned OFF — pause the loop on your next wake (in-flight workers finish; the queue holds; do not re-arm)."
+  echo "pod '$POD': full-auto OFF ✋ (manual)"
+fi
+exit 0

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# mgr-pick-next — composite: poll for completions, then dispatch the
+# highest-priority queued task to any worker that just freed (or any
+# already-idle worker).
+#
+# Designed to be called at the top of every manager Bash tool call so
+# the queue keeps draining without explicit per-step bookkeeping.
+#
+# Usage:
+#   mgr-pick-next                # poll + dispatch one if a worker is free
+#   mgr-pick-next --all-idle     # dispatch to EVERY idle worker (drains
+#                                # multiple queue entries in one shot if
+#                                # there are queue items waiting)
+#   mgr-pick-next --print-only   # print what would happen, fire nothing
+
+set -euo pipefail
+QBIN="$(cd "$(dirname "$0")" && pwd)"             # sibling mgr-* live here
+POD_BIN="$(cd "$QBIN/../../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+. "$POD_BIN/_mgr-runtime.sh"                       # mgr_current_pod, mgr_full_auto
+
+QUEUE_DIR="$POD_INBOX/_queue"
+WORKERS_PATH="$POD_STATE/workers.json"
+
+ALL_IDLE=0
+PRINT_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --all-idle)   ALL_IDLE=1 ;;
+    --print-only) PRINT_ONLY=1 ;;
+    *) echo "ERROR: unrecognized arg: $arg" >&2; exit 2 ;;
+  esac
+done
+
+# Step 1: poll for newly-completed tasks (frees workers if any). This runs in BOTH
+# modes — manual mode still tracks completions; it just won't auto-dispatch below.
+echo "==> Polling for completions"
+"$QBIN/mgr-poll"
+
+# FULL AUTO gate: only AUTO-dispatch when this pod's switch is on. Fail-OPEN for
+# non-pods (plain tmux / no @is_pod stamp) so the queue works outside a stamped pod.
+# In MANUAL mode the queue holds — dispatch by hand with mgr-dispatch --tmux-window.
+POD_SESS="$(mgr_current_pod)"
+if ! mgr_full_auto "$POD_SESS"; then
+  echo "==> FULL AUTO is OFF for pod '$POD_SESS' — manual mode, holding the queue"
+  echo "    (dispatch by hand: mgr-dispatch --tmux-window <@id>)"
+  exit 0
+fi
+
+# Step 2: count idle workers + queue depth.
+idle_count=$(jq '[.workers[] | select(.status=="idle")] | length' "$WORKERS_PATH")
+queue_count=$(ls "$QUEUE_DIR" 2>/dev/null | wc -l | tr -d ' ')
+echo "==> idle workers: ${idle_count}, queue depth: ${queue_count}"
+
+if [ "$idle_count" -eq 0 ]; then
+  echo "    no idle workers — nothing to dispatch"
+  exit 0
+fi
+if [ "$queue_count" -eq 0 ]; then
+  echo "    queue empty — nothing to dispatch"
+  exit 0
+fi
+
+# Step 3: dispatch up to N workers' worth of queued tasks.
+n=1
+[ "$ALL_IDLE" -eq 1 ] && n=$idle_count
+[ "$n" -gt "$queue_count" ] && n=$queue_count
+
+dispatch_args=()
+[ "$PRINT_ONLY" -eq 1 ] && dispatch_args+=("--print-only")
+
+i=0
+while [ "$i" -lt "$n" ]; do
+  echo ""
+  "$QBIN/mgr-dispatch" ${dispatch_args[@]+"${dispatch_args[@]}"}
+  i=$((i + 1))
+done

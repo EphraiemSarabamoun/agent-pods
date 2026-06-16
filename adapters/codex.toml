@@ -1,0 +1,61 @@
+# Codex (OpenAI's CLI). A "poll" agent: no lifecycle hooks we can wire, so its state
+# dot is inferred by the foreign-state poller and its card is scraped live from the
+# composer footer. pod-mail reaches it via pod-deliver (send-keys notification).
+[agent]
+id       = "codex"
+label    = "Codex"
+priority = 20
+
+[launch]
+base_cmd   = "codex"
+model_arg  = ["-m", "{model}"]
+effort_arg = ["-c", "model_reasoning_effort={effort}"]
+
+[detect]
+# Codex runs as a Node TUI -> pane command is "node". "node" is ambiguous (cursor,
+# gemini, opencode can also be node), so confirm with a content pattern when present.
+pane_cmd_patterns = ['^node$']
+content_patterns  = ['(?i)codex', 'model_reasoning_effort']
+reject_content    = []
+
+[defaults]
+model             = "gpt-5.5"
+effort            = "high"
+# Scrape "<model> <effort> · <cwd>" from the footer (e.g. "gpt-5.5 high · ~"). Group 1
+# = model (must contain a digit), group 2 = effort (a known level). Used by the poller.
+card_scrape_regex = '^\s*([A-Za-z][\w.\-]*\d[\w.\-]*)\s+(minimal|low|medium|high|xhigh|max|none)\b.*·'
+
+[lifecycle]
+mode            = "poll"
+installer       = ""
+native_delivery = false
+state_source    = "poll"
+
+# Live discovery via the OpenAI REST API. The Codex CLI has no list-models command,
+# but GET /v1/models does — pod-discover-api calls it (filtered to gpt/codex/o-series)
+# with an OPENAI_API_KEY from the env, ~/.codex/auth.json (if you logged in with a
+# key), or one captured by `pod-login codex`. A ChatGPT *subscription* Codex login has
+# no platform API key and can't list models, so discovery falls back to the curated
+# [[models]] below. Reasoning effort isn't enumerable from any API, so it's declared.
+[discover]
+auth         = "openai"
+models_cmd   = "pod-discover-api openai"
+models_regex = '^(\S+)\s+-\s+(.+)$'
+timeout_s    = 12
+efforts = [
+  { slug = "high",    label = "high",    value = "high" },
+  { slug = "medium",  label = "medium",  value = "medium" },
+  { slug = "low",     label = "low",     value = "low" },
+  { slug = "minimal", label = "minimal", value = "minimal" },
+]
+
+# Fallback / offline list (also the right answer for ChatGPT-subscription users).
+[[models]]
+slug  = "gpt5.5"
+label = "GPT-5.5"
+model = "gpt-5.5"
+efforts = [
+  { slug = "high",   label = "high",   value = "high" },
+  { slug = "medium", label = "medium", value = "medium" },
+  { slug = "low",    label = "low",    value = "low" },
+]

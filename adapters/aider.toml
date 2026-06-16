@@ -1,0 +1,39 @@
+# Aider (open-source pair-programmer). Poll agent. Aider's --model takes a
+# provider/model string (e.g. "anthropic/claude-opus-4-8", "gpt-5.5", "ollama/qwen2.5").
+# Edit the [[models]] to match the providers you have keys for.
+[agent]
+id       = "aider"
+label    = "Aider"
+priority = 45
+
+[launch]
+base_cmd   = "aider"
+model_arg  = ["--model", "{model}"]
+effort_arg = []
+
+[detect]
+pane_cmd_patterns = ['^(aider|python|python3)$']
+content_patterns  = ['(?i)aider']
+reject_content    = []
+
+[defaults]
+model             = "sonnet"
+effort            = ""
+card_scrape_regex = ''
+
+[lifecycle]
+mode            = "poll"
+installer       = ""
+native_delivery = false
+state_source    = "poll"
+
+[[models]]
+slug  = "sonnet"
+label = "Sonnet"
+model = "sonnet"
+efforts = []
+[[models]]
+slug  = "gpt"
+label = "GPT-5.5"
+model = "gpt-5.5"
+efforts = []

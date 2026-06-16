@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# pod-sync-label <tmux_window_id> <new_name>
+#
+# Sync a renamed pod window's name into the manager's worker registry (the
+# workers.json `label` field) so the optional queue/MCP tools (mgr-status,
+# fleet_list_workers) reflect the new name. (The `pod` roster reads the LIVE tmux
+# window name directly, so it needs no sync — this is only for the registry-reading
+# tools.) Wired to tmux's window-renamed hook by pod-launch. Defensive + idempotent:
+# no-op if the window isn't a registered worker or the registry is absent.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+WID="${1:-}"
+NAME="${2:-}"
+WJ="$POD_STATE/workers.json"
+[ -n "$WID" ] && [ -f "$WJ" ] || exit 0
+
+python3 - "$WID" "$NAME" "$WJ" <<'PY'
+import json, sys, os, fcntl, tempfile
+wid, name, path = sys.argv[1], sys.argv[2], sys.argv[3]
+lf = open(path + ".lock", "w")
+fcntl.flock(lf, fcntl.LOCK_EX)               # SAME lock file as pod-add-worker / pod-kill-worker
+try:
+    try:
+        d = json.load(open(path))
+        if not isinstance(d, dict):
+            sys.exit(0)
+    except Exception:
+        sys.exit(0)
+    changed = False
+    for w in d.get("workers", []):
+        if w.get("tmux_window") == wid and w.get("label") != name:
+            w["label"] = name
+            changed = True
+    if changed:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".workers.", suffix=".tmp")
+        with os.fdopen(fd, "w") as tf:
+            json.dump(d, tf, indent=2)
+        os.replace(tmp, path)            # atomic
+finally:
+    fcntl.flock(lf, fcntl.LOCK_UN)
+    lf.close()
+PY

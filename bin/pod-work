@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# pod-work — capture a snippet of THIS pane's latest prompt as its session work-log,
+# so the pod summary popup (the ☰ button -> pod-summary) can show who worked on what.
+#
+# Wired into the agent's UserPromptSubmit hook, alongside `pod-state busy`. Reads the
+# hook JSON on stdin, pulls `.prompt`, sanitizes it to one short line, and stamps:
+#   - the window option @work                         (latest, for inline/status use)
+#   - $POD_COMMS/<pod>/work/<window_id>.log           (a per-session, per-agent history)
+# The log lives under the pod's pod-comms subtree, which pod-mail-gc deletes when the pod
+# closes -> the summary is genuinely SESSION-SCOPED. No-op outside tmux (a lone agent
+# window, ssh, cron). MUST never fail a hook, so every path exits 0.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+T="$POD_TMUX"
+[ -n "${TMUX:-}" ] || exit 0
+pane="${TMUX_PANE:-}"
+[ -n "$pane" ] || exit 0
+
+# hook payload on stdin -> a clean one-line snippet of the prompt. The whole
+# extract+sanitize+truncate is one python3 pass (json -> .prompt, collapse
+# whitespace, drop a leading /command word, cap to 70 CHARACTERS). python slices by
+# codepoint, so it can't cut a multibyte char in half the way bash ${x:0:69} does
+# under a C locale (the old jq|tr|sed|substr chain). Silent no-op on any failure.
+payload="$(cat 2>/dev/null)"
+command -v python3 >/dev/null 2>&1 || exit 0
+snip="$(printf '%s' "$payload" | python3 -c '
+import sys, json, re
+try:
+    p = json.load(sys.stdin).get("prompt") or ""
+except Exception:
+    sys.exit(0)
+p = re.sub(r"\s+", " ", p).strip()
+if p.startswith("/"):
+    p = p[1:].strip()
+if len(p) > 70:
+    p = p[:69] + "…"
+sys.stdout.write(p)
+' 2>/dev/null)"
+[ -n "$snip" ] || exit 0
+
+win="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
+[ -n "$win" ] || exit 0
+
+# Don't let a bare confirmation/ack overwrite the real task HEADLINE (@work): if you
+# tell an agent "remove feature X" and then say "yes please", the at-a-glance line
+# should stay "remove feature X", not flip to "yes please". The snippet is still
+# LOGGED below, so the per-session history stays complete — we only skip updating the
+# headline for acks. Match is case-insensitive, leading/trailing punctuation+space
+# stripped, against a small ack set OR trimmed length < 4 (a real standalone task that
+# short doesn't occur in practice).
+lc="$(printf '%s' "$snip" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:punct:][:space:]]+//; s/[[:punct:][:space:]]+$//')"
+is_ack=0
+case "$lc" in
+  y|ya|ye|ok|okay|k|kk|yes|yep|yeah|yup|sure|go|"go ahead"|"do it"|"do that"|please|"yes please"|thanks|"thank you"|ty|continue|proceed|"sounds good"|lgtm) is_ack=1 ;;
+  *) [ "${#lc}" -lt 4 ] && is_ack=1 ;;
+esac
+if [ "$is_ack" -eq 0 ]; then
+  "$T" set-option -w -t "$win" @work    "$snip"       2>/dev/null || true
+  "$T" set-option -w -t "$win" @work_at "$(date +%s)" 2>/dev/null || true
+  "$T" refresh-client -S 2>/dev/null || true   # repaint now, not at the next status tick
+fi
+
+# append to the per-pod, per-window work log (session-scoped; dies with the pod)
+. "$POD_BIN/_pod-common.sh" 2>/dev/null || exit 0
+pod="${POD_SESSION:-$("$T" display-message -p -t "$pane" '#{session_name}' 2>/dev/null)}"
+[ -n "$pod" ] || exit 0
+dir="$(pod_dir_for "$pod")/work"
+mkdir -p "$dir" 2>/dev/null || exit 0
+printf '%s  %s\n' "$(date +%H:%M)" "$snip" >> "$dir/${win}.log" 2>/dev/null || true
+exit 0

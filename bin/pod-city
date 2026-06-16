@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# pod-city — print a random city name not already in use by a live tmux session, for
+# naming NEW pods (Rome, Kyoto, ...) instead of the old <prefix>-2/<prefix>-3 series.
+# The session-name analogue of pod-name (which names worker TABS after people): pods
+# are places, agents are people.
+#
+# Exits 1 with no output when the pool is exhausted; the caller (pod-launch) then
+# falls back to the legacy numeric series. Override the pool with POD_CITIES (a
+# space-separated list of single-word names). bash 3.2 safe: positional params, no arrays.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+T="$POD_TMUX"
+
+# Single-word ASCII only (tmux session names + comms path components + every pod-*
+# script's word-splitting all assume no spaces).
+CITIES="${POD_CITIES:-Rome Athens Cairo Tokyo Kyoto Osaka Seoul Taipei Hanoi Bangkok Mumbai \
+Delhi Jaipur Nairobi Lagos Accra Dakar Tunis Marrakesh Lima Quito Bogota Santiago \
+Havana Cusco Oaxaca Toronto Montreal Chicago Denver Austin Boston Seattle Portland \
+Sydney Melbourne Auckland Perth Brisbane Oslo Vienna Prague Berlin Dublin Geneva \
+Zurich Milan Naples Venice Florence Seville Porto Munich Hamburg Krakow Budapest \
+Helsinki Stockholm Istanbul Beirut Amman Baghdad Carthage Samarkand Timbuktu Petra \
+Lisbon Madrid Paris Warsaw Kyiv Tbilisi Baku}"
+
+# every live session name is off-limits (not just pods — any tmux session could
+# collide as a target name), space-padded so the case-glob matches whole words.
+used=" $("$T" list-sessions -F '#{session_name}' 2>/dev/null | tr '\n' ' ') "
+
+free=""
+for c in $CITIES; do
+  case "$used" in *" $c "*) : ;; *) free="$free $c" ;; esac
+done
+
+# /dev/urandom, not $RANDOM — same-second launches would correlate (see pod-name).
+rand="$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -dc 0-9)"
+[ -n "$rand" ] || rand="$RANDOM"
+
+set -- $free
+[ "$#" -gt 0 ] || exit 1
+idx=$(( rand % $# ))
+shift "$idx"
+printf '%s' "$1"

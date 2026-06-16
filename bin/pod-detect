@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# pod-detect <window_id> — identify which agent runs in a pod window and cache it on
+# the window as @agent_id (+ @agent label + @pod_native_delivery hint). This is the
+# ONE place the "claude vs codex vs shell" question is answered; pod, pod-tell,
+# pod-foreign-state, pod-deliver all read the cached @agent_id instead of re-testing
+# pane_current_command (which they used to do inconsistently).
+#
+# Idempotent and cheap: short-circuits when the pane command is unchanged since the
+# last detect, so the poller can call it every cycle. Prints the agent id on stdout.
+#
+# EMPTY-TARGET FOOTGUN: a blank <window_id> would make every `set-option -t` below hit
+# the ACTIVE window and mis-stamp it. Refuse an empty target. Always pass a stable
+# #{window_id} (@N), never a window index (indexes renumber).
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+T="$POD_TMUX"
+
+win="${1:-}"
+[ -n "$win" ] || { echo "usage: pod-detect <window_id>" >&2; exit 1; }
+
+cmd="$("$T" display-message -p -t "$win" '#{pane_current_command}' 2>/dev/null)"
+
+# short-circuit: same pane command as last detect -> reuse the cached id (free).
+prev_id="$("$T" show-options -wqv -t "$win" @agent_id 2>/dev/null)"
+prev_cmd="$("$T" show-options -wqv -t "$win" @agent_id_cmd 2>/dev/null)"
+if [ -n "$prev_id" ] && [ "$cmd" = "$prev_cmd" ]; then
+  printf '%s' "$prev_id"
+  exit 0
+fi
+
+# capture pane content for any NON-Claude command, so detection-by-content works for
+# any agent regardless of what process name it shows (node, python, sleep, a wrapper,
+# ...). A version-string command (claude reports e.g. "2.1.158") is unambiguous and
+# needs no content read — keep that common case to a single tmux round-trip.
+content=""
+case "$cmd" in
+  [0-9]*) : ;;   # claude version string -> matched by pane_cmd pattern, no content needed
+  # Strip blank lines BEFORE tailing: a tall pane is mostly empty, so a naive `tail`
+  # would grab only trailing blanks and miss identifying text near the top (a short
+  # TUI) — keep the last 60 non-blank lines, which covers a footer or a header.
+  *)      content="$("$T" capture-pane -p -t "$win" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -60)" ;;
+esac
+
+id="$("$POD_ADAPTER" detect "$cmd" "$content" 2>/dev/null)"
+[ -n "$id" ] || { printf ''; exit 1; }
+
+label="$("$POD_ADAPTER" field "$id" label 2>/dev/null)"
+nd="$("$POD_ADAPTER" field "$id" native_delivery 2>/dev/null)"
+ssrc="$("$POD_ADAPTER" field "$id" state_source 2>/dev/null)"
+scrx="$("$POD_ADAPTER" field "$id" card_scrape_regex 2>/dev/null)"
+
+"$T" set-option -w -t "$win" @agent_id     "$id"   2>/dev/null || true
+"$T" set-option -w -t "$win" @agent_id_cmd "$cmd"  2>/dev/null || true
+# cache these so the foreign-state poller reads tmux options (cheap) instead of
+# re-querying pod-adapter (python) for every window every cycle.
+"$T" set-option -w -t "$win" @state_source "${ssrc:-poll}" 2>/dev/null || true
+"$T" set-option -w -t "$win" @scrape_rx    "${scrx:-}"      2>/dev/null || true
+[ -n "$label" ] && "$T" set-option -w -t "$win" @agent "$label" 2>/dev/null || true
+# @pod_native_delivery: the adapter's hint that this agent surfaces pod-mail itself
+# (so pod-deliver should NOT send-keys to it). A hook-capable agent's own hook
+# re-stamps this to the authoritative 1 once it's live; until then the hint stands.
+if [ "$nd" = "true" ]; then
+  "$T" set-option -w -t "$win" @pod_native_delivery 1 2>/dev/null || true
+else
+  "$T" set-option -w -t "$win" @pod_native_delivery 0 2>/dev/null || true
+fi
+
+printf '%s' "$id"

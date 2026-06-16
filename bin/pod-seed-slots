@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+# pod-seed-slots [--force] — write a default quick-pick slots file ($POD_SLOTS)
+# generated from the adapter catalog, so the "+" picker works on a fresh setup
+# before the user has curated their own slots via the gear (pod-settings-menu).
+#
+# Without --force it is a no-op when the slots file already exists (safe to call
+# from pod-spawn-menu-build's seed-if-missing path). With --force it overwrites.
+#
+# Every entry is resolved through pod-adapter, so the agent/model/effort/cmd/label
+# are guaranteed consistent with the catalog (no hand-maintained launch strings).
+import json
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+POD_BIN = os.environ.get("POD_BIN") or HERE
+ADAPTER = os.path.join(POD_BIN, "pod-adapter")
+SLOTS = os.environ.get("POD_SLOTS") or os.path.join(
+    os.environ.get("POD_CONFIG_DIR", os.path.expanduser("~/.config/pod")), "slots.json"
+)
+
+force = "--force" in sys.argv[1:]
+
+
+def adapter(*args):
+    try:
+        out = subprocess.run([ADAPTER, *args], capture_output=True, text=True)
+    except OSError:
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def models(agent_id):
+    rows = adapter("models", agent_id)
+    return [ln.split("\t", 1)[0] for ln in rows.splitlines() if ln.strip()]
+
+
+def efforts(agent_id, model_slug):
+    rows = adapter("efforts", agent_id, model_slug)
+    return [ln.split("\t", 1)[0] for ln in rows.splitlines() if ln.strip()]
+
+
+def pick_effort(effs):
+    # Prefer a sane middle default over the catalog's first entry (often "max").
+    for pref in ("high", "medium"):
+        if pref in effs:
+            return pref
+    return effs[0] if effs else ""
+
+
+def _slot(agent_id, m):
+    """Resolve one (agent, model) into a slot dict, or None if it won't launch."""
+    eff = pick_effort(efforts(agent_id, m)) if m else ""
+    cargs = []
+    if m:
+        cargs += ["--model", m]
+    if eff:
+        cargs += ["--effort", eff]
+    cmd = adapter("launch", agent_id, *cargs)
+    if not cmd:
+        return None
+    label = adapter("card", agent_id, *cargs) or agent_id
+    return {"label": label, "agent": agent_id, "model": m, "effort": eff, "cmd": cmd}
+
+
+def build_slots():
+    # Round-robin across agents: give each available agent its first model before any
+    # agent gets a second. Without this, a discovery-backed agent like cursor (which
+    # can return 40+ live models) would swallow all 10 default slots and bury the rest.
+    available = [a for a in adapter("list", "--available").splitlines() if a.strip()]
+    per_agent = [(a, models(a) or [""]) for a in available]
+    slots, depth = [], 0
+    while len(slots) < 10:
+        progressed = False
+        for agent_id, mods in per_agent:
+            if depth >= len(mods):
+                continue
+            progressed = True
+            s = _slot(agent_id, mods[depth])
+            if s:
+                slots.append(s)
+                if len(slots) >= 10:
+                    return slots
+        if not progressed:
+            break
+        depth += 1
+    return slots
+
+
+def main():
+    if os.path.exists(SLOTS) and not force:
+        return 0
+    slots = build_slots()
+    if not slots:
+        sys.stderr.write("pod-seed-slots: catalog produced no available agents; "
+                         "nothing seeded.\n")
+        return 1
+    os.makedirs(os.path.dirname(SLOTS), exist_ok=True)
+    with open(SLOTS, "w") as f:
+        json.dump({"title": "Spawn agent (0-9)", "slots": slots}, f, indent=2)
+    sys.stderr.write(f"pod-seed-slots: wrote {len(slots)} default slots to {SLOTS}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

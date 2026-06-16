@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# mgr-queue — add a staged task to the dispatch queue.
+#
+# Usage:
+#   mgr-queue <task-id> [--priority <int>] [--description <str>]
+#                       [--template <str>] [--deps <id,id,...>]
+#
+# Priority: lower number = higher priority. Default 100.
+# Queue file: $POD_INBOX/_queue/<priority>-<timestamp>-<task-id>.json
+#
+# The filename prefix sorts naturally (lexicographic = priority-then-time)
+# so `ls _queue/` already shows the dispatch order.
+#
+# NOTE: --deps records dependencies but nothing enforces them — the queue is a
+# priority list, not a DAG scheduler. Track ordering with priority.
+
+set -euo pipefail
+POD_BIN="$(cd "$(dirname "$0")/../../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+
+QUEUE_DIR="$POD_INBOX/_queue"
+INBOX_ROOT="$POD_INBOX"
+DEFAULT_PRIORITY=100
+
+[ $# -ge 1 ] || { echo "usage: mgr-queue <task-id> [--priority N] [--description S] [--template T] [--deps id,id]" >&2; exit 2; }
+
+TASK_ID="$1"; shift
+PRIORITY="$DEFAULT_PRIORITY"
+DESCRIPTION=""
+TEMPLATE=""
+DEPS="[]"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --priority)    PRIORITY="$2"; shift 2 ;;
+    --description) DESCRIPTION="$2"; shift 2 ;;
+    --template)    TEMPLATE="$2"; shift 2 ;;
+    --deps)        DEPS=$(echo "$2" | jq -Rc 'split(",")'); shift 2 ;;
+    *) echo "ERROR: unrecognized arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+PROMPT_PATH="${INBOX_ROOT}/${TASK_ID}/prompt.txt"
+[ -f "$PROMPT_PATH" ] || { echo "ERROR: prompt not found at $PROMPT_PATH. Stage it first via mgr-stage." >&2; exit 1; }
+
+mkdir -p "$QUEUE_DIR"
+TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+PRI_PADDED=$(printf '%03d' "$PRIORITY")
+QUEUE_FILE="${QUEUE_DIR}/${PRI_PADDED}-${TS}-${TASK_ID}.json"
+
+# Refuse if already queued (don't double-queue).
+existing=$(find "$QUEUE_DIR" -maxdepth 1 -name "*-${TASK_ID}.json" 2>/dev/null | head -1)
+if [ -n "$existing" ]; then
+  echo "ERROR: ${TASK_ID} already queued at ${existing}. Remove it first if re-queueing intentionally." >&2
+  exit 1
+fi
+
+jq -n \
+  --arg id "$TASK_ID" \
+  --argjson priority "$PRIORITY" \
+  --arg queued_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg description "$DESCRIPTION" \
+  --arg template "$TEMPLATE" \
+  --argjson deps "$DEPS" \
+  '{task_id: $id, priority: $priority, queued_at: $queued_at, description: $description, template: $template, deps: $deps, status: "queued"}' \
+  > "$QUEUE_FILE"
+
+# (durability layer removed — the queue file is the only record.)
+
+echo "$QUEUE_FILE"

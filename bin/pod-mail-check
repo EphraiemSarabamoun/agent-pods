@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# pod-mail-check <hook-event> — SessionStart/UserPromptSubmit hook helper.
+#
+# If THIS instance has unread pod-mail, emit additionalContext nudging it to read.
+# This is the non-intrusive NATIVE-delivery path for hook-capable agents: the agent
+# learns it has mail as CONTEXT at its next turn (never injected into its input /
+# never auto-acted). Silent if no mail or not in a pod. Mirrors the additionalContext
+# pattern from pod-awareness.sh.
+set -u
+EVENT="${1:-UserPromptSubmit}"
+command -v tmux >/dev/null 2>&1 || exit 0
+[ -n "${TMUX:-}" ] || exit 0
+pane="${TMUX_PANE:-}"; [ -n "$pane" ] || exit 0
+# per-pod mailbox (the helper resolves THIS pod from $TMUX_PANE). Guarded so a
+# missing helper just means "no nudge", never a broken hook.
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || exit 0
+. "$POD_BIN/_pod-common.sh" 2>/dev/null || exit 0
+T="$POD_TMUX"
+me_id="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)" || exit 0
+# clear the red unread PILL: this instance has been prompted, so it's now aware of
+# (and will read) its mail. "prompted => pill gone", guaranteed, even if the mbox is
+# already empty (a stale badge). Unset, never "0" (#{?} treats "0" as true).
+"$T" set-option -uw -t "$me_id" @unread 2>/dev/null || true
+mbox="$(pod_mbox "$me_id")"
+[ -s "$mbox" ] || exit 0
+# Count MESSAGES, not lines: every pod-tell entry begins with a "[HH:MM] " stamp,
+# so count those. (grep -c '.' overcounted a multi-line message body as N
+# messages, and the old `|| echo 0` double-printed "0" on an all-blank mailbox,
+# making the integer test below error out.) grep -c always emits one integer.
+n="$(grep -c '^\[' "$mbox" 2>/dev/null)"; n="${n:-0}"
+[ "$n" -gt 0 ] 2>/dev/null || exit 0
+preview="$(head -4 "$mbox")"
+msg="You have ${n} unread pod-mail message(s). Run \`pod-mail\` to read and clear them. Preview:
+${preview}"
+command -v jq >/dev/null 2>&1 && jq -n --arg c "$msg" --arg e "$EVENT" \
+  '{hookSpecificOutput: {hookEventName: $e, additionalContext: $c}}'
+exit 0

@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# pod-foreign-state — the FLOOR for every agent without lifecycle hooks. A singleton
+# background poller (~3s) that, for each non-hook pod window:
+#   1. ensures it's identified (pod-detect -> @agent_id / @state_source / @scrape_rx),
+#   2. infers idle/busy from pane output and stamps @cc_state (the strip dot),
+#   3. scrapes a live identity card if the adapter gave a card_scrape_regex,
+#   4. delivers any unread pod-mail via pod-deliver when the agent is idle.
+#
+# Idle inference: cksum of the visible transcript (minus the bottom $POD_FOREIGN_TRIM
+# input/footer lines) unchanged across a cycle => settled => idle (green); changed or
+# first-seen => busy (orange). capture-pane / display-message don't count as activity.
+#
+# Hook agents (Claude Code: @state_source=hooks) own their own @cc_state + delivery and
+# are skipped. Self-terminates when no pod is left. Singleton via a pidfile. bash 3.2 safe.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+T="$POD_TMUX"
+INTERVAL="$POD_FOREIGN_INTERVAL"
+TRIM="$POD_FOREIGN_TRIM"
+PIDFILE="$POD_STATE/pod-foreign-state.pid"
+mkdir -p "$POD_STATE" 2>/dev/null || true
+
+# Singleton (kill -0 liveness; portable, no flock). Small launch race is acceptable.
+if [ -f "$PIDFILE" ]; then
+  oldpid="$(cat "$PIDFILE" 2>/dev/null)"
+  if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then exit 0; fi
+fi
+echo $$ > "$PIDFILE" 2>/dev/null || true
+cleanup() { rm -f "$PIDFILE" 2>/dev/null; }
+trap cleanup EXIT
+trap 'exit 0' INT TERM HUP
+
+while :; do
+  # pods are identified by their @is_pod stamp (not a name regex — pods are city-named).
+  pods=""
+  for s in $("$T" list-sessions -F '#{session_name}' 2>/dev/null); do
+    [ "$("$T" show-options -t "=${s}:" -qv @is_pod 2>/dev/null)" = "1" ] && pods="$pods $s"
+  done
+  [ -n "$pods" ] || exit 0          # the deck is gone -> self-terminate
+
+  touched=0
+  for s in $pods; do
+    while IFS='|' read -r wid wname cmd; do
+      [ -n "$wid" ] || continue
+
+      # identify (cached; cheap re-detect when the pane command is unchanged).
+      "$POD_BIN/pod-detect" "$wid" >/dev/null 2>&1 || true
+      ssrc="$("$T" show-options -w -t "$wid" -qv @state_source 2>/dev/null)"
+      [ "$ssrc" = "hooks" ] && continue       # hook agent owns its state + delivery
+
+      # idle/busy from the transcript hash (drop the bottom $TRIM input/footer lines).
+      cap="$("$T" capture-pane -p -t "$wid" 2>/dev/null)"
+      h="$(printf '%s\n' "$cap" | awk -v n="$TRIM" '{a[NR]=$0} END{for(i=1;i<=NR-n;i++) print a[i]}' | cksum 2>/dev/null | awk '{print $1}')"
+      [ -n "$h" ] || continue
+      prev="$("$T" show-options -w -t "$wid" -qv @fhash 2>/dev/null)"
+      if [ -n "$prev" ] && [ "$h" = "$prev" ]; then st=idle; else st=busy; fi
+      "$T" set-option -w -t "$wid" @fhash "$h" 2>/dev/null || true
+      "$T" set-option -w -t "$wid" @cc_state "$st" 2>/dev/null || true
+      touched=1
+
+      # live identity card, if the adapter supplied a scrape regex (group 1 = model
+      # [must contain a digit per the regex], group 2 = effort). Only a successful
+      # parse writes @card, so a blank/unparseable pane is left untouched.
+      rx="$("$T" show-options -w -t "$wid" -qv @scrape_rx 2>/dev/null)"
+      if [ -n "$rx" ]; then
+        cardline="$(printf '%s\n' "$cap" | tail -15 | RX="$rx" python3 -c '
+import sys, os, re
+rx = os.environ.get("RX", "")
+mod = eff = ""
+try:
+    pat = re.compile(rx)
+    for ln in reversed(sys.stdin.read().splitlines()):
+        m = pat.search(ln)
+        if m and (m.lastindex or 0) >= 2:
+            mod, eff = m.group(1), m.group(2); break
+except Exception:
+    pass
+print(mod + "|" + eff)
+' 2>/dev/null)"
+        cx_model="${cardline%%|*}"; cx_effort="${cardline#*|}"
+        if [ -n "$cx_model" ]; then
+          aid="$("$T" show-options -w -t "$wid" -qv @agent_id 2>/dev/null)"
+          card="$("$POD_ADAPTER" card "$aid" --model "$cx_model" --effort "$cx_effort" 2>/dev/null)"
+          cur="$("$T" show-options -w -t "$wid" -qv @card 2>/dev/null)"
+          if [ -n "$card" ] && [ "$card" != "$cur" ]; then
+            "$T" set-option -w -t "$wid" @card   "$card"      2>/dev/null || true
+            "$T" set-option -w -t "$wid" @model  "$cx_model"  2>/dev/null || true
+            "$T" set-option -w -t "$wid" @effort "$cx_effort" 2>/dev/null || true
+            touched=1
+          fi
+        fi
+      fi
+
+      # deliver unread pod-mail + any queued gold-star prompt when idle (both no-op
+      # when there's nothing to deliver and re-check their own safety gates).
+      # Backgrounded so a settle re-check can't stall the poll loop.
+      if [ "$st" = "idle" ]; then
+        ( "$POD_BIN/pod-deliver" "$wid" >/dev/null 2>&1 & )
+        ( "$POD_BIN/pod-star" --deliver-pending "$wid" "$s" >/dev/null 2>&1 & )
+        # this (non-hook) agent is idle = caught up; clear its red unread pill (hook
+        # agents clear theirs via pod-mail-check at their next prompt instead).
+        "$T" set-option -uw -t "$wid" @unread 2>/dev/null || true
+      fi
+    done <<EOF
+$("$T" list-windows -t "$s" -F '#{window_id}|#{window_name}|#{pane_current_command}' 2>/dev/null)
+EOF
+  done
+  [ "$touched" = "1" ] && "$T" refresh-client -S 2>/dev/null || true
+  sleep "$INTERVAL"
+done

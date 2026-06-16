@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# pod-star — award a gold ⭐ to a podmate. HUMAN-ONLY: stars come from you (the human)
+# via the gold ⭐ strip button / C-a * / M-g, or this CLI from a non-agent shell.
+# Agents may read the board/log but cannot award or revoke — see the caller guard
+# below. (Recognition flows from the human, not agent-to-agent.)
+#
+# Usage:
+#   pod-star <name|@id|index> [reason...]   award one star (with an optional reason)
+#   pod-star <worker> -n 3 [reason]         award N stars at once
+#   pod-star <worker> --revoke              take one star back
+#   pod-star                                show this pod's star board
+#   pod-star --board                        (same)
+#   pod-star --log                          dump the raw award log for this pod
+#   pod-star --deliver-pending <@id> [pod]  internal: deliver a queued star prompt
+#
+# Stars live on the tmux window option @stars (the source of truth — rendered in the
+# colored status strip and the `pod` roster). Every award is appended to this pod's
+# star log ($POD_COMMS/<pod>/stars.log). When the awardee is an interactive agent
+# (detected, not a plain shell) the award is delivered as a REAL prompt the moment it
+# returns idle (a queued-input mechanism); a plain shell or unknown agent keeps only
+# the badge, log entry, and status-line flash. bash 3.2 safe.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"; . "$POD_BIN/_pod-common.sh"
+T="$POD_TMUX"
+
+# is this window an interactive agent we can deliver a typed prompt to? (any detected
+# agent that isn't the generic-shell floor). Uses @agent_id, the cached detection key.
+deliverable() {
+  local aid; aid="$("$T" show-options -wqv -t "$1" @agent_id 2>/dev/null)"
+  case "$aid" in ""|generic-shell|shell) return 1 ;; *) return 0 ;; esac
+}
+
+# --- internal: --deliver-pending <window_id> [session] ------------------------
+# Deliver any queued star award to <window_id> as a REAL user prompt (send-keys).
+# Called by pod-state/pod-foreign-state when a window flips to idle, and by the award
+# path when the target is already idle. EXEMPT from the human-only guard: this is
+# transport, not an award. Every path exits 0.
+if [ "${1:-}" = "--deliver-pending" ]; then
+  win="${2:-}"; sess="${3:-}"
+  [ -n "$win" ] || exit 0
+  [ -n "$sess" ] || sess="$("$T" display-message -p -t "$win" '#{session_name}' 2>/dev/null)"
+  [ -n "$sess" ] || exit 0
+  deliverable "$win" || exit 0
+  pend="$(pod_dir_for "$sess")/stars/${win}.pending"
+  [ -f "$pend" ] || exit 0
+  claim="${pend}.claim.$$"
+  mv "$pend" "$claim" 2>/dev/null || exit 0   # atomic claim: one deliverer wins a race
+  sleep 0.3                                   # settle; let a racing state stamp land
+  st="$("$T" show-options -wqv -t "$win" @cc_state 2>/dev/null)"
+  if [ "$st" != "idle" ]; then
+    # Target went busy/wait between claim and send (wait = a permission DIALOG,
+    # never type into one). Merge back; the next idle stamp re-fires us.
+    if [ -f "$pend" ]; then cat "$claim" >> "$pend" && rm -f "$claim"
+    else mv "$claim" "$pend" 2>/dev/null; fi
+    exit 0
+  fi
+  # Compose from the LIVE total (not award-time totals) so a revoke-while-pending
+  # can never overstate; fully revoked -> drop silently (badge already gone).
+  total="$("$T" show-options -wqv -t "$win" @stars 2>/dev/null)"
+  case "$total" in (*[!0-9]*|"") total=0 ;; esac
+  [ "$total" -gt 0 ] || { rm -f "$claim"; exit 0; }
+  n=0; reasons=""
+  while IFS='|' read -r _ts _aw d _tot r; do
+    case "$d" in (*[!0-9]*|"") d=1 ;; esac
+    n=$((n+d))
+    [ -n "$r" ] && reasons="${reasons:+$reasons; }$r"
+  done < "$claim"
+  [ "${#reasons}" -gt 140 ] && reasons="$(printf '%.137s' "$reasons")..."
+  star="⭐"; who="$POD_STAR_AWARDER"
+  if [ "$n" -le 1 ]; then
+    msg="${star} Gold star from ${who}!${reasons:+ For: $reasons.} That puts you at $total ${star}. No reply needed, keep rolling."
+  else
+    msg="${star} ${who} gave you $n gold stars while you were heads-down!${reasons:+ For: $reasons.} That puts you at $total ${star}. No reply needed, keep rolling."
+  fi
+  # send-keys text, 0.1s gap, Enter — the measured-reliable race-guard pattern.
+  "$T" send-keys -t "$win" -l "$msg" 2>/dev/null || { rm -f "$claim"; exit 0; }
+  sleep 0.1
+  "$T" send-keys -t "$win" Enter 2>/dev/null
+  # Optimistic state flip so the board reads busy now; the recipient owns the next
+  # stamp (its UserPromptSubmit hook re-affirms in a beat).
+  "$T" set-option -w -t "$win" @cc_state busy 2>/dev/null
+  "$T" set-option -w -t "$win" @state_since "$(date +%s)" 2>/dev/null
+  "$T" refresh-client -S 2>/dev/null
+  rm -f "$claim"
+  exit 0
+fi
+
+# --- caller (awarder) + pod session, pinned to the CALLING pane --------------
+pane="${TMUX_PANE:-}"; S=""; AWARDER=""; AWIDX=""
+if [ -n "$pane" ]; then
+  meta="$("$T" display-message -p -t "$pane" '#{session_name}|#{window_name}|#{window_index}' 2>/dev/null)"
+  IFS='|' read -r S AWARDER AWIDX <<<"$meta"
+fi
+[ -n "$S" ]       || S="${POD_SESSION:-$POD_SESSION_PREFIX}"
+STARLOG="$(pod_dir_for "$S")/stars.log"
+
+# --- parse args --------------------------------------------------------------
+worker=""; n=1; revoke=0; board=0; dumplog=0; reason=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -n|--count)        n="${2:-1}"; shift 2 ;;
+    --revoke|--remove) revoke=1; shift ;;
+    -b|--board)        board=1; shift ;;
+    --log)             dumplog=1; shift ;;
+    -h|--help)         sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --)                shift; reason="$*"; break ;;
+    -*)                shift ;;                # ignore unknown flags
+    *) if [ -z "$worker" ]; then worker="$1"; else reason="${reason:+$reason }$1"; fi; shift ;;
+  esac
+done
+case "$n" in (*[!0-9]*|"") n=1 ;; esac
+
+if [ "$dumplog" = "1" ]; then
+  [ -f "$STARLOG" ] && cat "$STARLOG" || echo "(no stars awarded in pod '$S' yet)"
+  exit 0
+fi
+
+# --- board view (default when no worker given) -------------------------------
+if [ "$board" = "1" ] || [ -z "$worker" ]; then
+  rows="$("$T" list-windows -t "=$S" -F '#{window_index}|#{window_id}|#{window_name}' 2>/dev/null \
+    | while IFS='|' read -r idx wid wname; do
+        s="$("$T" show-options -wqv -t "$wid" @stars 2>/dev/null)"
+        { [ -n "$s" ] && [ "$s" -gt 0 ] 2>/dev/null; } || continue
+        # one glyph per star, capped so a 20-star worker does not wrap the terminal
+        g=""; i=0; cap="$s"; [ "$cap" -gt 10 ] && cap=10
+        while [ "$i" -lt "$cap" ]; do g="${g}⭐"; i=$((i+1)); done
+        [ "$s" -gt 10 ] && g="${g}…"
+        printf '  %-14s %s  (%s)\n' "$wname" "$g" "$s"
+      done)"
+  echo "⭐ Star board — POD '$S':"
+  if [ -n "$rows" ]; then printf '%s\n' "$rows"; else echo "  (no stars yet — go do something impressive)"; fi
+  exit 0
+fi
+
+# --- HUMAN-ONLY from here down ------------------------------------------------
+# Agents run their tools with CLAUDECODE set (and live in a detected, non-shell
+# window). A human awarding from the ⭐ button/menu runs with TMUX_PANE unset (so no
+# caller window) or from a plain shell (no agent stamp). This is a courtesy gate, not
+# a security boundary. Board/log above stay agent-readable; --deliver-pending
+# (transport) exited earlier.
+caller_agent=""
+[ -n "${TMUX_PANE:-}" ] && caller_agent="$("$T" show-options -wqv -t "$TMUX_PANE" @agent_id 2>/dev/null)"
+case "$caller_agent" in generic-shell|shell) caller_agent="" ;; esac
+if [ -n "${CLAUDECODE:-}" ] || [ -n "$caller_agent" ]; then
+  echo "pod-star: gold stars are awarded by the human (the ⭐ strip button / C-a *). Standings: pod-star --board"
+  exit 1
+fi
+who="$POD_STAR_AWARDER"   # the only possible awarder now — never trust the focused pane name
+
+# --- resolve worker (name | @id | index) -> window id ------------------------
+case "$worker" in
+  @*)     # window-ids are server-global — validate membership in THIS pod (same
+          # guard as pod-tell) so a typo'd @id can't half-award
+          win=""
+          "$T" list-windows -t "=$S" -F '#{window_id}' 2>/dev/null | grep -qx -- "$worker" && win="$worker" ;;
+  [0-9]*) win="$("$T" list-windows -t "=$S" -F '#{window_index}|#{window_id}' 2>/dev/null | awk -F'|' -v i="$worker" '$1==i{print $2; exit}')" ;;
+  *)      win="$("$T" list-windows -t "=$S" -F '#{window_id}|#{window_name}' 2>/dev/null | awk -F'|' -v nm="$worker" 'tolower($2)==tolower(nm){print $1; exit}')" ;;
+esac
+[ -n "${win:-}" ] || { echo "pod-star: no worker '$worker' in pod '$S' (try: pod-star --board)"; exit 1; }
+
+wname="$("$T" display-message -p -t "$win" '#{window_name}' 2>/dev/null || echo "$worker")"
+cur="$("$T" show-options -wqv -t "$win" @stars 2>/dev/null)"; case "$cur" in (*[!0-9]*|"") cur=0 ;; esac
+
+if [ "$revoke" = "1" ]; then new=$(( cur - n )); [ "$new" -lt 0 ] && new=0
+else                        new=$(( cur + n )); fi
+
+# @stars is the source of truth; unset at 0 so the strip #{?#{@stars},..} test is clean
+if [ "$new" -gt 0 ]; then "$T" set-option -w  -t "$win" @stars "$new"
+else                      "$T" set-option -uw -t "$win" @stars 2>/dev/null; fi
+"$T" refresh-client -S 2>/dev/null   # repaint the status strip now, don't wait for the tick
+
+# --- log the award (per-pod, cleaned up with the pod) ------------------------
+esc() { printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+mkdir -p "$(dirname "$STARLOG")" 2>/dev/null
+delta="$n"; [ "$revoke" = "1" ] && delta="-$n"
+printf '{"ts":"%s","awarder":"%s","awardee":"%s","delta":%s,"total":%s,"reason":"%s"}\n' \
+  "$(date '+%Y-%m-%dT%H:%M:%S')" "$(esc "$who")" "$(esc "$wname")" "$delta" "$new" "$(esc "$reason")" >> "$STARLOG" 2>/dev/null
+
+# --- announce + celebrate ----------------------------------------------------
+if [ "$revoke" = "1" ]; then
+  echo "➖ Took a star from $wname (now $new ⭐)."
+else
+  echo "⭐ $who awarded $wname a star${reason:+ — $reason}  (now $new ⭐)"
+  # Queued-input delivery: the awardee gets a REAL prompt when it next returns idle.
+  # Only for deliverable (detected, non-shell) agents — a plain shell would just get
+  # text typed into it. Unknown/shell windows keep the badge, log, and flash.
+  if deliverable "$win"; then
+    sdir="$(pod_dir_for "$S")/stars"; mkdir -p "$sdir" 2>/dev/null
+    r="${reason//|/ }"; r="${r//$'\n'/ }"          # keep the pending line one line, pipe-clean
+    [ "${#r}" -gt 120 ] && r="$(printf '%.117s' "$r")..."
+    printf '%s|%s|%s|%s|%s\n' "$(date +%s)" "$who" "$n" "$new" "$r" >> "$sdir/${win}.pending"
+    # idle -> prompt NOW. Append-then-read-state ordering matters: pod-state does
+    # stamp-then-check, so the worst race is a delivery deferred to the next idle
+    # stamp, never a lost one. busy/wait -> pod-state delivers at the idle flip.
+    st="$("$T" show-options -wqv -t "$win" @cc_state 2>/dev/null)"
+    if [ "$st" = "idle" ]; then
+      ( "$POD_BIN/pod-star" --deliver-pending "$win" "$S" >/dev/null 2>&1 & )
+    fi
+  fi
+  "$T" display-message -t "$win" "⭐ Star for $wname${reason:+: $reason}  (total $new)" 2>/dev/null
+fi

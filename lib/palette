@@ -1,0 +1,19 @@
+# agent-pods worker color palette — SINGLE SOURCE OF TRUTH.
+# One "<tmux-color-code> <name>" per line. Read by bin/pod-add-worker (bash) and
+# modules/mcp/pod_manager_server.py (python). Keep them from drifting apart by
+# reading THIS file in both, never re-listing the colors inline.
+#
+# HARD RULE (the black-on-black bug): every code here must be a DARK jewel tone so a
+# light foreground (fg=colour231) stays readable on it. A window's body bg is set to
+# this code paired with fg=colour231 in pod-add-worker; a bare bg with no light fg is
+# exactly the black-on-black regression. Do not add a light/saturated code here.
+#
+# Lines starting with '#' and blank lines are ignored. Order = assignment preference.
+colour18 ocean
+colour52 maroon
+colour22 forest
+colour58 olive
+colour53 purple
+colour23 teal
+colour60 slate
+colour94 rust

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# pod-shell — the default manager seat (window 0) when no agent is configured. Prints
+# the pod roster once, then drops into an interactive shell. Pointing POD_MANAGER_CMD
+# at an agent (claude/codex/...) in ~/.config/pod/config.sh replaces this entirely.
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+"$POD_BIN/pod" 2>/dev/null || true
+echo
+echo "  agent-pods manager seat. Useful commands:"
+echo "    pod                 roster of this pod"
+echo "    pod-tell <who> ...  message a podmate (name | @id | all)"
+echo "    pod-mail            read your unread pod-mail"
+echo "    click  +  (bottom-right)  spawn an agent;  ⚙ edit slots;  ☰ summary;  ✕ kill a tab"
+echo
+exec "${SHELL:-/bin/bash}" -i

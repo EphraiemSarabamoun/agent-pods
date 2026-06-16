@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# mgr-status — pretty-print the queue state: in-flight workers, queued tasks,
+# recent completions.
+#
+# Usage:
+#   mgr-status            # human-readable
+#   mgr-status --json     # machine-readable
+
+set -euo pipefail
+POD_BIN="$(cd "$(dirname "$0")/../../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+
+INBOX_ROOT="$POD_INBOX"
+QUEUE_DIR="$POD_INBOX/_queue"
+WORKERS_PATH="$POD_STATE/workers.json"
+LOG_PATH="$POD_STATE/log.jsonl"
+DISPATCHED="$POD_STATE/dispatched"
+
+EMIT_JSON=0
+[ "${1:-}" = "--json" ] && EMIT_JSON=1
+
+if [ "$EMIT_JSON" -eq 1 ]; then
+  jq -n \
+    --slurpfile workers "$WORKERS_PATH" \
+    --argjson queue "$(ls "$QUEUE_DIR" 2>/dev/null | jq -R . | jq -s . || echo '[]')" \
+    --arg inbox "$INBOX_ROOT" \
+    '{workers: $workers[0].workers, queue_files: $queue, inbox_root: $inbox}'
+  exit 0
+fi
+
+echo "================================================================"
+echo " WORKERS"
+echo "================================================================"
+jq -r '.workers[] | "  " + (.tmux_window // "?") + " " + (.color // "") + " [" + (.label // "—") + "] " + .status + (if .current_task_id then " · " + .current_task_id else "" end) + (if .started_at then " · started " + .started_at else "" end)' "$WORKERS_PATH" 2>/dev/null
+[ "$(jq '.workers | length' "$WORKERS_PATH" 2>/dev/null || echo 0)" -eq 0 ] && echo "  (no workers registered — spawn one via the + button or pod-add-worker)"
+
+echo ""
+echo "================================================================"
+echo " QUEUE (highest priority / earliest first)"
+echo "================================================================"
+queue_files=$(ls "$QUEUE_DIR" 2>/dev/null | sort)
+if [ -z "$queue_files" ]; then
+  echo "  (queue empty)"
+else
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    fp="${QUEUE_DIR}/${f}"
+    tid=$(jq -r .task_id "$fp")
+    pri=$(jq -r .priority "$fp")
+    desc=$(jq -r '.description // ""' "$fp")
+    tpl=$(jq -r '.template // ""' "$fp")
+    printf "  pri=%-3s %-40s %-15s %s\n" "$pri" "$tid" "[$tpl]" "$desc"
+  done <<< "$queue_files"
+fi
+
+echo ""
+echo "================================================================"
+echo " RECENT COMPLETIONS (last 10)"
+echo "================================================================"
+if [ -s "$LOG_PATH" ]; then
+  grep '"event":"completed"' "$LOG_PATH" | tail -10 | jq -r '"  \(.ts)  \(.task_id)"'
+else
+  echo "  (no completions logged yet)"
+fi
+
+echo ""
+echo "================================================================"
+echo " DISPATCHED ARCHIVE COUNT: $(ls "$DISPATCHED" 2>/dev/null | wc -l | tr -d ' ')"
+echo "================================================================"

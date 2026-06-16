@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# pod-task-wait — block until a pod worker becomes idle, then exit.
+#
+# An autonomous manager loop (see docs/autonomy.md) launches this in the BACKGROUND.
+# When it exits, the manager agent is re-invoked — that re-invocation IS the "wake
+# whenever an agent is idle" trigger. The manager then polls (mgr-pick-next),
+# dispatches the next queued chunk to the freed worker(s), and re-arms this watcher.
+#
+# "Idle" signal: a change in the set of $POD_INBOX/*/DONE sentinels (a worker finished
+# its dispatched task and touched DONE). This is the clean, protocol-native signal.
+# Workers that go idle WITHOUT a DONE (errored, never-tasked, stuck at a REPL prompt)
+# are NOT caught here — the safety timeout heartbeat exists so the manager wakes anyway
+# and can sweep for those.
+#
+# Exits (prints one of, informational only — the manager polls regardless of reason):
+#   idle-change   a DONE sentinel appeared/disappeared
+#   timeout       the safety heartbeat elapsed
+#   stopped       the pod-task was marked done/paused/absent (stale watcher self-ends)
+#   auto-off      the pod's FULL AUTO switch is off (pod-auto / the strip pill) — the
+#                 manager should pause the loop: mark status "paused", don't dispatch,
+#                 don't re-arm. Fail-OPEN: a non-pod context is a no-op.
+#
+# Usage: pod-task-wait [timeout_seconds]      (default 1200 = 20 min heartbeat)
+#   POD_TASK_WAIT_POLL=<secs>  override the poll interval (default 3)
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+. "$POD_BIN/_mgr-runtime.sh" 2>/dev/null || true
+
+STATE="$POD_STATE/pod-task.json"
+TIMEOUT="${1:-1200}"
+POLL="${POD_TASK_WAIT_POLL:-3}"
+
+# Full-auto gate (mgr_current_pod / mgr_full_auto). Guarded so a missing helper
+# degrades to the pre-switch behavior. TMUX_PANE is inherited from the manager's Bash
+# tool; POD_SESSION is the creation-time fallback baked into window 0's environment.
+POD=""
+command -v mgr_current_pod >/dev/null 2>&1 && POD="$(mgr_current_pod)"
+auto_on() {
+  [ -n "$POD" ] || return 0
+  command -v mgr_full_auto >/dev/null 2>&1 || return 0
+  mgr_full_auto "$POD"
+}
+
+# Honor a done/paused state file ONLY when it's THIS pod's loop. pod-task.json is a
+# host-global singleton any pod's loop can write, so a foreign pod's "done" must not
+# self-terminate our watcher. An unscoped file (no .pod) is still honored; a pod we
+# can't resolve ($POD empty) degrades to the old honor-regardless behavior.
+state_terminal_for_me() {
+  [ -f "$STATE" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  local spod sst
+  spod="$(jq -r '.pod // empty' "$STATE" 2>/dev/null)"
+  if [ -n "$spod" ] && [ -n "$POD" ] && [ "$spod" != "$POD" ]; then
+    return 1
+  fi
+  sst="$(jq -r '.status // "running"' "$STATE" 2>/dev/null)"
+  case "$sst" in done|paused) return 0 ;; esac
+  return 1
+}
+
+# the set of DONE sentinels as a stable string (portable — no shasum/cksum dependency)
+snapshot() { ls "$POD_INBOX"/*/DONE 2>/dev/null | sort | tr '\n' ' '; }
+
+# Refuse to arm while the switch is off — a manual pod has no business waking the loop.
+auto_on || { echo "auto-off"; exit 0; }
+# If THIS pod's state file already says done/paused, don't even arm.
+state_terminal_for_me && { echo "stopped"; exit 0; }
+
+baseline="$(snapshot)"
+end=$(( $(date +%s) + TIMEOUT ))
+
+while [ "$(date +%s)" -lt "$end" ]; do
+  state_terminal_for_me && { echo "stopped"; exit 0; }
+  # mid-run flip of FULL AUTO -> wake the manager NOW so it pauses within one poll
+  auto_on || { echo "auto-off"; exit 0; }
+  cur="$(snapshot)"
+  if [ "$cur" != "$baseline" ]; then
+    echo "idle-change"
+    exit 0
+  fi
+  sleep "$POLL"
+done
+
+echo "timeout"
+exit 0

@@ -1,0 +1,44 @@
+# agent-pods runtime config — copy to ~/.config/pod/config.sh and edit.
+# This is a PLAIN SHELL FILE, sourced by every pod-* script via _pod-paths.sh.
+# Set only what you want to override; anything you omit keeps its built-in default.
+# (The agent CATALOG is separate — that's adapters/*.toml + ~/.config/pod/slots.toml.)
+
+# --- deck identity -------------------------------------------------------------
+# New pods are named after a random free city (Rome, Kyoto, ...); the numeric
+# <prefix>, <prefix>-2, ... series is the fallback when the city pool is exhausted.
+# POD_SESSION_PREFIX=pod
+# POD_CITIES=        # override the city pool (space-separated single-word names)
+
+# Window 0 is the "manager". By default it becomes the best agent you actually have
+# installed, in POD_MANAGER_PREFER order, launched with that agent's default
+# model/effort — and only falls back to a shell (showing the `pod` roster) if NONE of
+# those agents are present. Override the order, or pin a specific manager:
+#   POD_MANAGER_PREFER="claude-code codex cursor openclaw"   # default; first installed wins
+#   POD_MANAGER_CMD=claude          # pin the manager to a specific command (skips auto-pick)
+#   POD_MANAGER_CARD="Claude Code · opus · manager"
+# Set POD_MANAGER_CMD to a shell to FORCE the plain manager seat regardless of agents:
+#   POD_MANAGER_CMD=/bin/bash
+# POD_MANAGER_NAME=manager
+# POD_MANAGER_PREFER="claude-code codex cursor openclaw"
+# POD_MANAGER_CMD=
+# When FULL AUTO is on, the manager window is renamed to signal the mode. Defaults to
+# POD_MANAGER_NAME (a visible no-op); set a distinct name to make the switch obvious:
+# POD_MANAGER_NAME_AUTO=
+
+# --- gold stars ----------------------------------------------------------------
+# Stars are HUMAN-only. This name is attributed in the award log + the delivered
+# prompt ("Gold star from <name>!"). Defaults to "the human".
+# POD_STAR_AWARDER="the human"
+
+# --- state location ------------------------------------------------------------
+# All ephemeral state lives under one tmp tree. Override the base if /tmp is unusual.
+# POD_TMP=/tmp/pod
+
+# --- tmux binary ---------------------------------------------------------------
+# Empty -> resolved on PATH. Set an absolute path only if tmux isn't on PATH for
+# non-interactive shells.
+# POD_TMUX=
+
+# --- foreign-state poller (state dot for agents without lifecycle hooks) --------
+# POD_FOREIGN_INTERVAL=3     # seconds between idle/busy polls
+# POD_FOREIGN_TRIM=8         # bottom lines (input box + footer) excluded from the hash

@@ -1,0 +1,73 @@
+# adapters/_schema.toml — the adapter contract, documented. This file is NOT loaded
+# (leading underscore = skipped). Copy any real adapter as a starting point, or read
+# docs/adapters.md. An adapter teaches agent-pods how to launch, detect, and label one
+# AI coding agent. Drop a *.toml here (or in ~/.config/pod/adapters/ to override) and
+# it shows up in the "+" spawn menu — no code change.
+
+[agent]
+id       = "example"          # stable key; cached on the window as @agent_id
+label    = "Example Agent"    # pretty name shown in cards/menus
+priority = 50                 # detection tie-break, LOWER wins; generic-shell = 9999
+
+[launch]
+base_cmd   = "example"                  # binary (resolved on PATH); or a ${SHELL}-style expansion
+model_arg  = ["--model", "{model}"]     # argv tokens; {model} <- the chosen model's `model` value
+effort_arg = ["--effort", "{effort}"]   # argv tokens; {effort} <- the chosen effort's `value`
+# Launch command = base_cmd + model_arg (if a model is picked) + effort_arg (if an
+# effort is picked), each as SEPARATE argv words. Keep every token space-free so the
+# spawn path's word-splitting reconstructs argv correctly.
+
+[detect]
+# How to recognize this agent already running in a tmux pane. Tried in priority order.
+pane_cmd_patterns = ['^example$']   # regex vs #{pane_current_command} (cheap, tried first)
+content_patterns  = []              # regex vs capture-pane output (fallback; for node/python TUIs)
+reject_content    = []              # if any matches the pane content, do NOT claim it (veto)
+
+[defaults]
+model             = "default"       # used when the manager seat / a bare spawn picks this agent
+effort            = ""
+card_scrape_regex = ''              # optional: a regex to read live model/effort from the pane
+                                    # footer; must capture group 1 = model, group 2 = effort.
+
+[lifecycle]
+mode            = "poll"            # "hooks" = agent fires lifecycle events we wired; "poll" = floor
+installer       = ""               # path (repo-relative) to a hook installer; only for mode="hooks"
+native_delivery = false            # true = agent surfaces pod-mail itself -> pod-deliver skips send-keys
+state_source    = "poll"           # "hooks" = agent stamps its own @cc_state; "poll" = the poller infers it
+
+# [discover] (OPTIONAL) — live model discovery. When present and the command exits 0
+# with >=1 parsed model, the live list REPLACES [[models]] below (which then serves
+# only as the offline fallback and as a source of prettier labels / effort ladders by
+# matching slug). Use it for agents whose CLI can enumerate models (cursor-agent
+# --list-models, `ollama list` for an Ollama backend). Omit it for agents with no such
+# command (e.g. claude-code, codex) — their curated [[models]] is the source of truth.
+# Results are cached under $POD_STATE/discover/<id>.json for ttl_s; `pod-adapter
+# refresh [id]` busts the cache. The command runs via the shell, so it can reach a
+# remote backend (e.g. "ssh gpu-box ollama list").
+[discover]
+models_cmd   = "agent --list-models"   # shell command; its stdout is parsed per line
+models_regex = '^(\S+)\s+-\s+(.+)$'     # group 1 = model id (= {model} + slug);
+                                        # optional group 2 = pretty label. Non-matching
+                                        # lines (headers, blanks) are skipped.
+timeout_s    = 6                        # kill discovery after this many seconds
+ttl_s        = 21600                    # cache lifetime (6h); refresh to re-query
+# auth (OPTIONAL): names a provider whose models come from a REST API behind a key
+# (e.g. models_cmd = "pod-discover-api anthropic"). `pod-login <agent>` reads this to
+# know which key to ask for; if no key is available the command just fails and the
+# static fallback below is used. Omit for discovery that needs no key (cursor/ollama).
+auth         = ""                       # "" | "anthropic" | "openai" | <your provider>
+# Effort ladder applied to EVERY discovered model (efforts aren't CLI-enumerable, so
+# they stay declarative here). Empty [] = the agent has no effort axis.
+efforts = []
+
+# Zero or more models. efforts is an inline array of tables (may be empty []). With a
+# [discover] block above, this list is the OFFLINE FALLBACK; without one, it's the
+# authoritative model list.
+[[models]]
+slug   = "default"
+label  = "Default"
+model  = "the-model-id"            # substituted into {model}
+efforts = [
+  { slug = "high",   label = "high",   value = "high" },
+  { slug = "low",    label = "low",    value = "low" },
+]

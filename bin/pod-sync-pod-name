@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# pod-sync-pod-name <new_session_name> — session-renamed hook handler: make a pod
+# RENAME first-class, the way pod-sync-label does for worker-tab renames.
+#
+# tmux's session-renamed hook only tells us the NEW name (#{hook_session_name}); the
+# OLD name comes from the @pod_name session option, which pod-launch stamps at
+# creation and this script re-stamps after every rename. On a rename it:
+#
+#   1. moves $POD_COMMS/<old> -> <new>  (chat feed, mailboxes, leases, work logs —
+#      everything _pod-common.sh keys by session name; without the move the pod's
+#      comms history would orphan and the launch-time gc would delete it)
+#   2. updates the session env POD_SESSION (future panes; running panes keep a stale
+#      copy, which is fine — pod_name()/mgr_current_pod/pod-add-worker resolve
+#      live-first and only trust POD_SESSION when that session exists)
+#   3. rewrites tmux_group.json if this pod is the recorded PRIMARY (the MCP +
+#      headless mgr-* helpers follow that file)
+#   4. re-stamps @pod_name and logs the rename to the pod's channel feed
+#
+# Guarded by @is_pod: renaming a non-pod tmux session is a no-op here. bash 3.2 safe.
+set -uo pipefail
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"; . "$POD_BIN/_pod-common.sh"
+T="$POD_TMUX"
+STATE_GRP="$POD_STATE/tmux_group.json"
+
+# NOTE on targeting: has-session accepts the "=" exact-match prefix, but on tmux 3.6b
+# set-option/show-options REJECT it ("no such session: =x"). cmd-find tries an exact
+# name match before prefix matching, so after the exact has-session guard the
+# bare-name targets below resolve to the right session deterministically.
+new="${1:-}"
+[ -n "$new" ] || exit 0
+"$T" has-session -t "=$new" 2>/dev/null || exit 0
+[ "$("$T" show-options -t "$new" -qv @is_pod 2>/dev/null)" = "1" ] || exit 0
+
+old="$("$T" show-options -t "$new" -qv @pod_name 2>/dev/null)"
+
+# always leave the stamp + env consistent with the live name
+"$T" set-option -t "$new" @pod_name "$new" 2>/dev/null || true
+"$T" set-environment -t "$new" POD_SESSION "$new" 2>/dev/null || true
+
+# nothing else to migrate when there's no prior name (pre-@pod_name pod adopted live)
+# or the "rename" is a no-op
+[ -n "$old" ] && [ "$old" != "$new" ] || exit 0
+
+# 1. per-pod comms/lease subtree follows the pod
+od="$(pod_dir_for "$old")"; nd="$(pod_dir_for "$new")"
+if [ -d "$od" ] && [ ! -e "$nd" ]; then
+  mv "$od" "$nd" 2>/dev/null || true
+fi
+
+# 2. primary-pod record follows too (only if it pointed at the OLD name; a secondary
+# pod's rename must not clobber the primary's record)
+if [ -f "$STATE_GRP" ] && command -v jq >/dev/null 2>&1; then
+  if [ "$(jq -r '.session // empty' "$STATE_GRP" 2>/dev/null)" = "$old" ]; then
+    tmp="${STATE_GRP}.tmp.$$"
+    if jq --arg n "$new" '.session = $n | .pod = $n' "$STATE_GRP" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$STATE_GRP"
+    else
+      rm -f "$tmp"
+    fi
+  fi
+fi
+
+# 3. announce in the pod's own feed (same format pod-kill-worker uses)
+CHAN="$(pod_chan_for "$new")"
+mkdir -p "$(dirname "$CHAN")" 2>/dev/null || true
+echo "[$(date +%H:%M)] pod renamed $old -> $new" >> "$CHAN" 2>/dev/null || true

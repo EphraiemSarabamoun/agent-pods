@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# pod-status-action <mouse_status_range> — route a pod status-strip click.
+#
+# Bound (via run-shell -b) to MouseDown1Status in pod-launch for the "button"
+# ranges only; normal tab clicks (range=window) are handled by select-window in
+# the binding itself and never reach here.
+#
+# Why a script instead of a nested if-shell: the range is matched here in bash on
+# the argument captured AT CLICK TIME. The earlier nested-if-shell approach lost
+# the mouse-event context in the deferred branch, so #{mouse_status_range} read
+# empty there and the kill never fired. Passing the range as an argv sidesteps that.
+set -uo pipefail
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+T="$POD_TMUX"
+range="${1:-}"
+# $2 = clicked session (passed for multi-pod safety, kept as-is); $3 = triggering
+# client name, so the picker menu can pop for the client that clicked "+".
+client="${3:-}"
+case "$range" in
+  newwin)
+    # "+" opens the agent/model picker (native display-menu, built from the adapter
+    # catalog) instead of spawning a default worker directly. Picking a model runs
+    # pod-add-worker with that agent's launch command. NEVER pass -c from this
+    # backgrounded run-shell context: the "+" action is new-window and its display-menu
+    # auto-resolves the popup client; forcing -c here would break it.
+    exec "$POD_BIN/pod-spawn-menu-build" "$client" ;;
+  settings)
+    # the gear opens the slot editor (chained display-menus from the catalog, writes
+    # slots.json). Thread the CLIENT ($3) through: each chained menu is popped from a
+    # menu item's BACKGROUNDED run-shell, which has no reliable "current client" for
+    # display-menu to attach to (unlike the "+", whose action is new-window and needs
+    # no client). So the editor pops every menu with `-c <client>`. Without it the
+    # 2nd/3rd menu silently no-ops ("nothing happens").
+    exec "$POD_BIN/pod-settings-menu" --client "$client" ;;
+  summary)
+    # the ☰ button toggles the docked summary PANE (non-modal: keyboard focus stays
+    # in the agent pane while it shows the roster + chat feed). Output suppressed so a
+    # backgrounded run-shell can't pop a copy-mode overlay.
+    sess="${2:-}"
+    exec "$POD_BIN/pod-summary-pane" toggle "$sess" >/dev/null 2>&1 ;;
+  star)
+    # the gold ⭐ button (or C-a * / M-g) pops the one-click star picker. NO -c here:
+    # the picker is a top-level display-menu and auto-resolves the clicking client
+    # (the "+"/pod-spawn-menu-build lesson); forcing -c makes display-menu return 1.
+    exec "$POD_BIN/pod-star-menu" "${2:-}" "$client" ;;
+  fullauto)
+    # the ⚡/✋ pill (or C-a a / M-a) flips this pod's FULL AUTO switch. Suppress all
+    # output: pod-auto echoes for CLI callers, and ANY stdout from a backgrounded
+    # run-shell pops a copy-mode overlay (even with -b). The flash + strip redraw are
+    # the user-visible feedback, not stdout.
+    sess="${2:-}"
+    exec "$POD_BIN/pod-auto" toggle --pod "$sess" --client "$client" >/dev/null 2>&1 ;;
+  kill_*)
+    # terminate is destructive -> confirm in the client first (misclick guard).
+    # The window id is baked into the command literally here (captured from argv),
+    # so the deferred y/n branch needs no mouse context.
+    win="${range#kill_}"
+    name="$("$T" display-message -p -t "$win" '#{window_name}' 2>/dev/null || echo "$win")"
+    exec "$T" confirm-before -p "terminate agent $name ($win)? (y/n) " \
+         "run-shell -b '$POD_BIN/pod-kill-worker $range'" ;;
+  *)
+    : ;;   # no-op; normal tab-select is handled in the binding
+esac

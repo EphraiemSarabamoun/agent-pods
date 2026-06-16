@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# pod-star-menu [session] [client] — the gold ⭐ button / C-a * one-click star picker.
+#
+# Pops a single FLAT display-menu of this pod's agents (the proven "+" pattern: one
+# level, NO -c — tmux resolves the clicking client itself from the
+# MouseDown1Status-routed run-shell; an explicit -c tty made display-menu return 1,
+# see pod-spawn-menu-build). Picking an agent awards ONE star instantly via pod-star —
+# no note prompt. The trailing "standings" item pops the board in a display-popup;
+# THAT one threads -c because it fires from a MENU ITEM's backgrounded run-shell
+# (chained UI loses the client context).
+#
+# Human-only enforcement lives in pod-star (the caller guard), not here — the menu is
+# just chrome around it. POD_MENU_PRINT=1 prints the tmux argv instead of popping.
+# bash 3.2 safe.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+T="$POD_TMUX"
+
+# --- standings popup (reached from the menu's trailing item) ------------------
+if [ "${1:-}" = "--board-popup" ]; then
+  sess="${2:-}"; client="${3:-}"
+  pcmd="bash -c \"POD_SESSION='$sess' '$POD_BIN/pod-star' --board; printf '\\n(press any key)'; read -rsn1\""
+  if [ -n "$client" ]; then
+    exec "$T" display-popup -c "$client" -w 64 -h 16 -E "$pcmd"
+  fi
+  exec "$T" display-popup -w 64 -h 16 -E "$pcmd"
+fi
+
+S="${1:-}"; CLIENT="${2:-}"
+[ -n "$S" ] || S="$("$T" display-message -p '#{session_name}' 2>/dev/null)"
+[ -n "$S" ] || exit 0
+
+args=("$T" display-menu -T "⭐ Gold star — who earned it?")
+found=0
+while IFS='|' read -r wid widx wname stars; do
+  [ -n "$wid" ] || continue
+  label="${widx}: ${wname}"
+  [ "$widx" = "0" ] && label="${label} (manager)"
+  case "$stars" in (''|*[!0-9]*) : ;; (*) label="${label}  ⭐${stars}" ;; esac
+  key=""; case "$widx" in [0-9]) key="$widx" ;; esac   # key = tab index -> C-a * <digit>
+  # env -u TMUX_PANE: pin pod-star's session to THIS pod (multi-pod safe) and keep
+  # the FOCUSED window from leaking into session resolution; the awarder is config
+  # inside pod-star anyway. stdout to /dev/null (the copy-mode-overlay gotcha) —
+  # feedback is the display-message flash + badge.
+  args+=("$label" "$key" "run-shell -b \"env -u TMUX_PANE POD_SESSION='$S' '$POD_BIN/pod-star' '$wid' >/dev/null 2>&1\"")
+  found=1
+done < <("$T" list-windows -t "=$S" -F '#{window_id}|#{window_index}|#{window_name}|#{@stars}' 2>/dev/null)
+[ "$found" = 1 ] || exit 0
+args+=("")                                       # separator line
+args+=("standings" s "run-shell -b \"'$POD_BIN/pod-star-menu' --board-popup '$S' '$CLIENT'\"")
+if [ -n "${POD_MENU_PRINT:-}" ]; then printf '%s\n' "${args[@]}"; exit 0; fi
+exec "${args[@]}"

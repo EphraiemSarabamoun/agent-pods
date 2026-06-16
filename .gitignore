@@ -1,0 +1,11 @@
+# agent-pods — ignore runtime + local artifacts (state lives under /tmp/pod, not here).
+*.pyc
+__pycache__/
+.DS_Store
+*.swp
+*.bak
+*.tmp
+# local user config never belongs in the repo (it lives in ~/.config/pod/)
+config.sh
+slots.json
+catalog.toml
