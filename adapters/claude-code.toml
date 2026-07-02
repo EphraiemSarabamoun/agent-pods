@@ -62,8 +62,8 @@ efforts = [
 ]
 [[models]]
 slug  = "sonnet"
-label = "Sonnet 4.6"
-model = "claude-sonnet-4-6"
+label = "Sonnet 5"
+model = "claude-sonnet-5"
 efforts = [
   { slug = "high",   label = "high",   value = "high" },
   { slug = "medium", label = "medium", value = "medium" },
