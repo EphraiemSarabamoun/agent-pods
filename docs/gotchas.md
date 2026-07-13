@@ -257,3 +257,18 @@ never reaches the server, so the hook falls back to the defaults.
 `set-environment -g POD_TMP ...` / `set-environment -g POD_CONFIG_DIR ...` at launch, so
 every server-side hook resolves the same roots the launcher did. (Harmless when they're the
 defaults; these are host-wide, not per-pod.)
+
+## `display-message -t <dead-window-id>` exits 0
+
+**Symptom.** A "window still alive?" probe like
+`tmux display-message -p -t "$wid" '#{window_id}' && echo alive` sees every corpse as
+alive: dead-worker reclaim never fires, reap guards pass on dead windows.
+
+**Cause.** tmux resolves a bad `-t` target leniently for `display-message`: on a dead
+window id it exits **0** and prints an **empty** line instead of erroring (verified on
+tmux 3.6b).
+
+**Fix.** Judge liveness by the probe's **output**, never its exit code:
+`[ "$(tmux display-message -p -t "$wid" '#{window_id}' 2>/dev/null)" = "$wid" ]`.
+Same rule for any `#{session_name}` / `#{window_index}` probe — compare the value,
+don't trust the return.
