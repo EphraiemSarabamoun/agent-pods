@@ -26,7 +26,9 @@ LIVE="$("$T" list-sessions -F '#{session_name}' 2>/dev/null | while IFS= read -r
 
 remove_pod() {
   name="$(pod_sanitize "${1:-}")"
-  case "$name" in ""|.|..) return 0 ;; esac
+  # "_"-prefixed dirs are shared infrastructure (locks, scratch), not pod state —
+  # never a session name, never swept.
+  case "$name" in ""|.|..|_*) return 0 ;; esac
   printf '%s\n' "$LIVE" | grep -Fxq -- "$name" && return 0   # never wipe a live pod
   dir="$(pod_dir_for "$name")"
   case "$dir" in "$POD_COMMS"|"$POD_COMMS/"|/|"") return 0 ;; esac   # paranoia

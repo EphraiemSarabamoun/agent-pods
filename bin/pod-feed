@@ -77,6 +77,7 @@ def rainbow(word="@everyone"):
 # "Claude Code" match whole — a bare \w+ split "@Claude Code" at the space and
 # mis-colored it), then a generic word as the fallback.
 _known = sorted(set(list(TABCOLS) + ([MGR] if MGR else []) + list(MGR_ALIASES)), key=len, reverse=True)
+_known_lc = {n.lower() for n in _known}   # for recipient-prefix detection on relays
 _alt   = "".join(re.escape(n) + "|" for n in _known if n)
 MENT = re.compile(r'@(' + _alt + r'[A-Za-z0-9_\-]+)', re.IGNORECASE)
 ment = lambda t: MENT.sub(lambda m: rainbow() if m.group(1).lower() in ("all", "everyone")
@@ -144,6 +145,7 @@ def notification(ts, text):
     elif text.startswith("pod renamed"): acc = 39    # azure
     elif text.startswith("⊕"):           acc = 84    # task assignment (mgr-dispatch)
     elif text.startswith("»"):           acc = 45    # manager typed input (pod_send_input)
+    elif text.startswith("✉"):           acc = 75    # relay / ping from an unattributed sender
     A = f"\033[38;5;{acc}m"
     body = MENT.sub(lambda m: (rainbow() if m.group(1).lower() in ("all", "everyone")
                                else tag(canon(m.group(1)))) + A, text)
@@ -159,6 +161,18 @@ def render_one(raw):
         return notification(ts, f"{glyph} {body} · cc @{canon(disp)}")  # notification() trims the clause
     if m:
         ts, who, disp, body = m.groups()
+        # Unattributed sender (?/empty): the line was NOT authored through a
+        # resolvable pod-tell — it's a relay/ping injected by an integration that
+        # couldn't name its pane (a foreign agent's pod-tell, or a scripted
+        # relay), not peer chat. Render it as a notification so it sits with the
+        # other system lines instead of masquerading as a chat bubble from "?".
+        # A baked-in "Recipient:" body prefix becomes a → @Recipient mention.
+        if (who or "").strip() in ("", "?"):
+            relay = body
+            mr = re.match(r'^\s*([A-Za-z][\w .\-]*?):\s+(.*)$', body)
+            if mr and mr.group(1).strip().lower() in _known_lc:
+                relay = f"→ @{mr.group(1).strip()} {mr.group(2)}"
+            return notification(ts, "✉ " + relay)
         if disp == "chat":      # quiet tier (pod-tell chat): no arrow, no @tag, no badge
             return f" {DIM}{ts}{R} {sender(canon(who))}{DIM}:{R} {ment(body)}"
         to = rainbow() if disp.lower() in ("all", "everyone", "") else tag(canon(disp))

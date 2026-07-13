@@ -13,7 +13,7 @@ PAT='claudius|claude-fleet|claude-configs|/Users/fatherdomadious|manager-inbox|C
 # Scan the shipped sources; skip .git and THIS file (it necessarily contains the words).
 # The LICENSE copyright line carries the author's real name BY DESIGN (standard MIT
 # attribution) — that one line is allowed; any other Ephraiem/path/host hit still fails.
-hits="$(grep -rInE "$PAT" \
+hits="$(grep -rIinE "$PAT" \
   bin modules adapters hooks docs config test \
   install.sh uninstall.sh README.md LICENSE CHANGELOG.md .gitignore 2>/dev/null \
   | grep -v '^test/no-private-leaks.sh:' \

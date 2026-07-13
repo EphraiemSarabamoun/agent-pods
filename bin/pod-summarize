@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# pod-summarize self | win <window_id> — write a ONE-LINE summary of what an agent is
+# working on to @summary on its tmux window, so podmates get real cross-agent
+# awareness (read by pod-brief / pod / pod-summary) instead of a truncated prompt.
+#
+# Modes:
+#   self            the window THIS process runs in (the Claude Code Stop hook fires
+#                   it via pod-last). Requires TMUX env.
+#   win <window_id> an explicit target (e.g. a poller settle trigger for an agent
+#                   without lifecycle hooks). No TMUX env needed — the default server
+#                   socket resolves, same as the poller's tmux calls.
+#
+# Context source: a window with @transcript (stamped by pod-last) -> the last few
+# JSONL turns. A window without one -> capture the visible pane (chrome-trimmed),
+# which is agent-agnostic across all TUIs.
+#
+# Runs DETACHED from its trigger so it adds ZERO latency to a turn.
+#
+# Tiers, cheapest first:
+#   1. if the agent emitted a <!-- STATUS: "..." --> tag in its recent output, use it
+#      verbatim (zero cost — teach your agents the tag and no summarizer is needed)
+#   2. else run $POD_SUMMARIZE_CMD, a user-configured shell command (e.g. a small
+#      local model, or an agent CLI in print mode): recent output on stdin, ONE short
+#      line expected on stdout, killed after $POD_SUMMARIZE_TIMEOUT seconds. EMPTY BY
+#      DEFAULT -> the tier is skipped entirely and only the free STATUS tag applies.
+#   3. on any failure, leave @summary untouched -> the boards fall back to @work/@last.
+#
+# MUST stay quiet and never wedge: it's detached, so failures are invisible -> logged
+# to $POD_STATE/summarize/<win>.log for debugging. Every path exits 0-ish.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || exit 0
+T="$POD_TMUX"
+mode="${1:-}"
+case "$mode" in
+  self)
+    [ -n "${TMUX:-}" ] || exit 0
+    pane="${TMUX_PANE:-}"; [ -n "$pane" ] || exit 0
+    win="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"; [ -n "$win" ] || exit 0
+    ;;
+  win)
+    [ -n "${2:-}" ] || exit 0
+    win="$("$T" display-message -p -t "$2" '#{window_id}' 2>/dev/null)"; [ -n "$win" ] || exit 0
+    ;;
+  *) echo "usage: pod-summarize self | win <window_id>" >&2; exit 1 ;;
+esac
+safe="$(printf '%s' "$win" | tr -c 'A-Za-z0-9' '_')"
+
+D="$POD_STATE/summarize"; mkdir -p "$D" 2>/dev/null
+LOG="$D/$safe.log"
+lock="$D/$safe.lock"
+# One summarizer per window at a time (don't stack on rapid turns). STALE-LOCK
+# RECOVERY: the trap below can't fire on SIGKILL / a hard terminal crash, and a
+# leftover lock dir would otherwise starve this window's @summary forever (every
+# later run bows out instantly, silently). A healthy summarize is seconds; anything
+# older than 10 minutes is a corpse — steal it.
+if ! mkdir "$lock" 2>/dev/null; then
+  lock_mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
+  age=$(( $(date +%s) - lock_mtime ))
+  [ "$age" -gt 600 ] 2>/dev/null || exit 0
+  rmdir "$lock" 2>/dev/null || rm -rf "$lock" 2>/dev/null
+  mkdir "$lock" 2>/dev/null || exit 0
+fi
+trap 'rmdir "$lock" 2>/dev/null' EXIT INT TERM
+
+get_opt() { "$T" show-options -wqv -t "$win" "$1" 2>/dev/null; }
+tpath="$(get_opt @transcript)"
+
+# debounce: already summarized at/after the last turn end -> nothing new to say
+last_at="$(get_opt @last_at)"; sum_at="$(get_opt @summary_at)"
+if [ -n "$sum_at" ] && [ -n "$last_at" ] && [ "$sum_at" -ge "$last_at" ] 2>/dev/null; then
+  exit 0
+fi
+# win mode only (poller-triggered agents): rate-limit on top of the debounce.
+# Hash-flappy TUIs re-stamp @last_at on every settle, so the debounce alone never
+# holds there. self mode (a real turn boundary, a Stop hook) is untouched.
+if [ "$mode" = "win" ] && [ -n "$sum_at" ]; then
+  now="$(date +%s)"
+  if [ $(( now - sum_at )) -lt "${POD_SUMMARIZE_MIN_INTERVAL:-120}" ] 2>/dev/null; then
+    exit 0
+  fi
+fi
+
+if [ -n "$tpath" ] && [ -f "$tpath" ]; then
+# recent transcript tail -> last ~6 user/agent text turns, capped ~3.5k chars
+ctx="$(tail -n 400 "$tpath" 2>/dev/null | python3 -c '
+import sys, json
+msgs = []
+for ln in sys.stdin:
+    ln = ln.strip()
+    if not ln: continue
+    try: ev = json.loads(ln)
+    except Exception: continue
+    if ev.get("type") not in ("user","assistant"): continue
+    content = (ev.get("message") or {}).get("content")
+    txt = ""
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                txt += b.get("text") or ""
+    elif isinstance(content, str):
+        txt = content
+    txt = txt.strip()
+    if txt:
+        msgs.append(("USER: " if ev.get("type")=="user" else "AGENT: ") + txt)
+print(("\n\n".join(msgs[-6:]))[-3500:])
+' 2>/dev/null)"
+else
+  # No transcript: an agent without a Stop hook, read from its pane. A hook-capable
+  # window pre-first-Stop also lands here — keep its wait-for-the-transcript behavior
+  # rather than summarizing TUI chrome (@agent_id is the durable agent key).
+  [ "$(get_opt @agent_id)" = "claude-code" ] && exit 0
+  # Visible pane text (plain -p = escape-free; alt-screen TUIs give the current
+  # screen, which IS the live task). Trim the bottom input-box/footer lines with
+  # the same line count pod-foreign-state hashes with, squeeze blank runs, cap.
+  cap="$("$T" capture-pane -p -t "$win" -S -250 2>/dev/null)"
+  ctx="$(printf '%s\n' "$cap" \
+    | awk -v n="${POD_FOREIGN_TRIM:-8}" '{a[NR]=$0} END{for(i=1;i<=NR-n;i++) print a[i]}' \
+    | cat -s | tail -c 3500)"
+  # A near-blank screen (fresh boot, cleared TUI) would make a summarizer hallucinate
+  # a summary out of chrome — require some real content before spending a call.
+  [ "$(printf '%s' "$ctx" | tr -d '[:space:]' | wc -c | tr -d ' ')" -ge 40 ] || exit 0
+fi
+[ -n "$ctx" ] || exit 0
+
+# tier 1 — explicit STATUS tag in the agent's own output (zero inference)
+summary="$(printf '%s' "$ctx" | sed -n 's/.*<!-- *STATUS: *"\(.*\)" *-->.*/\1/p' | tail -1)"
+
+# tier 2 — the user-configured summarizer command, recent output on stdin. Runs with
+# TMUX/TMUX_PANE dropped: the command may itself be an agent CLI whose own pod hooks
+# would otherwise fire against OUR window (clobbering @work, even recursing back here
+# via a Stop hook) — the hooks are all tmux-gated, so dropping TMUX makes them no-op.
+# Watchdog-killed after $POD_SUMMARIZE_TIMEOUT so a wedged command can't hold the lock.
+if [ -z "$summary" ] && [ -n "${POD_SUMMARIZE_CMD:-}" ]; then
+  outf="$D/$safe.out.$$"
+  ( printf '%s' "$ctx" | env -u TMUX -u TMUX_PANE sh -c "$POD_SUMMARIZE_CMD" > "$outf" 2>>"$LOG" ) &
+  cpid=$!
+  ( sleep "${POD_SUMMARIZE_TIMEOUT:-45}"; kill "$cpid" 2>/dev/null ) 2>/dev/null &
+  wpid=$!
+  wait "$cpid" 2>/dev/null
+  kill "$wpid" 2>/dev/null
+  summary="$(tr -d '\r' < "$outf" 2>/dev/null | grep -v '^[[:space:]]*$' | head -1)"
+  rm -f "$outf" 2>/dev/null
+fi
+
+# sanitize: single line, trim, hard-cap ~72 chars (one short sentence — a glanceable
+# label, not a status report; the cap backstops a rambling summarizer). Applies to
+# the STATUS-tag tier too.
+summary="$(printf '%s' "$summary" | tr '\t' ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+[ -n "$summary" ] || exit 0
+if [ "${#summary}" -gt 72 ]; then summary="$(printf '%s' "$summary" | cut -c1-71)…"; fi
+
+"$T" set-option -w -t "$win" @summary    "$summary"      2>/dev/null || true
+"$T" set-option -w -t "$win" @summary_at "$(date +%s)"   2>/dev/null || true
+printf '%s  %s\n' "$(date +%H:%M:%S)" "$summary" >> "$LOG" 2>/dev/null || true
+exit 0

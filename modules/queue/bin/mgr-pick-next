@@ -17,6 +17,7 @@ set -euo pipefail
 QBIN="$(cd "$(dirname "$0")" && pwd)"             # sibling mgr-* live here
 POD_BIN="$(cd "$QBIN/../../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
 . "$POD_BIN/_mgr-runtime.sh"                       # mgr_current_pod, mgr_full_auto
+T="$POD_TMUX"
 
 QUEUE_DIR="$POD_INBOX/_queue"
 WORKERS_PATH="$POD_STATE/workers.json"
@@ -46,13 +47,27 @@ if ! mgr_full_auto "$POD_SESS"; then
   exit 0
 fi
 
-# Step 2: count idle workers + queue depth.
-idle_count=$(jq '[.workers[] | select(.status=="idle")] | length' "$WORKERS_PATH")
+# Step 2: count LIVE idle workers + queue depth. The registry's idle claims can
+# go stale (a window killed out from under it, a state flip a sweep missed), so
+# a row only counts when its window is alive, in THIS pod, and the live
+# @cc_state agrees — the same filter mgr-dispatch applies when it picks, so the
+# count here never promises a worker that dispatch will then refuse.
+live_idle_count() {
+  n=0
+  for w in $(jq -r '.workers[] | select(.status=="idle") | .tmux_window // empty' "$WORKERS_PATH" 2>/dev/null); do
+    [ -n "$w" ] || continue
+    [ "$("$T" display-message -p -t "$w" '#{session_name}' 2>/dev/null || true)" = "$POD_SESS" ] || continue
+    [ "$("$T" show-options -w -t "$w" -qv @cc_state 2>/dev/null || true)" = "idle" ] || continue
+    n=$((n + 1))
+  done
+  echo "$n"
+}
+idle_count=$(live_idle_count)
 queue_count=$(ls "$QUEUE_DIR" 2>/dev/null | wc -l | tr -d ' ')
-echo "==> idle workers: ${idle_count}, queue depth: ${queue_count}"
+echo "==> pod: ${POD_SESS}, live idle workers: ${idle_count}, queue depth: ${queue_count}"
 
 if [ "$idle_count" -eq 0 ]; then
-  echo "    no idle workers — nothing to dispatch"
+  echo "    no live idle workers — nothing to dispatch"
   exit 0
 fi
 if [ "$queue_count" -eq 0 ]; then
@@ -71,6 +86,10 @@ dispatch_args=()
 i=0
 while [ "$i" -lt "$n" ]; do
   echo ""
-  "$QBIN/mgr-dispatch" ${dispatch_args[@]+"${dispatch_args[@]}"}
+  # Tolerate a single dispatch failure (a ghost-quarantine exit, a worker whose
+  # state flipped mid-sweep) so the remaining idle workers still get tasks
+  # instead of the whole --all-idle batch aborting under set -e.
+  "$QBIN/mgr-dispatch" ${dispatch_args[@]+"${dispatch_args[@]}"} \
+    || echo "    (dispatch attempt $((i + 1)) of ${n} returned $? — continuing)" >&2
   i=$((i + 1))
 done

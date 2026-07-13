@@ -2,8 +2,9 @@
 # pod-summary [--pane] [session] — "who worked on what" panel for the pod.
 #
 # Lists every agent in the pod (manager + workers) with its identity + live state +
-# a brief headline of what it's working on (the @work stamp from pod-work), then the
-# pod chat feed (newest first, rendered by pod-feed) in the rows left below.
+# a brief summary of what it worked on (the @summary stamped by pod-summarize, falling
+# back to in-flight placeholders / the @last digest — never the raw @work prompt), then
+# the pod chat feed (newest first, rendered by pod-feed) in the rows left below.
 #
 # TWO MODES:
 #
@@ -71,14 +72,16 @@ EOF
   # lighting the crown. Empty/unset reads as not-auto -> no crown.
   FULLAUTO="$("$T" display-message -p -t "=$sess:0" '#{@full_auto}' 2>/dev/null)"
   # EVERYTHING rides ONE list-windows call. \x1f (US, the unit separator) because
-  # @work is FREE TEXT and can contain '|' (the old @card pipe caveat, generalized).
-  # MUST be \x1f, NOT tab: tab is IFS-WHITESPACE, so bash 3.2 collapses runs of it
-  # and DROPS empty fields — an empty field would shift the read and corrupt the
-  # card. \x1f is non-whitespace: it splits cleanly and PRESERVES empty fields.
-  # (\x01 was an earlier attempt — bash 3.2 ate it; \x1f survives the tmux→read
-  # pipeline.) The free-text @work field rides LAST; `work` takes the remainder.
+  # @summary/@work/@last are FREE TEXT and can contain '|' (the old @card pipe
+  # caveat, generalized). MUST be \x1f, NOT tab: tab is IFS-WHITESPACE, so bash 3.2
+  # collapses runs of it and DROPS empty fields — an empty @summary (first task,
+  # before pod-summarize stamps it) would shift @work's value into `summ`, so the
+  # card would print the verbatim prompt and the 🐣 first-task branch below would be
+  # unreachable. \x1f is non-whitespace: it splits cleanly and PRESERVES empty
+  # fields. (\x01 was an earlier attempt — bash 3.2 ate it; \x1f survives the
+  # tmux→read pipeline.) Free-text fields ride LAST; `last` takes the remainder.
   local SEP=$'\x1f'
-  while IFS="$SEP" read -r wid widx wname state since card style work; do
+  while IFS="$SEP" read -r wid widx wname state since card style summ work last; do
     [ -n "$wid" ] || continue
     # each agent's EXACT tab color (bg colour of its window-status-style) + the
     # manager's name — handed to pod-feed so feed names/@tags match the strip.
@@ -86,10 +89,17 @@ EOF
     [ -n "$c" ] && AGENT_COLORS="${AGENT_COLORS}${wname}=${c}
 "
     [ "$widx" = "0" ] && MGR_NAME="$wname"
-    # the headline: WHAT this agent is working on (the @work stamp). Until its first
-    # prompt @work is empty -> a calm placeholder.
+    # What it's working on: prefer the @summary stamped by pod-summarize; else, while
+    # the agent is actively working, an "in flight" placeholder — NEVER the verbatim
+    # @work prompt (the raw prompt must never surface as a summary; go from "in
+    # flight" straight to the real summary once pod-summarize stamps it). Once idle,
+    # fall back to @last (the last-reply digest). The genuine first task (no @last
+    # yet) keeps its own "first task in flight…" wording.
     local head
-    head="$work"
+    if [ -n "$summ" ]; then head="$summ"
+    elif [ -z "$last" ]; then head="${work:+🐣 first task in flight…}"
+    elif [ "$state" = busy ] || [ "$state" = wait ]; then head="🐣 task in flight…"
+    else head="$last"; fi
     [ -n "$head" ] || head="(nothing yet)"
     # Compact identity tag from @card ("Agent · Model · effort[ · suffix]"):
     # agent "logo" (closest single-width NON-EMOJI Unicode mark in the brand's
@@ -150,7 +160,7 @@ EOF
     sp=""; [ "$pad" -gt 0 ] && printf -v sp '%*s' "$pad" ''
     age_fmt "$since"
     WID+=("$wid"); WIDX+=("$widx"); WNAME+=("$wname"); STATE+=("$state"); HEAD+=("$head"); TAG+=("${tag}${sp}"); AGE+=("$AGE_OUT")
-  done < <("$T" list-windows -t "=$sess" -F "#{window_id}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{@cc_state}${SEP}#{@state_since}${SEP}#{@card}${SEP}#{window-status-style}${SEP}#{@work}" 2>/dev/null)
+  done < <("$T" list-windows -t "=$sess" -F "#{window_id}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{@cc_state}${SEP}#{@state_since}${SEP}#{@card}${SEP}#{window-status-style}${SEP}#{@summary}${SEP}#{@work}${SEP}#{@last}" 2>/dev/null)
   n=${#WID[@]}
   LIMIT=$((ROWS - n - 7))   # header + rule + cards + rule + hints(≤2) + spacer + spare
   load_feed

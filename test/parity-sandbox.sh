@@ -107,6 +107,19 @@ chk "channel.log records all three" '[ "$(grep -c . "$SBX/pod/comms/$POD/channel
 feedline="$(POD_COLS=60 POD_FEED_CACHE=1 "$CLONE/bin/pod-feed" "$SBX/pod/comms/$POD/channel.log" 2>/dev/null | head -1)"
 chk "pod-feed cache emits ord|more|plen|line" 'printf %s "$feedline" | grep -qE "^[0-9]+\|[01]\|[0-9]+\|"'
 chk "pod-mail-check clears the pill at next prompt" 'TMUX=1 TMUX_PANE="$(TM list-panes -t "$W1" -F "#{pane_id}"|head -1)" POD_SESSION="$POD" "$CLONE/bin/pod-mail-check" UserPromptSubmit >/dev/null 2>&1; [ -z "$(TM show-options -wqv -t "$W1" @unread)" ]'
+chk "pod-mail-check DELIVERS the messages (auto-delivery, not a nudge)" 'TMUX=1 TMUX_PANE="$(TM list-panes -t "$W2" -F "#{pane_id}"|head -1)" POD_SESSION="$POD" "$CLONE/bin/pod-mail-check" UserPromptSubmit 2>/dev/null | jq -e ".hookSpecificOutput.additionalContext | contains(\"deploy freeze\")" >/dev/null && [ ! -s "$SBX/pod/comms/$POD/${W2}.mbox" ] && grep -q "deploy freeze" "$SBX/pod/comms/$POD/${W2}.read"'
+
+# ── 4b. pod journal + per-turn delta brief ─────────────────────────────────────
+sec "pod journal (pod-brief)"
+POD_SESSION="$POD" POD_BRIEF_WHO=sbx "$CLONE/bin/pod-note" "sandbox says hi" >/dev/null 2>&1
+chk "pod-note lands in journal.md" 'grep -q "NOTE (sbx): sandbox says hi" "$SBX/pod/comms/$POD/journal.md"'
+bootj="$(TMUX=1 TMUX_PANE="$MPANE" POD_SESSION="$POD" "$CLONE/bin/pod-brief" boot 2>/dev/null)"
+chk "boot injects the journal tail as context" 'printf %s "$bootj" | jq -e ".hookSpecificOutput.additionalContext | contains(\"sandbox says hi\")"'
+r1="$(TMUX=1 TMUX_PANE="$MPANE" POD_SESSION="$POD" "$CLONE/bin/pod-brief" refresh UserPromptSubmit 2>/dev/null)"
+chk "first refresh reports podmates as spawned" 'printf %s "$r1" | jq -e ".hookSpecificOutput.additionalContext | contains(\"spawned\")"'
+r2="$(TMUX=1 TMUX_PANE="$MPANE" POD_SESSION="$POD" "$CLONE/bin/pod-brief" refresh UserPromptSubmit 2>/dev/null)"
+chk "quiet second refresh emits nothing" '[ -z "$r2" ]'
+chk "auto-journal recorded the joins" 'grep -q "joined" "$SBX/pod/comms/$POD/journal.md"'
 
 # ── 5. docked summary pane ────────────────────────────────────────────────────
 sec "docked summary pane"
@@ -197,12 +210,43 @@ TM set -w -t "$idlewin" @cc_state idle
 jq '(.workers[0].status)="idle"' "$SBX/pod/state/workers.json" > "$SBX/wj" && mv "$SBX/wj" "$SBX/pod/state/workers.json"
 disp="$(POD_SESSION="$POD" mgr-pick-next 2>&1)"
 chk "mgr-pick-next dispatches in full-auto" 'printf %s "$disp" | grep -qiE "dispatch|sent|sbx-task-1" || jq -e ".workers[]|select(.current_task_id==\"sbx-task-1\")" "$SBX/pod/state/workers.json"'
-# simulate the worker completing
+# simulate the worker completing (reap pinned OFF here; 9b tests it deliberately)
 printf '{"status":"done","answer":"ok"}' > "$SBX/pod/inbox/sbx-task-1/result.json"
 touch "$SBX/pod/inbox/sbx-task-1/DONE"
-freed="$(POD_SESSION="$POD" mgr-poll 2>&1)"
+freed="$(MGR_REAP_FINISHED_WORKERS=0 POD_SESSION="$POD" mgr-poll 2>&1)"
 chk "mgr-poll detects DONE + frees the worker" 'printf %s "$freed" | grep -q sbx-task-1'
 chk "mgr-status renders the board" 'POD_SESSION="$POD" mgr-status 2>/dev/null | grep -qi "queue\|worker\|complet"'
+
+# ── 9b. queue self-healing: reclaim, reap, ghost quarantine ────────────────────
+sec "queue self-healing"
+# dead-worker reclaim: dispatch to a disposable worker, kill its window, poll requeues
+POD_SESSION="$POD" "$CLONE/bin/pod-add-worker" >/dev/null 2>&1; sleep 0.4
+DW="$(jq -r '.workers[-1].tmux_window' "$SBX/pod/state/workers.json")"
+TM set -w -t "$DW" @cc_state idle
+POD_SESSION="$POD" mgr-stage execute --id sbx-task-2 context="sandbox" task_body="reclaim me" >/dev/null 2>&1
+POD_SESSION="$POD" mgr-queue sbx-task-2 --priority 60 >/dev/null 2>&1
+POD_SESSION="$POD" mgr-dispatch --task sbx-task-2 --tmux-window "$DW" >/dev/null 2>&1
+chk "dispatch stamps the live board busy" '[ "$(TM show-options -wqv -t "$DW" @cc_state)" = busy ]'
+chk "assignment logged to the feed (⊕)" 'grep -q "⊕" "$SBX/pod/comms/$POD/channel.log"'
+TM kill-window -t "$DW"; sleep 0.3
+rec="$(POD_SESSION="$POD" mgr-poll 2>&1)"
+chk "dead worker's task requeued" 'printf %s "$rec" | grep -q "requeued sbx-task-2"'
+chk "queue holds the entry again" 'ls "$SBX/pod/inbox/_queue"/*sbx-task-2* >/dev/null 2>&1'
+chk "dead registry row dropped" '! jq -e --arg w "$DW" ".workers[]|select(.tmux_window==\$w)" "$SBX/pod/state/workers.json" >/dev/null 2>&1'
+# finished-worker reap: a fresh worker completes it, the queue drains, window closes
+POD_SESSION="$POD" "$CLONE/bin/pod-add-worker" >/dev/null 2>&1; sleep 0.4
+RW="$(jq -r '.workers[-1].tmux_window' "$SBX/pod/state/workers.json")"
+TM set -w -t "$RW" @cc_state idle
+POD_SESSION="$POD" mgr-dispatch --task sbx-task-2 --tmux-window "$RW" >/dev/null 2>&1
+touch "$SBX/pod/inbox/sbx-task-2/DONE"
+TM set -w -t "$RW" @cc_state idle   # the worker's Stop hook fires as it finishes
+POD_SESSION="$POD" mgr-poll >/dev/null 2>&1; sleep 0.3
+chk "finished worker reaped once the queue drained" '[ "$(TM display-message -p -t "$RW" "#{window_id}" 2>/dev/null)" != "$RW" ]'
+chk "reap logged" 'grep -q worker_reaped_on_completion "$SBX/pod/state/log.jsonl"'
+# ghost quarantine: a queue entry whose prompt vanished must not block the head
+printf '{"task_id":"sbx-ghost","priority":40,"queued_at":"2020-01-01T00-00-00Z"}\n' > "$SBX/pod/inbox/_queue/040-x-sbx-ghost.json"
+POD_SESSION="$POD" mgr-dispatch >/dev/null 2>&1; grc=$?
+chk "ghost auto-pick exits 3 + quarantined to _state/dead" '[ "$grc" -eq 3 ] && ls "$SBX/pod/inbox/_state/dead/" | grep -q sbx-ghost'
 
 # ── 10. stars ─────────────────────────────────────────────────────────────────
 sec "human-only stars"

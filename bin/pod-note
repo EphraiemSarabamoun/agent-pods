@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# pod-note <text...> — append a curated note to THIS pod's journal (the running
+# cross-agent memory that pod-brief injects at SessionStart and on each turn).
+#
+# Thin alias for `pod-brief note`, matching the verb ergonomics of pod-tell /
+# pod-mail / pod-star — and matching the journal's own boot hint, which tells
+# agents to append with `pod-note "..."`.
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+exec "$POD_BIN/pod-brief" note "$@"

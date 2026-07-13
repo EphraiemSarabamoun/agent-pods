@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# pod-last — on Stop, stamp THIS pane's "last action" digest onto its tmux window so
+# the pod boards (pod / pod-summary / pod-brief) show what each agent JUST DID, not
+# only what it was asked (@work). Reads the Claude Code Stop-hook JSON on stdin, pulls
+# the first line of the LAST assistant text message from the transcript, and stamps:
+#   @last        one-line digest (<= 80 chars)
+#   @last_at     epoch
+#   @transcript  the transcript path (so pod-summarize can find it on demand)
+#
+# Wired into the Stop hook alongside `pod-state idle`. No-op outside tmux (a lone
+# agent window, ssh, cron). MUST never fail a hook -> every path exits 0.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || exit 0
+[ -n "${TMUX:-}" ] || exit 0
+T="$POD_TMUX"
+pane="${TMUX_PANE:-}"; [ -n "$pane" ] || exit 0
+command -v python3 >/dev/null 2>&1 || exit 0
+win="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
+[ -n "$win" ] || exit 0
+
+payload="$(cat 2>/dev/null)"
+# python emits "<transcript_path>\t<digest>" (digest may be empty). One pass: parse
+# the hook JSON for transcript_path, tail the last ~400 transcript lines, find the
+# last assistant message carrying text, take its first non-empty line capped to 80
+# codepoints. Reading only the tail bounds cost; the Stop event's final assistant
+# message is at the very end of the file, so the tail always contains it.
+out="$(printf '%s' "$payload" | python3 -c '
+import sys, json, os, re
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+tp = d.get("transcript_path") or ""
+digest = ""
+if tp and os.path.exists(tp):
+    try:
+        with open(tp, "r", errors="replace") as f:
+            lines = f.readlines()[-400:]
+    except Exception:
+        lines = []
+    last_text = ""
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            ev = json.loads(ln)
+        except Exception:
+            continue
+        if ev.get("type") != "assistant":
+            continue
+        content = (ev.get("message") or {}).get("content")
+        txt = ""
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    txt += b.get("text") or ""
+        elif isinstance(content, str):
+            txt = content
+        if txt.strip():
+            last_text = txt.strip()
+    for line in last_text.splitlines():
+        line = line.strip()
+        if line:
+            digest = re.sub(r"\s+", " ", line)
+            break
+    if len(digest) > 80:
+        digest = digest[:79] + "…"
+    digest = digest.replace("\t", " ")
+sys.stdout.write(tp + "\t" + digest)
+' 2>/dev/null)"
+
+# split on the tab; no tab => no digest (and treat whole thing as path)
+tpath="${out%%$'\t'*}"
+digest="${out#*$'\t'}"
+[ "$digest" = "$out" ] && digest=""
+
+[ -n "$tpath" ] && "$T" set-option -w -t "$win" @transcript "$tpath" 2>/dev/null || true
+if [ -n "$digest" ]; then
+  "$T" set-option -w -t "$win" @last    "$digest"      2>/dev/null || true
+  "$T" set-option -w -t "$win" @last_at "$(date +%s)"  2>/dev/null || true
+fi
+
+# Fire-and-forget self-summary so podmates see what this agent is actually working on,
+# not just a truncated prompt. Detached so it never delays Stop; macOS has no setsid,
+# so a subshell-orphaned nohup is the keep-alive.
+SUMM="$POD_BIN/pod-summarize"
+[ -x "$SUMM" ] && ( nohup "$SUMM" self >/dev/null 2>&1 </dev/null & ) 2>/dev/null
+
+exit 0

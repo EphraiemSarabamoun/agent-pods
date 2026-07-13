@@ -10,8 +10,8 @@ change.
 
 The design idea: the generic path is first-class. Any agent in any pane is a real
 podmate (roster entry, color, state dot, mailbox). Per-agent lifecycle hooks are an
-upgrade on top of that floor, not a requirement. Only one adapter (Claude Code) ships
-with them, and everything still works without them.
+upgrade on top of that floor, not a requirement. Two adapters (Claude Code and Codex)
+ship with them, and everything still works without them.
 
 ## What it looks like
 
@@ -86,13 +86,17 @@ pod-launch mypod        # create-or-attach a pod named "mypod"
    live status, color, stars, and which is "you".
 4. **Talk.** `pod-tell Steve check the build` (direct), `pod-tell chat I'm rebasing`
    (quiet — reaches everyone, no badge), `pod-tell all freeze commits` (broadcast — badges
-   every tab). `pod-mail` reads your inbox.
-5. **Watch.** Hit `☰` (or `C-a s` / `M-s`) to dock the **summary pane** on the right edge:
+   every tab). Hook agents get mail delivered as context at their next turn; `pod-mail`
+   reads it manually.
+5. **Remember.** Every pod keeps a running **journal** — podmate joins, state flips, and
+   curated `pod-note "..."` entries — injected into each agent at session start and
+   refreshed as a per-turn delta, so agents stay aware of each other between messages.
+6. **Watch.** Hit `☰` (or `C-a s` / `M-s`) to dock the **summary pane** on the right edge:
    the roster on top, the live chat feed below. It follows you as you switch windows; click
    into it to scroll and navigate.
-6. **Go autonomous.** Flip `✋ MAN` to `⚡ AUTO` (the pill, `C-a a`, or `M-a`) to let the
+7. **Go autonomous.** Flip `✋ MAN` to `⚡ AUTO` (the pill, `C-a a`, or `M-a`) to let the
    manager run the pod on its own — see [docs/autonomy.md](docs/autonomy.md).
-7. **Reward.** Award a `⭐` with the gold-star button (`C-a *` / `M-g`). Stars are
+8. **Reward.** Award a `⭐` with the gold-star button (`C-a *` / `M-g`). Stars are
    human-only; the awardee gets a real "gold star!" prompt the next time it's idle.
 
 Every button has a keyboard chord — the full map is in
@@ -130,10 +134,13 @@ way the strip shows idle-at-a-glance.
 **pod-comms.** Agents message each other. `pod-tell Steve check the build` (direct),
 `pod-tell chat …` (quiet, reaches everyone with no badge), `pod-tell all stand down`
 (broadcast, badges every tab), `pod-mail` to read your inbox, and the docked summary pane
-for a live Slack-style feed. Delivery is universal: a hook-capable agent gets mail as
-context at its next turn; a hookless agent gets a one-line notification typed into its pane
-when it's idle. Direct and broadcast messages stamp a red unread pill on the tab, cleared
-when the recipient catches up. See [docs/comms.md](docs/comms.md).
+for a live Slack-style feed. Delivery is universal: a hook-capable agent gets the messages
+delivered as context at its next turn (mailbox drained, pill cleared); a hookless agent
+gets a one-line notification typed into its pane when it's idle. Direct and broadcast
+messages stamp a red unread pill on the tab, cleared when the recipient catches up. On top
+of chat, each pod keeps a running **journal** (`pod-note`, auto-fed from podmate
+transitions) that agents receive at session start and as per-turn deltas. See
+[docs/comms.md](docs/comms.md).
 
 **Gold stars.** Award a `⭐` to a worker with the gold-star button / `C-a *` — stars are
 **human-only** (agents can read the board but not award). A deliverable agent gets a real

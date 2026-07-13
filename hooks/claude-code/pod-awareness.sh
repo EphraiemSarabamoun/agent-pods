@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
-# Claude Code SessionStart hook — POD AWARENESS.
+# SessionStart hook — POD AWARENESS.
 #
-# Tells a Claude Code instance which pod it is in and who its podmates are, so
-# every instance starts aware of the others in its tmux session. Silent if the
-# instance is not running inside a pod (no tmux). Never fails session start.
+# Tells an agent instance which pod it is in and who its podmates are, so every
+# instance starts aware of the others in its tmux session. Silent if the instance
+# is not running inside a pod (no tmux). Never fails session start.
 #
-# It ALSO stamps this window authoritatively as Claude Code: @agent_id=claude-code,
+# It ALSO stamps this window authoritatively as a hook-parity agent: @agent_id,
 # @pod_native_delivery=1, @state_source=hooks. That tells the foreign-state poller to
-# leave this window's state dot alone (Claude drives it via pod-state) and tells
+# leave this window's state dot alone (the agent drives it via pod-state) and tells
 # pod-deliver to surface pod-mail as additionalContext instead of typing into the pane.
+#
+# The stamped agent id comes from argv1 (or $POD_AWARENESS_AGENT_ID), defaulting to
+# claude-code — the codex hook wiring shares this script and passes "codex".
 #
 # Resolves the pod bin from $POD_BIN if exported, else from this hook's own location
 # (hooks/claude-code/ -> repo root -> bin/). bash 3.2 safe.
 set -u
+
+AGENT_ID="${1:-${POD_AWARENESS_AGENT_ID:-claude-code}}"
 
 command -v tmux >/dev/null 2>&1 || exit 0
 [ -n "${TMUX:-}" ] || exit 0
@@ -29,12 +34,12 @@ fi
 
 T="$(command -v tmux 2>/dev/null || echo tmux)"
 
-# --- stamp this window as Claude Code (authoritative) ----------------------------
-# The pane this hook runs in is the Claude window; @state_source=hooks keeps the
+# --- stamp this window as the hook-parity agent (authoritative) ------------------
+# The pane this hook runs in is the agent's window; @state_source=hooks keeps the
 # foreign poller off it, @pod_native_delivery=1 makes pod-deliver skip send-keys.
 WIN="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null)"
 if [ -n "$WIN" ]; then
-  "$T" set-option -w -t "$WIN" @agent_id           "claude-code" 2>/dev/null || true
+  "$T" set-option -w -t "$WIN" @agent_id           "$AGENT_ID"   2>/dev/null || true
   "$T" set-option -w -t "$WIN" @pod_native_delivery 1            2>/dev/null || true
   "$T" set-option -w -t "$WIN" @state_source        "hooks"      2>/dev/null || true
 fi

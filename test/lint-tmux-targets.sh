@@ -50,7 +50,8 @@ findings=0
 # (skip comments) and report file:line. bash 3.2 safe: no mapfile, no associative arrays.
 for d in $DIRS; do
   # plain find over regular files; portable, no -print0 needed since paths here are tame.
-  for file in $(find "$d" -type f 2>/dev/null); do
+  # skip compiled/binary artifacts (a local __pycache__ makes sed choke on byte soup).
+  for file in $(find "$d" -type f ! -name '*.pyc' ! -path '*/__pycache__/*' 2>/dev/null); do
     rel="${file#$REPO/}"
     lineno=0
     while IFS= read -r line || [ -n "$line" ]; do

@@ -10,13 +10,20 @@
 #
 # Defaults:
 #   --task   = highest-priority unblocked queued task (lex-first queue file)
-#   worker   = first idle worker in $POD_STATE/workers.json
+#   worker   = first idle worker in $POD_STATE/workers.json whose LIVE tmux
+#              state agrees (window alive, in the calling pod, @cc_state idle)
 #
-# Side effects on success: marks the worker busy, archives the queue file to
-# $POD_STATE/dispatched/, appends a dispatch event to $POD_STATE/log.jsonl.
+# Side effects on success: marks the worker busy, stamps the live board
+# (@work / @cc_state), archives the queue file to $POD_STATE/dispatched/,
+# appends a dispatch event to $POD_STATE/log.jsonl, and logs the assignment
+# to the pod's channel.log.
+#
+# Exit 3 = an auto-picked queue entry was a ghost (prompt vanished) and got
+# quarantined to $POD_INBOX/_state/dead/ — retry to reach the next entry.
 
 set -euo pipefail
 POD_BIN="$(cd "$(dirname "$0")/../../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+. "$POD_BIN/_mgr-runtime.sh"    # mgr_current_pod, mgr_manager_window (+ _pod-common.sh)
 T="$POD_TMUX"
 
 INBOX_ROOT="$POD_INBOX"
@@ -24,13 +31,18 @@ QUEUE_DIR="$POD_INBOX/_queue"
 WORKERS_PATH="$POD_STATE/workers.json"
 LOG_PATH="$POD_STATE/log.jsonl"
 DISPATCHED="$POD_STATE/dispatched"
-GROUP_PATH="$POD_STATE/tmux_group.json"
 
 # The trigger message a worker reads after dispatch (points it at its staged prompt).
 TRIGGER_TPL="Read $POD_INBOX/{{task_id}}/prompt.txt and execute the task it describes end-to-end. Write result.json, touch DONE as your last action."
 
-# manager window (so we never dispatch into the manager seat) — from group state.
-MGR_WIN="$(jq -r '.manager_window // empty' "$GROUP_PATH" 2>/dev/null || true)"
+# Scheduling scope is the CALLING pod. Window ids are server-global, so every
+# target below is re-anchored to this session before anything is fired at it.
+CURRENT_POD="$(mgr_current_pod)"
+MGR_WIN="$(mgr_manager_window "$CURRENT_POD")"
+
+# live window probes (empty when the window is gone)
+win_session() { "$T" display-message -p -t "$1" '#{session_name}' 2>/dev/null || true; }
+win_state()   { "$T" show-options -w -t "$1" -qv @cc_state 2>/dev/null || true; }
 
 TASK_ID=""; TMUX_WINDOW=""; PRINT_ONLY=0
 while [ $# -gt 0 ]; do
@@ -44,10 +56,20 @@ done
 
 # Resolve task: explicit --task wins; otherwise pop the lex-first queue entry.
 QUEUE_FILE=""
+AUTO_TASK=0
 if [ -n "$TASK_ID" ]; then
-  QUEUE_FILE=$(find "$QUEUE_DIR" -maxdepth 1 -name "*-${TASK_ID}.json" 2>/dev/null | head -1)
+  # Exact task-id match. The filename suffix is lossy: a front-unanchored glob
+  # "*-<id>.json" also matches "*-<prefix>-<id>.json", so confirm each
+  # candidate's authoritative .task_id field. Without this an explicit dispatch
+  # can consume the WRONG queue file.
+  for f in "$QUEUE_DIR"/*-"${TASK_ID}".json; do
+    [ -e "$f" ] || continue
+    [ "$(jq -r '.task_id // empty' "$f" 2>/dev/null)" = "$TASK_ID" ] || continue
+    QUEUE_FILE="$f"; break
+  done
   [ -n "$QUEUE_FILE" ] || { echo "ERROR: ${TASK_ID} not in queue (looked in ${QUEUE_DIR})" >&2; exit 1; }
 else
+  AUTO_TASK=1
   QUEUE_FILE=$(ls "$QUEUE_DIR" 2>/dev/null | sort | head -1)
   [ -n "$QUEUE_FILE" ] || { echo "queue empty — nothing to dispatch" >&2; exit 0; }
   QUEUE_FILE="${QUEUE_DIR}/${QUEUE_FILE}"
@@ -55,19 +77,54 @@ else
 fi
 
 PROMPT_PATH="${INBOX_ROOT}/${TASK_ID}/prompt.txt"
-[ -f "$PROMPT_PATH" ] || { echo "ERROR: ${PROMPT_PATH} missing — task staged but prompt vanished" >&2; exit 1; }
-
-# Resolve worker record: explicit --tmux-window wins; else first idle.
-REC=""
-if [ -n "$TMUX_WINDOW" ]; then
-  REC=$(jq -c --arg tw "$TMUX_WINDOW" 'first(.workers[] | select(.tmux_window==$tw))' "$WORKERS_PATH")
-else
-  REC=$(jq -c '[.workers[] | select(.status=="idle")] | sort_by(.registered_at) | .[0] // empty' "$WORKERS_PATH")
+if [ ! -f "$PROMPT_PATH" ]; then
+  if [ "$AUTO_TASK" -eq 1 ]; then
+    # A ghost queue entry (prompt vanished) must not sit at the queue head and
+    # re-block every lower-priority task on each auto-pick. Quarantine it out of
+    # the queue and exit non-zero; mgr-pick-next tolerates the failure and moves
+    # on to the next entry.
+    DEAD="${INBOX_ROOT}/_state/dead"
+    mkdir -p "$DEAD" 2>/dev/null || true
+    mv "$QUEUE_FILE" "${DEAD}/$(basename "$QUEUE_FILE")" 2>/dev/null || true
+    jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg tid "$TASK_ID" --arg pod "$CURRENT_POD" \
+      '{ts: $ts, event: "quarantined", task_id: $tid, pod: $pod, reason: "prompt.txt missing"}' \
+      >> "$LOG_PATH" 2>/dev/null || true
+    echo "ERROR: ${PROMPT_PATH} missing — quarantined ${TASK_ID} to _state/dead/ (it was blocking the queue head)" >&2
+    exit 3
+  fi
+  echo "ERROR: ${PROMPT_PATH} missing — task staged but prompt vanished" >&2
+  exit 1
 fi
-[ -n "$REC" ] && [ "$REC" != "null" ] || { echo "no matching/idle worker — register one or pass --tmux-window" >&2; exit 1; }
 
-R_TMUX_WIN=$(echo "$REC" | jq -r '.tmux_window // empty')
-[ -n "$R_TMUX_WIN" ] || { echo "ERROR: worker record has no tmux_window" >&2; exit 1; }
+# The task headline for the live board (@work). Falls back to the task id when
+# no --description was queued, so the board always reflects the CURRENT dispatch
+# rather than the worker's previous headline. Captured before the queue file is
+# archived.
+DESC=$(jq -r '.description // ""' "$QUEUE_FILE" 2>/dev/null || echo "")
+[ -n "$DESC" ] || DESC="$TASK_ID"
+DESC="${DESC//$'\n'/ }"   # @work reads back as a single-line list-windows -F field
+
+# Resolve worker: explicit --tmux-window wins; else the first workers.json-idle
+# worker whose LIVE window agrees. The registry can go stale (a window killed
+# out from under it, a state flip a sweep missed), so the live tmux window —
+# not the registry row — is what earns an automatic dispatch.
+R_TMUX_WIN=""
+EXPLICIT=0
+if [ -n "$TMUX_WINDOW" ]; then
+  EXPLICIT=1
+  REC=$(jq -c --arg tw "$TMUX_WINDOW" 'first(.workers[] | select(.tmux_window==$tw))' "$WORKERS_PATH")
+  [ -n "$REC" ] && [ "$REC" != "null" ] || { echo "ERROR: ${TMUX_WINDOW} is not a registered worker (see ${WORKERS_PATH})" >&2; exit 1; }
+  R_TMUX_WIN="$TMUX_WINDOW"
+else
+  for cand in $(jq -r '[.workers[] | select(.status=="idle")] | sort_by(.registered_at) | .[].tmux_window // empty' "$WORKERS_PATH" 2>/dev/null); do
+    [ -n "$cand" ] || continue
+    [ "$cand" = "$MGR_WIN" ] && continue
+    [ "$(win_session "$cand")" = "$CURRENT_POD" ] || continue
+    [ "$(win_state "$cand")" = "idle" ] || continue
+    R_TMUX_WIN="$cand"; break
+  done
+  [ -n "$R_TMUX_WIN" ] || { echo "no live idle worker in pod '${CURRENT_POD}' — register one or pass --tmux-window" >&2; exit 1; }
+fi
 
 TRIGGER="${TRIGGER_TPL//\{\{task_id\}\}/$TASK_ID}"
 
@@ -78,6 +135,32 @@ echo "    prompt: ${PROMPT_PATH}"
 if [ -n "$MGR_WIN" ] && [ "$R_TMUX_WIN" = "$MGR_WIN" ]; then
   echo "ERROR: refusing to dispatch into the manager window (${MGR_WIN})" >&2; exit 1
 fi
+
+# Cross-pod refusal: the target must live in the calling pod. A window id from a
+# sibling pod would happily accept send-keys — never let one leak in.
+TARGET_POD="$(win_session "$R_TMUX_WIN")"
+[ -n "$TARGET_POD" ] || { echo "ERROR: tmux window ${R_TMUX_WIN} is not alive" >&2; exit 1; }
+if [ "$TARGET_POD" != "$CURRENT_POD" ]; then
+  echo "ERROR: refusing cross-pod dispatch: caller=${CURRENT_POD}, target=${TARGET_POD}/${R_TMUX_WIN}" >&2
+  exit 1
+fi
+
+# Live-state recheck at the last moment: workers.json said idle, but the window
+# option is the truth the strip renders. Never interrupt busy/wait; an unknown
+# state is accepted only for an explicit target (a deliberate act), never for
+# an auto-pick.
+LIVE_STATE="$(win_state "$R_TMUX_WIN")"
+case "$LIVE_STATE" in
+  idle) : ;;
+  ""|unknown)
+    if [ "$EXPLICIT" -eq 1 ]; then
+      echo "    warning: ${R_TMUX_WIN} live state is unknown; explicit target accepted"
+    else
+      echo "ERROR: ${R_TMUX_WIN} live state is unknown and cannot be auto-scheduled" >&2; exit 1
+    fi ;;
+  *) echo "ERROR: refusing to interrupt ${R_TMUX_WIN}; live state is '${LIVE_STATE}'" >&2; exit 1 ;;
+esac
+
 if [ "$PRINT_ONLY" -eq 1 ]; then
   echo "    [print-only] ${T} send-keys -t ${R_TMUX_WIN} -l \"${TRIGGER}\" ; send-keys -t ${R_TMUX_WIN} Enter"
   exit 0
@@ -103,11 +186,36 @@ jq --arg tw "$R_TMUX_WIN" --arg tid "$TASK_ID" --arg now "$NOW" '
     else . end)
 ' "$WORKERS_PATH" > "$TMP" && mv "$TMP" "$WORKERS_PATH"
 
+# Stamp the live board immediately: the REAL task headline (@work), plus an
+# instant busy dot so the strip and roster flip the moment the task is fired
+# instead of at the next hook/poller tick. A hook agent's own prompt hook
+# re-affirms busy shortly after; @state_since only moves on a real transition
+# there, so this stamp doesn't skew the activity timer.
+NOWS="$(date +%s)"
+"$T" set-option -w -t "$R_TMUX_WIN" @work        "$DESC" 2>/dev/null || true
+"$T" set-option -w -t "$R_TMUX_WIN" @work_at     "$NOWS" 2>/dev/null || true
+"$T" set-option -w -t "$R_TMUX_WIN" @cc_state    busy    2>/dev/null || true
+"$T" set-option -w -t "$R_TMUX_WIN" @state_since "$NOWS" 2>/dev/null || true
+"$T" refresh-client -S 2>/dev/null || true
+
 # Archive queue file + log the dispatch.
 mkdir -p "$DISPATCHED"
 mv "$QUEUE_FILE" "${DISPATCHED}/${TASK_ID}.json"
-jq -nc --arg ts "$NOW" --arg tid "$TASK_ID" --arg tgt "$R_TMUX_WIN" --arg mode "tmux" \
-  '{ts: $ts, event: "dispatched", task_id: $tid, target: $tgt, mode: $mode}' \
+jq -nc --arg ts "$NOW" --arg tid "$TASK_ID" --arg tgt "$R_TMUX_WIN" --arg pod "$CURRENT_POD" --arg mode "tmux" \
+  '{ts: $ts, event: "dispatched", task_id: $tid, target: $tgt, pod: $pod, mode: $mode}' \
   >> "$LOG_PATH"
+
+# Feed visibility: the assignment shows in the pod chat as a "⊕" notification
+# line (no sender→recipient arrow shape, so pod-feed renders it in the
+# notification register; the @name mention picks up the worker's tab color).
+# Best-effort throughout — feed logging may never fail a dispatch.
+WNAME="$("$T" display-message -p -t "$R_TMUX_WIN" '#{window_name}' 2>/dev/null || true)"
+if [ -n "$WNAME" ]; then
+  FDESC="$DESC"
+  [ "${#FDESC}" -gt 120 ] && FDESC="${FDESC:0:119}…"
+  mkdir -p "$(pod_dir_for "$CURRENT_POD")" 2>/dev/null || true
+  printf '[%s] ⊕ assigned @%s: %s\n' "$(date +%H:%M)" "$WNAME" "$FDESC" \
+    >> "$(pod_chan_for "$CURRENT_POD")" 2>/dev/null || true
+fi
 
 echo "==> Dispatched. Worker is now busy."

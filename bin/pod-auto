@@ -21,6 +21,10 @@
 #                                        # was launched before the pill existed
 #
 # Flip side effects (transitions only — repeat flips are idempotent no-ops):
+#   - ON only: a short celebration popup on the flipping client (pod-auto-anim).
+#     Non-blocking, skippable with any key, suppressed by POD_AUTO_ANIM=0, when no
+#     client is attached, or when the anim script isn't installed.
+#   - journal line in the pod's journal.md (pod-brief note)
 #   - status-strip redraw on every attached client (+ a flash on the clicking one)
 #   - manager window renamed to POD_MANAGER_NAME / POD_MANAGER_NAME_AUTO to signal mode
 #   - manager notification: OFF -> mbox note (an armed pod-task-wait exits "auto-off"
@@ -61,6 +65,26 @@ POD="${POD_ARG:-$(pod_name)}"
 flash() {  # best-effort one-liner in the clicking client's status line
   [ -n "$CLIENT" ] && "$T" display-message -c "$CLIENT" "$1" 2>/dev/null
   return 0
+}
+
+play_full_auto_animation() {  # the ⚡ celebration on the OFF->ON transition: a tmux
+  # popup on the flipping client. display-popup returns immediately (non-blocking)
+  # and -E auto-closes when the anim exits; any keypress skips it. Best-effort,
+  # never fatal. Disable with POD_AUTO_ANIM=0. Skipped when no client is attached
+  # (nobody to show it to) or when pod-auto-anim isn't installed alongside pod-auto.
+  [ "${POD_AUTO_ANIM:-1}" = "0" ] && return 0
+  local anim="$POD_BIN/pod-auto-anim" cl="$CLIENT"
+  [ -x "$anim" ] || return 0
+  [ -n "$cl" ] || cl="$("$T" list-clients -t "=$POD" -F '#{client_name}' 2>/dev/null | head -1)"
+  [ -n "$cl" ] || return 0
+  "$T" display-popup -c "$cl" -E -w 56 -h 13 "$anim" >/dev/null 2>&1 || true
+  return 0
+}
+
+journal() {  # the env override pins pod-brief's pod_name() to the TARGET pod, not the
+  # caller's pane (TMUX cleared -> pod_name falls through to POD_SESSION).
+  TMUX= TMUX_PANE= POD_SESSION="$POD" POD_BRIEF_WHO="full-auto switch" \
+    "$POD_BIN/pod-brief" note "$1" >/dev/null 2>&1 || true
 }
 
 refresh_pod_clients() {  # option changes don't reliably dirty the status line
@@ -171,8 +195,10 @@ fi
 
 if [ "$new" = "on" ]; then
   "$T" set -t "$POD" @full_auto 1
+  play_full_auto_animation
   rename_manager "$MGR_NAME_AUTO" "$MGR_NAME_MANUAL"
   refresh_pod_clients
+  journal "⚡ FULL AUTO ON"
   flash "${POD}: ⚡ FULL AUTO ON"
   if paused_task_for_pod; then
     send_resume_trigger
@@ -185,6 +211,7 @@ else
   "$T" set -t "$POD" @full_auto 0
   rename_manager "$MGR_NAME_MANUAL" "$MGR_NAME_AUTO"
   refresh_pod_clients
+  journal "✋ FULL AUTO OFF (manual)"
   flash "${POD}: ✋ MANUAL — you're the manager"
   notify_manager "FULL AUTO turned OFF — pause the loop on your next wake (in-flight workers finish; the queue holds; do not re-arm)."
   echo "pod '$POD': full-auto OFF ✋ (manual)"

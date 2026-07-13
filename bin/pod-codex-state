@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# pod-codex-state <state> [event] [--json] — Codex lifecycle-hook adapter. The Codex
+# CLI fires Claude-style hooks (wired into ~/.codex/hooks.json by hooks/codex/
+# install.sh); each event calls this with the pod state it implies, and two events
+# carry an extra duty:
+#
+#   user_prompt_submit -> also stamp @work from the payload's .prompt (pod-work)
+#   stop               -> Codex REQUIRES JSON on stdout from Stop hooks; --json emits {}
+#
+# It also stamps this window authoritatively as Codex the first time it fires
+# (@agent_id=codex, @pod_native_delivery=1, @state_source=hooks) — the same claim
+# pod-awareness.sh makes for a hook-parity agent at SessionStart: the foreign-state
+# poller backs off (hooks own the dot) and pod-deliver skips send-keys (pod-mail-check
+# injects mail as context at the next prompt instead).
+#
+# The hook payload arrives on stdin and is captured once, then RE-PIPED to pod-state —
+# its wait branch demuxes idle_prompt vs permission_prompt from the payload, and
+# consuming stdin here without forwarding would silently starve that path.
+#
+# No-op outside tmux. MUST never fail a hook, so every path exits 0 (and still emits
+# the JSON contract when --json was asked for).
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || true
+
+state="${1:-unknown}"
+[ $# -gt 0 ] && shift
+event=""; emit_json=0
+for a in "$@"; do
+  case "$a" in
+    --json) emit_json=1 ;;
+    *) [ -z "$event" ] && event="$a" ;;
+  esac
+done
+
+# Every exit goes through here so a Stop hook always gets its JSON, even on the
+# no-tmux / no-pane bail-outs.
+finish() { [ "$emit_json" -eq 1 ] && printf '{}\n'; exit 0; }
+
+# Capture the hook payload once (stdin is a pipe in hook context; never read a tty).
+payload=""
+[ ! -t 0 ] && payload="$(cat 2>/dev/null)"
+
+[ -n "${TMUX:-}" ] || finish
+T="${POD_TMUX:-$(command -v tmux 2>/dev/null || echo tmux)}"
+pane="${TMUX_PANE:-}"
+[ -n "$pane" ] || finish
+
+# --- stamp this window as Codex (authoritative; cheap guard keeps the hot path light)
+win="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
+if [ -n "$win" ] && [ "$("$T" show-options -w -t "$win" -qv @agent_id 2>/dev/null)" != "codex" ]; then
+  "$T" set-option -w -t "$win" @agent_id            "codex" 2>/dev/null || true
+  "$T" set-option -w -t "$win" @pod_native_delivery 1       2>/dev/null || true
+  "$T" set-option -w -t "$win" @state_source        "hooks" 2>/dev/null || true
+fi
+
+# --- state dot (forward the payload: pod-state's wait branch reads stdin) ----------
+printf '%s' "$payload" | "$POD_BIN/pod-state" "$state" 2>/dev/null || true
+
+case "$event" in
+  user_prompt_submit)
+    # @work headline, same as Claude Code's UserPromptSubmit wiring. pod-work parses
+    # .prompt from the payload and exits silently if the field is absent — safe either way.
+    printf '%s' "$payload" | "$POD_BIN/pod-work" 2>/dev/null || true
+    ;;
+esac
+
+finish

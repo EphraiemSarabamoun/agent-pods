@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# pod-auto-anim — the FULL AUTO celebration: clean "FULL-AUTO" text with a light
+# shimmer sweeping across it, ⚡ bolts blinking, and ENGAGED pulsing below. Plays
+# in a tmux popup when a pod's FULL AUTO switch flips ON. ~4s on screen, skippable.
+#
+# Deliberately restrained: no ASCII art, no sound effects — just the text, alive
+# (electric/⚡ theme to match the AUTO pill). Purely cosmetic; nothing reads its
+# exit code.
+#
+# Usage:
+#   pod-auto-anim            # play the ~4s animation, then exit (popup -E closes it)
+#   pod-auto-anim --still    # print a representative frame once
+#
+# Skips on ANY keypress. Disable with POD_AUTO_ANIM=0. Tune length with
+# POD_AUTO_HOLD=<seconds> (default ~4s).
+#
+# bash 3.2 safe, ANSI 256-color. Designed for a ~48x11 popup.
+set -uo pipefail
+
+ESC=$'\033'
+hide()  { printf '%s[?25l' "$ESC"; }
+show()  { printf '%s[?25h' "$ESC"; }
+home()  { printf '%s[H' "$ESC"; }
+clr()   { printf '%s[2J%s[H' "$ESC" "$ESC"; }
+el()    { printf '%s[K' "$ESC"; }
+reset() { printf '%s[0m' "$ESC"; }
+cb()    { printf '%s[1;38;5;%sm' "$ESC" "$1"; }  # bold fg
+c()     { printf '%s[38;5;%sm'   "$ESC" "$1"; }  # fg
+
+GRN=46
+DGR=28        # dim green (engaged pulse low)
+HIW=231       # shimmer highlight (bright white)
+BOLT=226      # ⚡ lit
+DBOLT=240     # ⚡ dim
+# gold glow ramp (charge-in), then steady at the top
+RAMP=(94 136 178 214 220 226)
+GOLD=220
+
+CHARS=(F U L L - A U T O)
+
+pace_or_skip() {  # sleep <seconds>, return 0 if a key was pressed (skip). Robust
+  # to non-tty stdin: off a tty we just sleep, so timing never collapses to instant.
+  if [ -t 0 ]; then
+    read -r -s -n 1 -t "$1" _k 2>/dev/null && return 0 || return 1
+  else
+    sleep "$1"; return 1
+  fi
+}
+
+# the_word <highlight_idx> <base_color> — "F U L L - A U T O" with one glyph lit
+# bright (the shimmer) sweeping across; the rest in base_color. -1 = no highlight.
+the_word() {
+  local hi="$1" base="$2" i=0 ch
+  for ch in "${CHARS[@]}"; do
+    [ $i -gt 0 ] && printf ' '
+    if [ $i -eq "$hi" ]; then printf '%s%s' "$(cb $HIW)" "$ch"; else printf '%s%s' "$(c $base)" "$ch"; fi
+    i=$((i + 1))
+  done
+  printf '%s' "$(reset)"
+}
+
+# frame <tick> — one frame; everything derives from the tick.
+frame() {
+  local t="$1"
+  local nch=${#CHARS[@]}
+  local hi=$(( t % nch ))                 # shimmer sweep position
+  # gold base ramps up over the first few ticks, then holds steady
+  local base; if [ $t -lt ${#RAMP[@]} ]; then base="${RAMP[$t]}"; else base=$GOLD; fi
+  # bolts blink; ENGAGED appears once "charged" (after the ramp) and pulses
+  local bolt; [ $(( t % 2 )) -eq 0 ] && bolt="$(cb $BOLT)" || bolt="$(c $DBOLT)"
+  home
+  printf '%s\n' "$(el)"
+  printf '              %s⚡%s%s\n' "$bolt" "$(reset)" "$(el)"
+  printf '%s\n' "$(el)"
+  printf '       %s%s\n' "$(the_word "$hi" "$base")" "$(el)"
+  printf '%s\n' "$(el)"
+  printf '              %s⚡%s%s\n' "$bolt" "$(reset)" "$(el)"
+  printf '%s\n' "$(el)"
+  if [ $t -ge ${#RAMP[@]} ]; then
+    local eng; [ $(( t % 2 )) -eq 0 ] && eng="$(cb $GRN)" || eng="$(c $DGR)"
+    printf '       %s⚡ E N G A G E D ⚡%s%s\n' "$eng" "$(reset)" "$(el)"
+  else
+    printf '%s\n' "$(el)"
+  fi
+  printf '%s\n' "$(el)"
+  reset
+}
+
+if [ "${1:-}" = "--still" ]; then
+  clr; frame 8; printf '\n'
+  exit 0
+fi
+
+cleanup() { show; reset; }
+trap cleanup EXIT INT TERM
+
+hide
+clr
+
+# Wall-clock bounded so the popup lasts ~HOLD seconds regardless of per-frame
+# subshell overhead or system load (a fixed tick count drifts badly under load).
+# `t` still counts frames so the charge ramp (first few frames) + ENGAGED reveal
+# work as before; we just keep drawing frames until HOLD seconds have elapsed.
+HOLD="${POD_AUTO_HOLD:-4}"
+start=$SECONDS
+t=0
+while [ $(( SECONDS - start )) -lt "$HOLD" ]; do
+  frame "$t"
+  if pace_or_skip 0.26; then break; fi
+  t=$((t + 1))
+done
+
+exit 0

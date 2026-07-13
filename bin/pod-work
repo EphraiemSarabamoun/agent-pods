@@ -54,6 +54,11 @@ case "$lc" in
   y|ya|ye|ok|okay|k|kk|yes|yep|yeah|yup|sure|go|"go ahead"|"do it"|"do that"|please|"yes please"|thanks|"thank you"|ty|continue|proceed|"sounds good"|lgtm) is_ack=1 ;;
   *) [ "${#lc}" -lt 4 ] && is_ack=1 ;;
 esac
+# A queue dispatch trigger ("Read $POD_INBOX/<id>/prompt.txt and execute...") is NOT
+# the worker's real task headline — mgr-dispatch already stamped @work with the task
+# description. Treat it like an ack: skip the headline update (so the trigger can't
+# clobber the description) while still logging it to the per-session history below.
+case "$snip" in *"$POD_INBOX"*) is_ack=1 ;; esac
 if [ "$is_ack" -eq 0 ]; then
   "$T" set-option -w -t "$win" @work    "$snip"       2>/dev/null || true
   "$T" set-option -w -t "$win" @work_at "$(date +%s)" 2>/dev/null || true

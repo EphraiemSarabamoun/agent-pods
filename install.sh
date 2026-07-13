@@ -9,7 +9,8 @@
 #      generic shell is found, slot 0 is a plain shell — agent-pods still works.
 #   3. Drop ~/.config/pod/config.sh from the example if you don't have one yet.
 #   4. Symlink bin/* into ~/.local/bin so `pod-launch` etc. are on your PATH.
-#   5. Optionally wire the Claude Code lifecycle hooks (only if Claude Code is present).
+#   5. Optionally wire the agent lifecycle hooks (Claude Code and Codex, each only if
+#      the agent is present).
 #
 # Re-running is safe: existing slots.json / config.sh are never clobbered (a replaced
 # slots.json is backed up first), symlinks are refreshed in place, and the hook wiring
@@ -18,6 +19,8 @@
 #   ./install.sh                    interactive
 #   ./install.sh --with-claude-hooks   non-interactively wire the Claude Code hooks
 #   ./install.sh --no-claude-hooks     non-interactively skip them
+#   ./install.sh --with-codex-hooks    non-interactively wire the Codex hooks
+#   ./install.sh --no-codex-hooks      non-interactively skip them
 set -u
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
@@ -29,18 +32,22 @@ CONFIG="$CONFIG_DIR/config.sh"
 CONFIG_EXAMPLE="$REPO/config/config.sh.example"
 LOCAL_BIN="$HOME/.local/bin"
 CLAUDE_HOOKS_INSTALLER="$REPO/hooks/claude-code/install.sh"
+CODEX_HOOKS_INSTALLER="$REPO/hooks/codex/install.sh"
 
 # --with-* / --no-* let CI / scripts skip the interactive prompts.
 HOOKS_CHOICE="ask"
+CODEX_HOOKS_CHOICE="ask"
 LOGINS_CHOICE="ask"
 for arg in "$@"; do
   case "$arg" in
     --with-claude-hooks) HOOKS_CHOICE="yes" ;;
     --no-claude-hooks)   HOOKS_CHOICE="no" ;;
+    --with-codex-hooks)  CODEX_HOOKS_CHOICE="yes" ;;
+    --no-codex-hooks)    CODEX_HOOKS_CHOICE="no" ;;
     --with-logins)       LOGINS_CHOICE="yes" ;;
     --no-logins)         LOGINS_CHOICE="no" ;;
     -h|--help)
-      echo "usage: install.sh [--with-claude-hooks|--no-claude-hooks] [--with-logins|--no-logins]"
+      echo "usage: install.sh [--with-claude-hooks|--no-claude-hooks] [--with-codex-hooks|--no-codex-hooks] [--with-logins|--no-logins]"
       echo "  Installs agent-pods: preflight deps, seed slots, symlink bin/* onto PATH."
       echo "  --with-logins   set up live Claude/Codex model discovery (prompts for an API key)"
       exit 0 ;;
@@ -256,6 +263,44 @@ else
       ok "Claude Code hooks wired"
     else
       warn "Claude Code hook installer exited non-zero — see its output above."
+    fi
+  fi
+fi
+
+# --- 5b. optional Codex hooks ------------------------------------------------------
+# Codex fires the same Claude-style lifecycle hooks (from ~/.codex/hooks.json), so it
+# gets the identical offer: instant state dots + pod-mail injected as context.
+say ""
+say "Codex lifecycle hooks"
+have_codex=0
+for aid in $AVAILABLE; do
+  [ "$aid" = "codex" ] && have_codex=1
+done
+if [ "$have_codex" -ne 1 ]; then
+  ok "Codex not detected — skipping hook wiring (nothing to do)."
+elif [ ! -x "$CODEX_HOOKS_INSTALLER" ]; then
+  warn "Codex present but $CODEX_HOOKS_INSTALLER is missing/not executable — skipping."
+else
+  do_codex_hooks="no"
+  case "$CODEX_HOOKS_CHOICE" in
+    yes) do_codex_hooks="yes" ;;
+    no)  do_codex_hooks="no"; ok "skipping Codex hooks (--no-codex-hooks)" ;;
+    ask)
+      # default N: only proceed on an explicit yes. Non-interactive (no tty) -> skip.
+      if [ -t 0 ]; then
+        printf '  Codex is installed. Wire the agent-pods lifecycle hooks into your\n'
+        printf '  ~/.codex/hooks.json (instant state dots, pod-mail delivery)? [y/N] '
+        read -r reply
+        case "$reply" in [Yy]*) do_codex_hooks="yes" ;; *) do_codex_hooks="no" ;; esac
+      else
+        ok "non-interactive and no --with-codex-hooks flag — skipping (run hooks/codex/install.sh later, or re-run with --with-codex-hooks)."
+      fi ;;
+  esac
+  if [ "$do_codex_hooks" = "yes" ]; then
+    if "$CODEX_HOOKS_INSTALLER"; then
+      ok "Codex hooks wired"
+    else
+      warn "Codex hook installer exited non-zero — see its output above."
     fi
   fi
 fi

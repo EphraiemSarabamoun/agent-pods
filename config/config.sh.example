@@ -42,3 +42,27 @@
 # --- foreign-state poller (state dot for agents without lifecycle hooks) --------
 # POD_FOREIGN_INTERVAL=3     # seconds between idle/busy polls
 # POD_FOREIGN_TRIM=8         # bottom lines (input box + footer) excluded from the hash
+
+# --- one-line agent summaries (@summary, shown in pod / pod-summary / the journal) --
+# pod-summarize turns an agent's recent output into a one-line "what it's doing"
+# label. Tier 1 is free and always on: an explicit <!-- STATUS: "..." --> tag in the
+# agent's own output wins verbatim (teach your agents the tag and you need nothing
+# else). Tier 2 is OFF by default: set POD_SUMMARIZE_CMD to any shell command that
+# reads recent output on stdin and prints ONE short line — a small local model, or an
+# agent CLI in print mode, e.g.:
+#   POD_SUMMARIZE_CMD='claude -p "Summarize what this agent is doing in one short present-tense line, no preamble."'
+# POD_SUMMARIZE_CMD=
+# POD_SUMMARIZE_TIMEOUT=45         # kill a wedged summarizer after this many seconds
+# POD_SUMMARIZE_MIN_INTERVAL=120   # poller-triggered (foreign-agent) rate limit, seconds
+
+# --- FULL AUTO celebration -------------------------------------------------------
+# The ⚡ popup animation when a pod's FULL AUTO switch flips ON. Cosmetic, skippable
+# with any key. Set POD_AUTO_ANIM=0 to disable, POD_AUTO_HOLD to change its length.
+# POD_AUTO_ANIM=1
+# POD_AUTO_HOLD=4
+
+# --- queue module (modules/queue) ------------------------------------------------
+# When a mgr-poll sweep finds the queue fully drained, workers whose task just
+# completed are closed (window killed + deregistered) so finished agents don't pile
+# up idle. Guarded (never the manager, never a busy/wait window). 0 disables.
+# MGR_REAP_FINISHED_WORKERS=1

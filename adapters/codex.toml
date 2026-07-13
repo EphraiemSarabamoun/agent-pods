@@ -1,6 +1,10 @@
-# Codex (OpenAI's CLI). A "poll" agent: no lifecycle hooks we can wire, so its state
-# dot is inferred by the foreign-state poller and its card is scraped live from the
-# composer footer. pod-mail reaches it via pod-deliver (send-keys notification).
+# Codex (OpenAI's CLI). A hook-parity agent: Codex fires Claude-style lifecycle hooks
+# from ~/.codex/hooks.json, so the installer below wires SessionStart / UserPromptSubmit
+# / PermissionRequest / PostToolUse / Stop to the pod helpers. With the hooks wired,
+# state dots flip instantly and pod-mail is injected silently as context at Codex's
+# next prompt — no send-keys needed. Skip the hook install and Codex still runs in a
+# pod via the poll/send-keys floor (override [lifecycle] back to poll in
+# ~/.config/pod/adapters/ so the poller owns it — see docs/adapters.md).
 [agent]
 id       = "codex"
 label    = "Codex"
@@ -22,14 +26,15 @@ reject_content    = []
 model             = "gpt-5.5"
 effort            = "high"
 # Scrape "<model> <effort> · <cwd>" from the footer (e.g. "gpt-5.5 high · ~"). Group 1
-# = model (must contain a digit), group 2 = effort (a known level). Used by the poller.
+# = model (must contain a digit), group 2 = effort (a known level). Only used when the
+# poller owns the window (the poll-floor override); with hooks wired the poller backs off.
 card_scrape_regex = '^\s*([A-Za-z][\w.\-]*\d[\w.\-]*)\s+(minimal|low|medium|high|xhigh|max|none)\b.*·'
 
 [lifecycle]
-mode            = "poll"
-installer       = ""
-native_delivery = false
-state_source    = "poll"
+mode            = "hooks"
+installer       = "hooks/codex/install.sh"
+native_delivery = true
+state_source    = "hooks"
 
 # Live discovery via the OpenAI REST API. The Codex CLI has no list-models command,
 # but GET /v1/models does — pod-discover-api calls it (filtered to gpt/codex/o-series)

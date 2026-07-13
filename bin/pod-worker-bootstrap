@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# pod-worker-bootstrap <cmd...> — hold a freshly spawned worker window until
+# pod-add-worker has finished stamping its identity (@pod_registered=1), then exec
+# the agent. This closes the spawn race without guessing how long an individual
+# agent takes to start: without the gate, the foreign-state poller can inspect the
+# newborn pane mid-launch (a bare interpreter, no identity yet), misclassify it,
+# and the agent's own first lifecycle hook fires against a half-stamped window.
+# The wait is bounded (~10s) and then proceeds regardless — it never wedges a
+# window if the spawner died. bash 3.2 safe.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || true
+T="${POD_TMUX:-$(command -v tmux 2>/dev/null || echo tmux)}"
+pane="${TMUX_PANE:-}"
+
+win=""
+if [ -n "$pane" ]; then
+  win="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
+  if [ -n "$win" ]; then
+    i=0
+    while [ "$i" -lt 200 ]; do
+      registered="$("$T" show-options -w -t "$win" -qv @pod_registered 2>/dev/null)"
+      [ "$registered" = "1" ] && break
+      sleep 0.05; i=$((i + 1))
+    done
+  fi
+fi
+
+# Hook-driven agents whose session hooks are THREAD-scoped (Codex: nothing fires
+# until the first prompt is submitted) would sit dot-less between spawn and first
+# use. Seed the honest pre-first-hook state — a freshly launched agent is at its
+# prompt, i.e. idle; the agent's own hooks own every transition from the first
+# real event. Harmless for agents whose hooks fire at session start (the seed is
+# overwritten milliseconds later).
+if [ -n "$win" ] && [ -x "${POD_ADAPTER:-}" ]; then
+  aid="$("$T" show-options -w -t "$win" -qv @agent_id 2>/dev/null)"
+  if [ -n "$aid" ]; then
+    ss="$("$POD_ADAPTER" field "$aid" state_source 2>/dev/null)"
+    if [ "$ss" = "hooks" ]; then "$POD_BIN/pod-state" idle >/dev/null 2>&1 || true; fi
+  fi
+fi
+
+exec "$@"

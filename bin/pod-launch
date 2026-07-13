@@ -23,6 +23,10 @@ MGRCARD="$POD_MANAGER_CARD"
 # the roster-printing shell only when none of those agents are present.
 MANAGER_CMD="${POD_MANAGER_CMD:-}"
 ADAPTER="${POD_ADAPTER:-$POD_BIN/pod-adapter}"
+# identity of the manager seat, stamped on window 0 below so the @agent_id-keyed
+# gates (pod-deliver, pod-star, roster tags) work from second zero. A custom
+# POD_MANAGER_CMD is unknowable -> generic-shell until detection reclassifies it.
+MGRAGENT="generic-shell"; MGRMODEL=""; MGREFFORT=""
 if [ -z "$MANAGER_CMD" ]; then
   avail="$("$ADAPTER" list --available 2>/dev/null)"
   for cand in ${POD_MANAGER_PREFER:-claude-code codex cursor openclaw}; do
@@ -36,6 +40,7 @@ if [ -z "$MANAGER_CMD" ]; then
     [ -n "$MANAGER_CMD" ] || continue
     MGRCARD="$("$ADAPTER" card "$cand" $margs --suffix manager 2>/dev/null)"
     [ -n "$MGRCARD" ] || MGRCARD="$POD_MANAGER_CARD"
+    MGRAGENT="$cand"; MGRMODEL="$dm"; MGREFFORT="$de"
     break
   done
   [ -n "$MANAGER_CMD" ] || MANAGER_CMD="$POD_BIN/pod-shell"
@@ -108,7 +113,10 @@ fi
 # the wrong pod. `; kill-session` ties the pod's life to its manager: EXITING the
 # manager (Ctrl-D / the agent quitting) tears the whole pod down instead of leaving a
 # zombie. A mere DETACH (closing the window) leaves the pod running for reattach.
-"$T" new-session -d -s "$S" -n "$MGRNAME" -e "POD_SESSION=$S" "$MANAGER_CMD; $T kill-session -t =$S"
+# The kill-session is deliberately BARE (no -t): it resolves the session from the
+# pane's own $TMUX at exit time, so it still kills the right pod after a RENAME —
+# a baked-in "-t =$S" targets the launch-time name and leaves a zombie session.
+"$T" new-session -d -s "$S" -n "$MGRNAME" -e "POD_SESSION=$S" "$MANAGER_CMD; $T kill-session"
 
 # server-level rendering (harmless on a fresh tmux server)
 "$T" set -g  default-terminal "tmux-256color" 2>/dev/null || true
@@ -253,6 +261,12 @@ _DOT="#{?#{==:#{@cc_state},idle},#[noreverse]#[fg=colour46]●#[default],#{?#{==
 "$T" setw -t "${S}:0" window-status-style         "bg=colour238,fg=colour231"
 "$T" setw -t "${S}:0" window-status-current-style "bg=colour252,fg=colour16"
 "$T" setw -t "${S}:0" @card "$MGRCARD"
+# Stamp the manager's identity alongside the card, so the @agent_id-keyed gates
+# (pod-deliver's mode pick, pod-star's deliverability, roster tags) work from second
+# zero instead of waiting for the first detection/hook pass to classify window 0.
+"$T" setw -t "${S}:0" @agent_id "$MGRAGENT"
+[ -n "$MGRMODEL" ]  && "$T" setw -t "${S}:0" @model  "$MGRMODEL"
+[ -n "$MGREFFORT" ] && "$T" setw -t "${S}:0" @effort "$MGREFFORT"
 
 # manager window-id, recorded in tmux_group.json so the MCP + mgr-* know which window
 # is the manager (window 0 at launch). Also stamped as @pod_manager_win so

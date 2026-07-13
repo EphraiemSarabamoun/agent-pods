@@ -99,10 +99,12 @@ card_scrape_regex = ''          # optional: read live model/effort from the pane
 
 `model` and `effort` are what a spawn uses when you don't pick one.
 
-`card_scrape_regex` is for poll agents whose model/effort can change inside the running
-TUI (you switch models in Codex mid-session). The foreign-state poller runs this regex
-against the bottom of the pane and, if it matches, rewrites the strip card live. **Group
-1 must capture the model, group 2 the effort.** Codex's is a good example:
+`card_scrape_regex` is for poll-driven windows whose model/effort can change inside the
+running TUI (you switch models in Codex mid-session). The foreign-state poller runs this
+regex against the bottom of the pane and, if it matches, rewrites the strip card live.
+It only fires when the poller owns the window (`state_source = "poll"`, or a hook agent
+running without its hooks via a poll override). **Group 1 must capture the model, group
+2 the effort.** Codex's is a good example:
 
 ```toml
 card_scrape_regex = '^\s*([A-Za-z][\w.\-]*\d[\w.\-]*)\s+(minimal|low|medium|high|xhigh|max|none)\b.*·'
@@ -125,16 +127,18 @@ state_source    = "poll"   # "hooks" = agent stamps its own @cc_state; "poll" = 
 This is the hooks-vs-poll distinction, the heart of "generic is first-class, hooks are an
 upgrade."
 
-- **`mode = "poll"`** (the floor, and what every adapter except Claude Code uses): the
-  agent has no lifecycle integration. agent-pods infers its state by watching the pane,
-  and delivers pod-mail by typing a notification into the pane when it's idle. This works
-  for any TUI with zero cooperation from the agent.
+- **`mode = "poll"`** (the floor, and what every adapter except Claude Code and Codex
+  uses): the agent has no lifecycle integration. agent-pods infers its state by watching
+  the pane, and delivers pod-mail by typing a notification into the pane when it's idle.
+  This works for any TUI with zero cooperation from the agent.
 
-- **`mode = "hooks"`**: the agent can run commands at lifecycle events (turn start, turn
-  end, session start, permission prompt), and `installer` points at a script that wires
-  those events to agent-pods' `pod-state` / `pod-mail-check` / `pod-work` helpers. With
-  hooks, state dots flip instantly (no poll lag), work headlines are captured per turn,
-  and the agent learns about new pod-mail as context at its next turn.
+- **`mode = "hooks"`** (Claude Code and Codex): the agent can run commands at lifecycle
+  events (turn start, turn end, session start, permission prompt), and `installer` points
+  at a script that wires those events to agent-pods' `pod-state` / `pod-mail-check` /
+  `pod-work` helpers (`hooks/claude-code/install.sh` targets Claude's settings.json;
+  `hooks/codex/install.sh` targets `~/.codex/hooks.json`). With hooks, state dots flip
+  instantly (no poll lag), work headlines are captured per turn, and the agent learns
+  about new pod-mail as context at its next turn.
 
 `state_source` mirrors `mode` for the state dot specifically: `"hooks"` means the agent
 stamps its own `@cc_state` and the poller leaves it alone; `"poll"` means the poller owns
@@ -250,7 +254,7 @@ scrape. Because `mode = "hooks"`, the installer wires SessionStart / UserPromptS
 Stop / Notification to `pod-state`, `pod-mail-check`, `pod-work`. Because
 `native_delivery = true`, pod-mail reaches it as additionalContext, never as send-keys.
 
-### codex, poll with a scraped card
+### codex, hook parity with a poll-floor fallback
 
 ```toml
 [agent]
@@ -271,15 +275,41 @@ content_patterns  = ['(?i)codex', 'model_reasoning_effort']
 card_scrape_regex = '^\s*([A-Za-z][\w.\-]*\d[\w.\-]*)\s+(minimal|low|medium|high|xhigh|max|none)\b.*·'
 
 [lifecycle]
-mode            = "poll"
-native_delivery = false
-state_source    = "poll"
+mode            = "hooks"
+installer       = "hooks/codex/install.sh"
+native_delivery = true
+state_source    = "hooks"
 ```
 
 Codex is a Node TUI, so the pane command is `node`, which is ambiguous. The
-`content_patterns` disambiguate it. It has no hooks, so its state dot comes from the
-poller and its card comes from `card_scrape_regex` (the footer reads `gpt-5.5 high · ~`;
-group 1 = model, group 2 = effort). pod-mail reaches it via a send-keys notification.
+`content_patterns` disambiguate it.
+
+Codex fires the same style of lifecycle hooks Claude Code does, read from
+`~/.codex/hooks.json`, so it gets full hook parity. `hooks/codex/install.sh` (offered
+by the root `./install.sh` when Codex is on PATH, or run directly) merge-wires five
+events without touching any hooks you already have:
+
+| event             | wired to |
+|-------------------|----------|
+| SessionStart      | `pod-codex-state idle` + `pod-awareness.sh codex` (roster injected as context) |
+| UserPromptSubmit  | `pod-codex-state busy user_prompt_submit` (state + `@work`) + `pod-mail-check` |
+| PermissionRequest | `pod-codex-state wait` |
+| PostToolUse       | `pod-codex-state busy` |
+| Stop              | `pod-codex-state idle stop --json` (Codex requires JSON on Stop stdout) |
+
+`bin/pod-codex-state` is a thin adapter that maps each event onto `pod-state` /
+`pod-work` and stamps the window (`@agent_id=codex`, `@pod_native_delivery=1`,
+`@state_source=hooks`). Because `native_delivery = true`, pod-mail reaches Codex
+silently as injected context at its next prompt — never as send-keys typed into its
+composer.
+
+**Without the hooks, the poll/send-keys floor still works** — it's the old behavior
+and remains the fallback. If you skip the hook install, restore the poll classification
+with a user override: copy `adapters/codex.toml` to `~/.config/pod/adapters/` and set
+`[lifecycle]` back to `mode = "poll"`, `native_delivery = false`, `state_source =
+"poll"`. The poller then owns the state dot, `card_scrape_regex` reads the live card
+from the composer footer (`gpt-5.5 high · ~`; group 1 = model, group 2 = effort), and
+pod-mail arrives as a send-keys notification.
 
 ### generic-shell, the universal floor
 

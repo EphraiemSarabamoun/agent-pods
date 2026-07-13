@@ -8,12 +8,17 @@
 #
 #   SessionStart     -> pod-awareness.sh   (roster + stamp this window as claude-code)
 #                       pod-state idle      (back at the prompt)
+#                       pod-brief boot      (inject the pod journal tail)
 #   UserPromptSubmit -> pod-mail-check UserPromptSubmit   (surface unread pod-mail)
 #                       pod-state busy      (a turn started)
 #                       pod-work            (capture the turn's work headline)
+#                       pod-brief refresh   (delta of podmate changes + auto-journal)
+#                       pod-auto-brief      (manager only: FULL AUTO stance for this turn)
 #   Stop             -> pod-state idle      (turn finished)
+#                       pod-last            (stamp the last-reply digest + transcript)
 #   Notification     -> pod-state wait      (a permission/attention prompt)
-#   PostToolUse      -> pod-state busy      (rescue a stuck wait dot; no-op if busy)
+#   PostToolUse      -> pod-state busy posttool  (rescue a stuck wait dot only;
+#                       a one-read no-op on every ordinary tool call)
 #
 # Idempotent: a pod hook is added only if an identical command isn't already present,
 # so re-running is safe. Existing non-pod hooks (e.g. a TTS Stop hook) are left intact.
@@ -62,27 +67,36 @@ WIRING = {
     "SessionStart": [
         'bash "%s"' % awareness,
         'bash "%s/pod-state" idle' % pod_bin,
+        'bash "%s/pod-brief" boot' % pod_bin,
     ],
     "UserPromptSubmit": [
         'bash "%s/pod-mail-check" UserPromptSubmit' % pod_bin,
         'bash "%s/pod-state" busy' % pod_bin,
         'bash "%s/pod-work"' % pod_bin,
+        'bash "%s/pod-brief" refresh UserPromptSubmit' % pod_bin,
+        'bash "%s/pod-auto-brief"' % pod_bin,
     ],
     "Stop": [
         'bash "%s/pod-state" idle' % pod_bin,
+        'bash "%s/pod-last"' % pod_bin,
     ],
     "Notification": [
         'bash "%s/pod-state" wait' % pod_bin,
     ],
     "PostToolUse": [
         # rescue a stuck "wait" dot: a tool result mid-turn means the agent is working
-        # again (e.g. a just-approved permission prompt). No-op when already busy.
-        'bash "%s/pod-state" busy' % pod_bin,
+        # again (e.g. a just-approved permission prompt). The posttool source makes
+        # pod-state act ONLY when the state was wait — one read + exit otherwise, so
+        # ordinary tool calls never pay a stamp or a redraw.
+        'bash "%s/pod-state" busy posttool' % pod_bin,
     ],
 }
 TIMEOUTS = {
     'bash "%s"' % awareness: 10,
     'bash "%s/pod-mail-check" UserPromptSubmit' % pod_bin: 5,
+    'bash "%s/pod-brief" boot' % pod_bin: 6,
+    'bash "%s/pod-brief" refresh UserPromptSubmit' % pod_bin: 6,
+    'bash "%s/pod-last"' % pod_bin: 5,
 }
 def timeout_for(cmd):
     return TIMEOUTS.get(cmd, 3)

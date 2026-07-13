@@ -1,37 +1,51 @@
 #!/usr/bin/env bash
 # pod-mail-check <hook-event> — SessionStart/UserPromptSubmit hook helper.
 #
-# If THIS instance has unread pod-mail, emit additionalContext nudging it to read.
-# This is the non-intrusive NATIVE-delivery path for hook-capable agents: the agent
-# learns it has mail as CONTEXT at its next turn (never injected into its input /
-# never auto-acted). Silent if no mail or not in a pod. Mirrors the additionalContext
-# pattern from pod-awareness.sh.
+# AUTO-DELIVERY: if THIS instance has unread pod-mail, inject the FULL messages as
+# additionalContext at its next turn, drain the mailbox (archive to <id>.read, same
+# as pod-mail), and clear the tab's red unread badge — so "agent got prompted"
+# always means "mail delivered and badge gone". Still non-intrusive: context, never
+# typed input. Silent if no mail or not in a pod. pod-mail remains the manual read
+# path (it mostly finds an empty box now).
+#
+# Ordering matters: emit-capability is checked BEFORE the drain (no jq -> no
+# drain), so messages can never vanish without reaching the model's context.
 set -u
 EVENT="${1:-UserPromptSubmit}"
 command -v tmux >/dev/null 2>&1 || exit 0
 [ -n "${TMUX:-}" ] || exit 0
 pane="${TMUX_PANE:-}"; [ -n "$pane" ] || exit 0
 # per-pod mailbox (the helper resolves THIS pod from $TMUX_PANE). Guarded so a
-# missing helper just means "no nudge", never a broken hook.
+# missing helper just means "no delivery", never a broken hook.
 POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || exit 0
 . "$POD_BIN/_pod-common.sh" 2>/dev/null || exit 0
 T="$POD_TMUX"
 me_id="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)" || exit 0
-# clear the red unread PILL: this instance has been prompted, so it's now aware of
-# (and will read) its mail. "prompted => pill gone", guaranteed, even if the mbox is
-# already empty (a stale badge). Unset, never "0" (#{?} treats "0" as true).
-"$T" set-option -uw -t "$me_id" @unread 2>/dev/null || true
 mbox="$(pod_mbox "$me_id")"
-[ -s "$mbox" ] || exit 0
-# Count MESSAGES, not lines: every pod-tell entry begins with a "[HH:MM] " stamp,
-# so count those. (grep -c '.' overcounted a multi-line message body as N
-# messages, and the old `|| echo 0` double-printed "0" on an all-blank mailbox,
-# making the integer test below error out.) grep -c always emits one integer.
-n="$(grep -c '^\[' "$mbox" 2>/dev/null)"; n="${n:-0}"
-[ "$n" -gt 0 ] 2>/dev/null || exit 0
-preview="$(head -4 "$mbox")"
-msg="You have ${n} unread pod-mail message(s). Run \`pod-mail\` to read and clear them. Preview:
-${preview}"
-command -v jq >/dev/null 2>&1 && jq -n --arg c "$msg" --arg e "$EVENT" \
+if [ ! -s "$mbox" ]; then  # no mail: clear any stale badge (self-heal), stay silent
+  "$T" set-option -uw -t "$me_id" @unread 2>/dev/null || true
+  exit 0
+fi
+command -v jq >/dev/null 2>&1 || exit 0   # can't emit -> leave the mail for pod-mail
+# Atomic drain (pod-mail's pattern): mv the mailbox aside FIRST; a concurrent
+# pod-tell append re-creates a fresh mbox, so nothing lands in a half-read box.
+snap="${mbox}.reading.$$"
+mv "$mbox" "$snap" 2>/dev/null || exit 0
+# Count MESSAGES, not lines: direct/@everyone entries begin with a "[HH:MM] "
+# stamp; quiet-chat entries (pod-tell chat) carry an "fyi " prefix and are
+# counted separately — they never badge, but they deliver all the same.
+n="$(grep -c '^\[' "$snap" 2>/dev/null)"; n="${n:-0}"
+nf="$(grep -c '^fyi ' "$snap" 2>/dev/null)"; nf="${nf:-0}"
+[ "$nf" -gt 0 ] && n="$n (+$nf fyi)"
+body="$(cat "$snap")"
+cat "$snap" >> "$(pod_read "$me_id")" 2>/dev/null || true
+rm -f "$snap"
+# delivered -> the tab badge clears NOW (this prompt = the read). Unset, never
+# "0" (#{?} treats the string "0" as true).
+"$T" set-option -uw -t "$me_id" @unread 2>/dev/null || true
+"$T" refresh-client -S 2>/dev/null || true
+msg="You have ${n} pod-mail message(s), delivered here and cleared (archived to your .read log):
+${body}"
+jq -n --arg c "$msg" --arg e "$EVENT" \
   '{hookSpecificOutput: {hookEventName: $e, additionalContext: $c}}'
 exit 0

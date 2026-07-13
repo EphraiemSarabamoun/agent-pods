@@ -47,7 +47,7 @@ POD_CITIES="${POD_CITIES:-}"
 POD_MANAGER_NAME="${POD_MANAGER_NAME:-manager}"
 # When FULL AUTO is on, pod-auto renames the manager window to this (to signal the
 # mode). Defaults to POD_MANAGER_NAME, so the rename is a visible no-op unless you
-# set a distinct name. (The private deck uses e.g. "Claudius" / "Claudius Maximus".)
+# set a distinct name (e.g. "manager" normally, "autopilot" while FULL AUTO is on).
 POD_MANAGER_NAME_AUTO="${POD_MANAGER_NAME_AUTO:-$POD_MANAGER_NAME}"
 POD_MANAGER_CARD="${POD_MANAGER_CARD:-Shell · manager}"
 # who gold stars are attributed to (stars are HUMAN-only). Shown in the award log +

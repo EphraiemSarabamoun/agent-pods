@@ -46,7 +46,11 @@ if [ -z "$win" ]; then
   # rides in #{@card}. pod-name avoids names already on a tab in this pod.
   wname="$("$POD_BIN/pod-name" "$S" 2>/dev/null)"
   [ -n "$wname" ] || wname="worker"
-  launch="exec $CMD"
+  # Launch through the bootstrap gate: it holds the agent until this script has
+  # finished stamping identity (@pod_registered, below), closing the race where the
+  # foreign-state poller inspects a half-launched pane. (@id adopt path skips it —
+  # that window's agent is already running.)
+  launch="exec \"$POD_BIN/pod-worker-bootstrap\" $CMD"
   # Append at the END of the window list (after the last window). Plain `-a -t $S`
   # inserts after the ACTIVE window, which dropped new agents in front of later ones,
   # so target the highest existing index explicitly.
@@ -151,6 +155,10 @@ finally:
     fcntl.flock(lf, fcntl.LOCK_UN)
     lf.close()
 PY
+# Identity + registration complete -> release the bootstrap gate (the spawned
+# window's pod-worker-bootstrap is polling for this stamp before exec'ing the agent).
+"$T" set-option -w -t "$win" @pod_registered 1 2>/dev/null || true
+
 # Log to a FILE, not stdout: the + button runs this via tmux run-shell, which captures
 # stdout and pops it as a copy-mode overlay on the new window (the "stuck color screen"
 # bug). Empty stdout => no overlay.

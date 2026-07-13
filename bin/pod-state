@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
-# pod-state <idle|busy|wait> — stamp THIS pane's live work-state onto its tmux window
-# so the pod status strip shows idle-at-a-glance. For agents with lifecycle hooks
-# (Claude Code), wire:
+# pod-state <idle|busy|wait> [source] — stamp THIS pane's live work-state onto its
+# tmux window so the pod status strip shows idle-at-a-glance. For agents with
+# lifecycle hooks (Claude Code), wire:
 #   UserPromptSubmit -> busy   (a turn started)
 #   Stop             -> idle   (turn finished; back at the prompt)
 #   Notification     -> wait   (a permission/attention prompt). Some agents also route
 #                              their idle "waiting for input" timeout here; that means
 #                              FREE, so we re-map it to idle from the payload.
+#   PostToolUse      -> busy posttool — rescues a STUCK wait: when you answer an
+#                              in-agent question / approve a prompt, the response
+#                              arrives as a tool_result, NOT a new user prompt, so
+#                              nothing else flips the yellow ◆ back to busy until the
+#                              turn's final Stop. A tool result only happens mid-turn,
+#                              so it proves work resumed. With source=posttool the
+#                              stamp fires ONLY when the state was wait — ordinary
+#                              tool calls cost one read + exit, no redraw.
 #
 # The strip reads #{@cc_state} per window: idle=green ● busy=orange ◐ wait=yellow ◆
 # unset=grey ○. Agents WITHOUT hooks get this dot from pod-foreign-state instead.
@@ -15,6 +23,7 @@
 set -u
 POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || true
 state="${1:-idle}"
+source="${2:-}"
 [ -n "${TMUX:-}" ] || exit 0
 T="${POD_TMUX:-$(command -v tmux 2>/dev/null || echo tmux)}"
 pane="${TMUX_PANE:-}"
@@ -42,6 +51,11 @@ win="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
 # Stamp @state_since (epoch) ONLY on a real transition, so the summary pane's activity
 # timer ("busy 12m") measures the current state, not the last hook fire.
 prev="$("$T" show-options -w -t "$win" -qv @cc_state 2>/dev/null)"
+# posttool exists only to clear a stuck "wait" (see header): if we weren't
+# waiting, do nothing — a one-read no-op on every ordinary tool call.
+if [ "$source" = "posttool" ]; then
+  [ "$prev" = "wait" ] || exit 0
+fi
 "$T" set-option -w -t "$win" @cc_state "$state" 2>/dev/null || true
 [ "$prev" = "$state" ] || "$T" set-option -w -t "$win" @state_since "$(date +%s)" 2>/dev/null || true
 # Force an immediate status-line redraw so the dot flips now. -S = status line only.

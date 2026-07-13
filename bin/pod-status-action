@@ -53,11 +53,17 @@ case "$range" in
   kill_*)
     # terminate is destructive -> confirm in the client first (misclick guard).
     # The window id is baked into the command literally here (captured from argv),
-    # so the deferred y/n branch needs no mouse context.
+    # so the deferred y/n branch needs no mouse context. Two overlay traps here:
+    # (1) since tmux 3.5, confirm-before BLOCKS and exits 1 on n/cancel — exec'ing
+    # it propagates that 1 out of the backgrounded binding and pops a full-screen
+    # "returned 1" view-mode page, so run it unexec'd and exit 0 regardless;
+    # (2) pod-kill-worker's "terminated ..." echo must be redirected or IT pops a
+    # copy-mode overlay (feedback belongs in the strip/feed, never stdout).
     win="${range#kill_}"
     name="$("$T" display-message -p -t "$win" '#{window_name}' 2>/dev/null || echo "$win")"
-    exec "$T" confirm-before -p "terminate agent $name ($win)? (y/n) " \
-         "run-shell -b '$POD_BIN/pod-kill-worker $range'" ;;
+    "$T" confirm-before -p "terminate agent $name ($win)? (y/n) " \
+         "run-shell -b '$POD_BIN/pod-kill-worker $range >/dev/null 2>&1'"
+    exit 0 ;;
   *)
     : ;;   # no-op; normal tab-select is handled in the binding
 esac

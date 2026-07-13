@@ -9,7 +9,12 @@ pane="${TMUX_PANE:-}"
 [ -n "$pane" ] || { echo "pod-mail: no TMUX_PANE — run me from inside a pod window"; exit 0; }
 me_id="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)" || exit 0
 mbox="$(pod_mbox "$me_id")"
-if [ ! -s "$mbox" ]; then echo "no new pod-mail"; exit 0; fi
+if [ ! -s "$mbox" ]; then
+  # no mail: clear any stale unread badge while we're here (self-heal; unset,
+  # never "0" — #{?} treats the string "0" as true)
+  "$T" set-option -uw -t "$me_id" @unread 2>/dev/null || true
+  echo "no new pod-mail"; exit 0
+fi
 # Atomic drain: rename the mailbox aside FIRST (mv is atomic within the same dir), then
 # read the snapshot. A pod-tell appending concurrently re-creates a fresh mailbox
 # (>> creates on demand), so its message can't be destroyed in the old
@@ -20,3 +25,6 @@ echo "pod-mail:"
 sed 's/^/  /' "$snap"
 cat "$snap" >> "$(pod_read "$me_id")" 2>/dev/null || true
 rm -f "$snap"
+# read -> the tab badge clears now
+"$T" set-option -uw -t "$me_id" @unread 2>/dev/null || true
+"$T" refresh-client -S 2>/dev/null || true

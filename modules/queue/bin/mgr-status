@@ -8,6 +8,7 @@
 
 set -euo pipefail
 POD_BIN="$(cd "$(dirname "$0")/../../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+. "$POD_BIN/_mgr-runtime.sh"                       # mgr_current_pod, mgr_pod_auto_state
 
 INBOX_ROOT="$POD_INBOX"
 QUEUE_DIR="$POD_INBOX/_queue"
@@ -15,18 +16,32 @@ WORKERS_PATH="$POD_STATE/workers.json"
 LOG_PATH="$POD_STATE/log.jsonl"
 DISPATCHED="$POD_STATE/dispatched"
 
+CURRENT_POD="$(mgr_current_pod)"
+AUTO_STATE="$(mgr_pod_auto_state "$CURRENT_POD")"   # on | off | none (non-pod)
+
 EMIT_JSON=0
 [ "${1:-}" = "--json" ] && EMIT_JSON=1
 
 if [ "$EMIT_JSON" -eq 1 ]; then
+  case "$AUTO_STATE" in
+    on)  fa=true ;;
+    off) fa=false ;;
+    *)   fa=null ;;
+  esac
   jq -n \
     --slurpfile workers "$WORKERS_PATH" \
     --argjson queue "$(ls "$QUEUE_DIR" 2>/dev/null | jq -R . | jq -s . || echo '[]')" \
     --arg inbox "$INBOX_ROOT" \
-    '{workers: $workers[0].workers, queue_files: $queue, inbox_root: $inbox}'
+    --argjson fa "$fa" \
+    '{workers: $workers[0].workers, queue_files: $queue, inbox_root: $inbox, full_auto: $fa}'
   exit 0
 fi
 
+# the pod's FULL AUTO switch (pod-auto / the strip's ⚡ pill); hidden for non-pods
+case "$AUTO_STATE" in
+  on)  echo " mode: ⚡ FULL AUTO — the manager dispatches autonomously (pod: ${CURRENT_POD})" ;;
+  off) echo " mode: ✋ MANUAL — automatic dispatch disabled (pod-auto on to flip)" ;;
+esac
 echo "================================================================"
 echo " WORKERS"
 echo "================================================================"

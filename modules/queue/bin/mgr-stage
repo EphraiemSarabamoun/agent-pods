@@ -51,37 +51,56 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Auto-allocate task-id if not given: <template-name>-<N> where N is the
-# next free integer (scans existing inbox dirs).
+# Auto-allocate task-id if not given: <template-name>-<N> where N is the next
+# free integer. The mkdir IS the claim — it fails if another stager already took
+# that N — so two concurrent auto-id runs can never share a task dir (a plain
+# [ -d ] scan would race between the test and the create).
 if [ -z "$TASK_ID" ]; then
+  mkdir -p "$INBOX_ROOT"
   N=1
-  while [ -d "${INBOX_ROOT}/${TEMPLATE_NAME}-${N}" ]; do
+  while :; do
+    TASK_ID="${TEMPLATE_NAME}-${N}"
+    mkdir "${INBOX_ROOT}/${TASK_ID}" 2>/dev/null && break
     N=$((N + 1))
+    [ "$N" -gt 100000 ] && { echo "ERROR: could not allocate a task id under ${INBOX_ROOT}" >&2; exit 1; }
   done
-  TASK_ID="${TEMPLATE_NAME}-${N}"
+  TASK_DIR="${INBOX_ROOT}/${TASK_ID}"
+  PROMPT_PATH="${TASK_DIR}/prompt.txt"
+else
+  TASK_DIR="${INBOX_ROOT}/${TASK_ID}"
+  PROMPT_PATH="${TASK_DIR}/prompt.txt"
+  [ -d "$TASK_DIR" ] && [ -f "$PROMPT_PATH" ] && {
+    echo "ERROR: ${PROMPT_PATH} already exists. Refuse to overwrite. Use a different --id or rm the dir first." >&2
+    exit 1
+  }
+  mkdir -p "$TASK_DIR"
 fi
-
-TASK_DIR="${INBOX_ROOT}/${TASK_ID}"
-PROMPT_PATH="${TASK_DIR}/prompt.txt"
-[ -d "$TASK_DIR" ] && [ -f "$PROMPT_PATH" ] && {
-  echo "ERROR: ${PROMPT_PATH} already exists. Refuse to overwrite. Use a different --id or rm the dir first." >&2
-  exit 1
-}
-mkdir -p "$TASK_DIR"
 
 # Read template into memory; substitute {{task_id}} and every key=value pair.
 content="$(cat "$TEMPLATE_PATH")"
 
-# Substitute {{task_id}} first so user-supplied vars can reference it transitively if needed.
-content="${content//\{\{task_id\}\}/$TASK_ID}"
-
-# Substitute user pairs. Use Bash parameter expansion (no sed regex hell).
+# Two-phase substitution so a VALUE that itself contains "{{key}}" is never
+# re-expanded by a later key's pass (a single-pass loop is order-dependent and
+# recursively expands such values). Phase 1 rewrites every recognized
+# placeholder to a sentinel form; phase 2 swaps the sentinels for the literal
+# values. Uses Bash parameter expansion (no sed regex hell).
+S1=$'\001'; S2=$'\002'
+content="${content//\{\{task_id\}\}/${S1}task_id${S2}}"
+for kv in "${KV_PAIRS[@]:-}"; do
+  [ -z "$kv" ] && continue
+  key="${kv%%=*}"
+  # The key becomes a glob pattern in the substitution below; a key with glob
+  # metachars (* ? [) would mis-match or eat surrounding text. Safe charset only.
+  case "$key" in ''|*[!A-Za-z0-9_]*) echo "WARN: skipping key with unsupported chars: '$key' (allowed: A-Za-z0-9_)" >&2; continue ;; esac
+  content="${content//\{\{${key}\}\}/${S1}${key}${S2}}"
+done
+content="${content//${S1}task_id${S2}/$TASK_ID}"
 for kv in "${KV_PAIRS[@]:-}"; do
   [ -z "$kv" ] && continue
   key="${kv%%=*}"
   val="${kv#*=}"
-  placeholder="{{${key}}}"
-  content="${content//${placeholder}/${val}}"
+  case "$key" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+  content="${content//${S1}${key}${S2}/$val}"
 done
 
 # Warn (but don't fail) if any {{key}} placeholders remain unsubstituted.

@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# pod-auto-brief — UserPromptSubmit hook: tell the MANAGER what the pod's FULL AUTO
+# switch means for THIS prompt.
+#
+# Injection matrix (additionalContext, the pod-brief emit_ctx pattern):
+#   manager window + switch ON          -> "you are the autonomous pod manager; work
+#                                          objectives go through the fire-and-poll
+#                                          loop" (docs/autonomy.md)
+#   manager window + switch OFF + a     -> one-liner pointing at the paused
+#     paused pod-task for this pod         objective (so it isn't forgotten)
+#   anything else                       -> ZERO output (workers, non-pods,
+#                                          manual pods with nothing paused —
+#                                          the common cases cost no context)
+#
+# MUST never fail a hook -> every path exits 0. No-op outside tmux. bash 3.2 safe.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || exit 0
+. "$POD_BIN/_mgr-runtime.sh" 2>/dev/null || exit 0   # mgr_manager_window
+T="$POD_TMUX"
+
+STATE="$POD_STATE/pod-task.json"
+GROUP="$POD_STATE/tmux_group.json"
+
+[ -n "${TMUX:-}" ] || exit 0
+pane="${TMUX_PANE:-}"
+[ -n "$pane" ] || exit 0
+
+meta="$("$T" display-message -p -t "$pane" '#{window_id}|#{session_name}' 2>/dev/null)"
+me_id="${meta%%|*}"; sess="${meta#*|}"
+{ [ -n "$me_id" ] && [ -n "$sess" ]; } || exit 0
+
+# only stamped pods ("=${sess}:" target form per the show-options quirk in _mgr-runtime.sh)
+[ "$("$T" show-options -t "=${sess}:" -qv @is_pod 2>/dev/null)" = "1" ] || exit 0
+
+# only the MANAGER window (@pod_manager_win stamp, index-0 fallback)
+[ "$me_id" = "$(mgr_manager_window "$sess")" ] || exit 0
+
+emit_ctx() {
+  command -v jq >/dev/null 2>&1 || exit 0
+  jq -n --arg c "$1" \
+    '{hookSpecificOutput:{hookEventName:"UserPromptSubmit", additionalContext:$c}}'
+  exit 0
+}
+
+# does the host-global pod-task state file belong to THIS pod? (".pod" field;
+# pre-field files belong to the recorded primary — same rule as pod-auto)
+state_is_mine() {
+  [ -f "$STATE" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  local tpod
+  tpod="$(jq -r '.pod // empty' "$STATE" 2>/dev/null)"
+  if [ -n "$tpod" ]; then
+    [ "$tpod" = "$sess" ]
+  else
+    [ "$(jq -r '.session // empty' "$GROUP" 2>/dev/null)" = "$sess" ]
+  fi
+}
+
+if [ "$("$T" show-options -t "=${sess}:" -qv @full_auto 2>/dev/null)" = "1" ]; then
+  emit_ctx "[full-auto] This pod's FULL AUTO switch is ON (the ⚡ pill). You are the autonomous pod manager: if this prompt is a work objective, run it through the fire-and-poll loop (decompose it into self-contained chunks → mgr-stage + mgr-queue each one → mgr-pick-next --all-idle to dispatch to idle workers → arm pod-task-wait in the background and repeat on each wake — see docs/autonomy.md) without asking for permission to manage. Conversational questions and status checks are answered normally — don't spin up workers for those."
+fi
+
+# switch is OFF — surface a paused loop so it isn't forgotten, else stay silent
+if state_is_mine && [ "$(jq -r '.status // empty' "$STATE" 2>/dev/null)" = "paused" ]; then
+  obj="$(jq -r '.objective // "?"' "$STATE" 2>/dev/null | cut -c1-120)"
+  emit_ctx "[full-auto] OFF (manual — the human runs the pod). A paused pod-task exists: \"${obj}\". Do not dispatch or re-arm; flipping the ⚡ pill (pod-auto on) resumes it."
+fi
+exit 0

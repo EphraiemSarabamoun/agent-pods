@@ -3,7 +3,8 @@
 #
 # Any window can run `pod` to see its podmates: the manager (window 0) and every
 # worker window in the same session. Marks which one is "you" and enriches each with
-# its identity card + live status / current-task / color from the registry.
+# its identity card + live runtime state, a one-line status (@summary, stamped by
+# pod-summarize), and what it's working on (@work) vs what it last did (@last).
 #
 # Terminology: the POD is the live cluster of co-located agent instances (one tmux
 # session). The FLEET (if you run agent-pods across machines) is the host mesh.
@@ -12,8 +13,17 @@
 set -u
 POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
 T="$POD_TMUX"
-WORKERS_JSON="$POD_STATE/workers.json"
 GRP="$POD_STATE/tmux_group.json"
+
+# Compact age of an epoch (e.g. 45s, 14m, 2h3m); empty for non-numeric/blank.
+NOW="$(date +%s)"
+pod_age() {
+  case "${1:-}" in ''|*[!0-9]*) return ;; esac
+  d=$(( NOW - $1 )); [ "$d" -lt 0 ] && d=0
+  if   [ "$d" -lt 60 ];   then printf '%ds' "$d"
+  elif [ "$d" -lt 3600 ]; then printf '%dm' $(( d / 60 ))
+  else printf '%dh%dm' $(( d / 3600 )) $(( (d % 3600) / 60 )); fi
+}
 
 SESS=""; ME=""
 if [ -n "${TMUX:-}" ]; then
@@ -26,7 +36,10 @@ if [ -n "${TMUX:-}" ]; then
     SESS="$("$T" display-message -p '#{session_name}' 2>/dev/null)"
     ME="$("$T" display-message -p '#{window_id}' 2>/dev/null)"
   fi
-elif [ -f "$GRP" ]; then
+fi
+# no live pane: the inherited POD_SESSION env, else the recorded primary pod
+[ -n "$SESS" ] || SESS="${POD_SESSION:-}"
+if [ -z "$SESS" ] && [ -f "$GRP" ]; then
   SESS="$(jq -r '.pod // .session // empty' "$GRP" 2>/dev/null)"
 fi
 
@@ -35,31 +48,74 @@ if [ -z "$SESS" ]; then
   exit 0
 fi
 
+# EVERYTHING rides ONE list-windows call. \x1f (US, the unit separator) because
+# @card/@summary/@last/@work are FREE TEXT and can contain '|'. MUST be \x1f, NOT tab:
+# tab is IFS-whitespace, so bash 3.2 collapses runs of it and DROPS empty fields,
+# shifting the read; \x1f splits cleanly and PRESERVES empty fields. The free-text
+# fields ride LAST; `work` takes the line remainder.
+SEP=$'\x1f'
 roster="$("$T" list-windows -t "$SESS" \
-  -F '#{window_id}|#{window_index}|#{window_name}|#{window_active}' 2>/dev/null)"
+  -F "#{window_id}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{window_active}${SEP}#{@agent_id}${SEP}#{@cc_state}${SEP}#{@state_source}${SEP}#{@stars}${SEP}#{@summary_at}${SEP}#{@work_at}${SEP}#{@card}${SEP}#{@summary}${SEP}#{@last}${SEP}#{@work}" 2>/dev/null)"
 if [ -z "$roster" ]; then
   echo "POD '$SESS' — no windows found (session may have ended)"
   exit 0
 fi
 
-n="$(printf '%s\n' "$roster" | awk -F'|' '$1!=""{c++} END{print c+0}')"
-echo "POD '$SESS' — $n instance(s):"
-printf '%s\n' "$roster" | while IFS='|' read -r wid widx wname wact; do
+n="$(printf '%s\n' "$roster" | awk -F"$SEP" '$1!=""{c++} END{print c+0}')"
+# FULL AUTO tag (the strip's ⚡/✋ pill, session option @full_auto) — stamped pods only.
+# "=${SESS}:" target form per the show-options quirk noted in _mgr-runtime.sh. Rides
+# BEFORE the instance count so the "instance(s):" shape consumers match on survives.
+mode=""
+if [ "$("$T" show-options -t "=${SESS}:" -qv @is_pod 2>/dev/null)" = "1" ]; then
+  if [ "$("$T" show-options -t "=${SESS}:" -qv @full_auto 2>/dev/null)" = "1" ]; then
+    mode=" · ⚡ FULL AUTO"
+  else
+    mode=" · ✋ manual"
+  fi
+fi
+echo "POD '$SESS'${mode} — $n instance(s):"
+printf '%s\n' "$roster" | while IFS="$SEP" read -r wid widx wname wact agent_id state src stars sat work_at card summ last work; do
   [ -z "$wid" ] && continue
   tag="";  [ "$widx" = "0" ] && tag=" (manager)"
-  act="";  [ "$wact" = "1" ] && act=" *active"
+  focus=""; [ "$wact" = "1" ] && focus=" · focused"
   you="";  [ -n "$ME" ] && [ "$wid" = "$ME" ] && you="   <-- you"
-  # identity card (agent · model · effort), cached on the window by pod-detect / the
-  # spawn path / the statusLine hook. Fall back to the agent label, then nothing.
-  card="$("$T" show-options -wqv -t "$wid" @card 2>/dev/null)"
-  [ -n "$card" ] || card="$("$T" show-options -wqv -t "$wid" @agent 2>/dev/null)"
-  info=""; [ -n "$card" ] && info=" · $card"
-  # live status from the registry, when registered (status / task / color)
-  if [ -f "$WORKERS_JSON" ]; then
-    reg="$(jq -r --arg w "$wid" '.workers[]? | select(.tmux_window==$w) | (if .status then " · "+.status else "" end) + (if .current_task_id then " · "+.current_task_id else "" end) + (if .color then " ("+.color+")" else "" end)' "$WORKERS_JSON" 2>/dev/null | head -1)"
-    [ -n "$reg" ] && info="$info$reg"
-  fi
-  stars="$("$T" show-options -wqv -t "$wid" @stars 2>/dev/null)"
+  # live runtime dot state (@cc_state), with a suffix naming a non-hook source:
+  # @state_source=hooks means the agent stamps its own state; anything else (poll)
+  # is the foreign-state poller's inference, so mark it.
+  srcsuf=""
+  case "${src:-}" in ""|hooks) : ;; poll) srcsuf="/polled" ;; *) srcsuf="/$src" ;; esac
+  info=" · runtime=${state:-unknown}${srcsuf}"
+  [ -n "$card" ] && info="$info · $card"
+  # pod-comms tag driven by the durable @agent_id (stamped at spawn / by pod-detect),
+  # never by the pane's momentary foreground command, which reads as a shell/runtime
+  # while an agent runs a tool and would false-flag busy windows. Every identified
+  # agent is deliverable (pod-deliver); only an undetected window has no comms path.
+  [ -z "$agent_id" ] && info="$info · no pod-comms (undetected)"
   star=""; { [ -n "$stars" ] && [ "$stars" -gt 0 ] 2>/dev/null; } && star="  ⭐×$stars"
-  printf "  [%s:%s]%s%s%s%s%s\n" "$widx" "$wname" "$tag" "$info" "$star" "$act" "$you"
+  printf "  [%s:%s]%s%s%s%s%s\n" "$widx" "$wname" "$tag" "$info" "$star" "$focus" "$you"
+  # One-line status: the @summary stamped by pod-summarize, with its age. While the
+  # agent is actively working with no summary yet, an "in flight" placeholder — NEVER
+  # the verbatim @work prompt (the raw prompt must never read as a summary; it stays
+  # on the on:/last: line below).
+  if [ -n "$summ" ]; then
+    age="$(pod_age "$sat")"; [ -n "$age" ] && age=" ($age)"
+    printf "        ↳ status: %s%s\n" "$summ" "$age"
+  elif [ -n "$last" ] && { [ "$state" = busy ] || [ "$state" = wait ]; }; then
+    printf "        ↳ status: 🐣 task in flight…\n"
+  fi
+  # What this instance is working on — the @work headline its own UserPromptSubmit
+  # hook (pod-work) / the dispatch path keeps current. "on:" while busy/blocked,
+  # "last:" once idle (so a stale headline can't read as live work). Until the FIRST
+  # turn completes (@last empty, stamped by pod-last at Stop) @work is only a verbatim
+  # echo of the prompt, which reads as a fake summary — show the hatchling placeholder
+  # instead, matching pod-brief / pod-summary.
+  if [ -n "$work" ]; then
+    if [ -z "$last" ]; then
+      printf "        ↳ on: 🐣 first task in flight…\n"
+    else
+      case "$state" in busy|wait) verb="on" ;; *) verb="last" ;; esac
+      age="$(pod_age "$work_at")"; [ -n "$age" ] && age=" ($age)"
+      printf "        ↳ %s: %s%s\n" "$verb" "$work" "$age"
+    fi
+  fi
 done

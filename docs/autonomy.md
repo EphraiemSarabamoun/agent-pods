@@ -54,6 +54,19 @@ this pod and, if it finds one, types a self-contained resume trigger into the ma
 REPL — so even a freshly-compacted manager can pick the loop back up from the state file
 alone.
 
+Two helpers keep the loop honest without you watching it:
+
+- **`pod-auto-brief`** (wired into the manager's per-prompt hook by the Claude Code hook
+  installer) injects the switch's meaning into the MANAGER only: with FULL AUTO on, "you
+  are the autonomous manager — run objectives through this loop"; with it off and a
+  paused task on file, a one-liner naming the paused objective so it isn't forgotten.
+  Workers and quiet manual pods cost zero context.
+- **Queue self-healing** (`mgr-poll`): a task assigned to a worker whose window died is
+  requeued automatically (the dispatched archive is restored before the dead registry
+  row drops, so an assignment can never vanish), and once the queue fully drains,
+  finished worker windows are closed so a long-running loop doesn't accumulate idle
+  agents (`MGR_REAP_FINISHED_WORKERS=0` to keep them).
+
 ## State: `pod-task.json`
 
 The loop's state lives in one host-global file, `$POD_STATE/pod-task.json`. It carries at

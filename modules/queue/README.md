@@ -35,6 +35,10 @@ Queue files live under `$POD_INBOX/_queue/`; templates under
 `$POD_INBOX/_templates/`. Copy or symlink this module's `templates/*.tpl.txt`
 into `$POD_INBOX/_templates/` at setup so `mgr-stage` can find them.
 
+Ghost queue entries (a queue file whose staged `prompt.txt` has vanished) are
+quarantined to `$POD_INBOX/_state/dead/` at auto-pick time, so a broken entry
+can never sit at the queue head blocking every lower-priority task.
+
 ## Commands
 
 All live in `modules/queue/bin/`; add that dir to your PATH (or call by path).
@@ -48,13 +52,28 @@ All live in `modules/queue/bin/`; add that dir to your PATH (or call by path).
   (`--deps` is recorded but not enforced — order with priority.)
 - `mgr-dispatch [--task <id>] [--tmux-window <@id>] [--print-only]` — fire the
   highest-priority queued task (or `--task`) at the first idle worker (or a
-  specific `--tmux-window`) via `tmux send-keys`. Marks the worker busy.
+  specific `--tmux-window`) via `tmux send-keys`. A registry-idle worker only
+  qualifies when its LIVE window agrees (alive, in the calling pod, `@cc_state`
+  idle); busy/wait windows are never interrupted, and cross-pod targets are
+  refused. Marks the worker busy, stamps the board (`@work`/`@cc_state`), and
+  logs the assignment to the pod's channel feed.
 - `mgr-poll [--quiet] [--json]` — sweep for `DONE` sentinels and flip completed
-  workers back to idle. Idempotent.
+  workers back to idle (clearing their `@work` headline). Requeues the task of
+  any worker whose window died mid-assignment, and — once the queue is fully
+  drained — closes finished worker windows via `pod-kill-worker`. Idempotent.
 - `mgr-pick-next [--all-idle] [--print-only]` — composite: poll, then dispatch
-  one queued task per freed/idle worker. Call this at the top of every manager
-  turn so the queue keeps draining.
-- `mgr-status [--json]` — print workers + queue + recent completions.
+  one queued task per freed/idle worker (idle = registry AND live tmux agree).
+  A single dispatch failure is logged and the batch continues. Call this at the
+  top of every manager turn so the queue keeps draining.
+- `mgr-status [--json]` — print the pod's FULL AUTO / manual mode, workers,
+  queue, and recent completions (`full_auto: true|false|null` in `--json`).
+
+## Environment knobs
+
+- `MGR_REAP_FINISHED_WORKERS` (default `1`) — when a `mgr-poll` sweep finds the
+  queue fully drained, close each worker window whose task just completed
+  (guarded: window alive, not the manager, registry idle, live state not
+  busy/wait). Set to `0` to keep finished workers open for reuse.
 
 ## Templates
 

@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# pod-brief — ambient pod awareness + a running, writable pod journal.
+#
+# Solves two gaps the rest of pod-* leaves open:
+#   1. Awareness goes STALE. pod-awareness.sh injects the roster once at SessionStart
+#      and never again, so an agent that spawns mid-session is invisible until you
+#      manually run `pod`. `pod-brief refresh` (wired into UserPromptSubmit) injects,
+#      every turn, ONLY what changed in the pod since this agent's last turn — a delta,
+#      not a dump. Quiet turn => zero output => zero context cost.
+#   2. No merged, writable timeline. The per-agent telemetry (@cc_state/@work/@last,
+#      stamped by pod-state/pod-work/pod-last) is live-only and per-window. This keeps a
+#      single chronological journal.md per pod, auto-fed from those transitions and
+#      hand-fed by `pod-brief note "..."`. `boot` injects its tail at SessionStart so a
+#      fresh session starts already knowing recent pod history (and it survives context
+#      compaction — the file re-injects).
+#
+# State (all under the per-pod comms subtree, GC'd when the pod closes):
+#   <poddir>/journal.md            the running memory (transitions + your notes)
+#   <poddir>/.brief/cursor.<wid>   per-reader: what THIS agent has already been shown
+#   <poddir>/.brief/journaled      shared: last sig journaled per window (write dedup)
+#   <poddir>/.brief/lock           atomic mkdir lock for the shared journal section
+#
+# Subcommands:
+#   refresh [event]   delta-inject others' changes + auto-journal (default UserPromptSubmit)
+#   boot              inject journal tail as SessionStart additionalContext
+#   note <text>       append a curated note to the journal
+#   log [N]           print last N journal lines (default 40)
+#
+# MUST never fail a hook -> every hook path exits 0. No-op outside tmux / alone in pod.
+# bash 3.2 safe (no associative arrays / mapfile); macOS has no flock -> mkdir lock.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || exit 0
+. "$POD_BIN/_pod-common.sh" 2>/dev/null || exit 0
+T="$POD_TMUX"
+
+CMD="${1:-refresh}"; [ "$#" -gt 0 ] && shift
+
+in_tmux=0; [ -n "${TMUX:-}" ] && in_tmux=1
+pane="${TMUX_PANE:-}"
+# pod_name: live tmux session via the calling pane, else the POD_SESSION env baked
+# into pod windows at creation — the same resolution pod-tell uses.
+POD="$(pod_name)"
+DIR="$(pod_dir_for "$POD")"
+BRIEF="$DIR/.brief"
+JOURNAL="$DIR/journal.md"
+
+now_hm() { date +%H:%M; }
+age_of() {  # epoch -> compact age (45s / 14m / 2h3m); empty for non-numeric/blank
+  case "${1:-}" in ''|*[!0-9]*) return ;; esac
+  d=$(( $(date +%s) - $1 )); [ "$d" -lt 0 ] && d=0
+  if   [ "$d" -lt 60 ];   then printf '%ds' "$d"
+  elif [ "$d" -lt 3600 ]; then printf '%dm' $(( d / 60 ))
+  else printf '%dh%dm' $(( d / 3600 )) $(( (d % 3600) / 60 )); fi
+}
+b64()     { printf '%s' "${1:-}" | base64 2>/dev/null | tr -d '\n'; }
+get_opt() { "$T" show-options -wqv -t "$1" "$2" 2>/dev/null; }
+lookup()  { awk -F'\t' -v w="$1" '$1==w{print $2; exit}' "$2" 2>/dev/null; }  # $1=wid $2=file
+
+# headline for a window: prefer the one-line summary (@summary, stamped by
+# pod-summarize); else, while the agent is actively working, an "in flight"
+# placeholder — NEVER the verbatim @work prompt (the raw prompt must never read as a
+# summary; go from "in flight" straight to the real summary). Once idle, fall back to
+# the last reply (@last). The genuine first task (no @last yet) keeps its own
+# "first task in flight…" wording.
+headline() {  # $1=state $2=summary $3=work $4=last
+  if   [ -n "$2" ]; then printf '%s' "$2"
+  elif [ -z "$4" ]; then [ -n "$3" ] && printf '🐣 first task in flight…' || printf '?'
+  elif [ "$1" = busy ] || [ "$1" = wait ]; then printf '🐣 task in flight…'
+  else printf '%s' "$4"; fi
+}
+
+emit_ctx() {  # $1=event  $2=text  -> additionalContext JSON (the proven delivery path)
+  command -v jq >/dev/null 2>&1 || return 0
+  jq -n --arg c "$2" --arg e "$1" \
+    '{hookSpecificOutput:{hookEventName:$e, additionalContext:$c}}'
+}
+
+# Every window is an agent. Structured fields carry no '|'; @card rides LAST so the
+# read's final variable absorbs the remainder. The free-form @work/@last/@summary are
+# fetched per-window via get_opt to dodge delimiter hell.
+list_wins() {
+  [ "$in_tmux" = 1 ] || return 0
+  "$T" list-windows -t "$POD" \
+    -F '#{window_id}|#{window_name}|#{@cc_state}|#{@work_at}|#{@last_at}|#{@card}' \
+    2>/dev/null
+}
+
+me_id=""
+[ -n "$pane" ] && me_id="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
+[ -n "$me_id" ] || me_id="self"
+
+case "$CMD" in
+  note)
+    text="$*"
+    [ -n "$text" ] || { echo "usage: pod-brief note <text>" >&2; exit 1; }
+    mkdir -p "$DIR" 2>/dev/null
+    who=""
+    [ "$in_tmux" = 1 ] && who="$(get_opt "$me_id" @card)"
+    [ -z "$who" ] && who="${POD_BRIEF_WHO:-}"
+    [ -z "$who" ] && who="me"
+    printf '[%s] NOTE (%s): %s\n' "$(now_hm)" "$who" "$text" >> "$JOURNAL"
+    echo "noted -> $JOURNAL"
+    ;;
+
+  log)
+    n="${1:-40}"
+    if [ -s "$JOURNAL" ]; then tail -n "$n" "$JOURNAL"; else echo "(pod journal empty)"; fi
+    ;;
+
+  boot)
+    [ "$in_tmux" = 1 ] || exit 0
+    [ -s "$JOURNAL" ] || exit 0
+    tailtxt="$(grep -v '^[[:space:]]*$' "$JOURNAL" 2>/dev/null | tail -n 15)"
+    [ -n "$tailtxt" ] || exit 0
+    emit_ctx "SessionStart" "Pod journal — recent activity in pod '$POD' (your running cross-agent memory; append with \`pod-note \"...\"\`, refreshes each turn):
+$tailtxt"
+    ;;
+
+  refresh)
+    [ "$in_tmux" = 1 ] || exit 0
+    EVENT="${1:-UserPromptSubmit}"
+    wins="$(list_wins)"
+    [ -n "$wins" ] || exit 0
+    mkdir -p "$BRIEF" 2>/dev/null
+    cursor="$BRIEF/cursor.$(printf '%s' "$me_id" | tr -c 'A-Za-z0-9' '_')"
+    journaled="$BRIEF/journaled"
+    touch "$cursor" "$journaled" 2>/dev/null
+    cur_wids="$(printf '%s\n' "$wins" | cut -d'|' -f1)"
+
+    # ---------- auto-journal: shared, mkdir-locked, best-effort ----------
+    # Whichever observer notices a transition first writes it; the shared `journaled`
+    # map (wid<TAB>sig rows) dedupes so concurrent refreshes (every agent runs this
+    # hook) log it once.
+    lock="$BRIEF/lock"; got=0
+    for i in 1 2 3 4 5 6; do mkdir "$lock" 2>/dev/null && { got=1; break; }; sleep 0.05; done
+    if [ "$got" = 1 ]; then
+      tmpj="$BRIEF/.journaled.tmp.$$"; : > "$tmpj"
+      printf '%s\n' "$wins" | while IFS='|' read -r wid wname state work_at last_at card; do
+        [ -n "$wid" ] || continue
+        work="$(get_opt "$wid" @work)"; last="$(get_opt "$wid" @last)"; summ="$(get_opt "$wid" @summary)"
+        sig="$(b64 "$state|$summ|$work|$last")"
+        printf '%s\t%s\n' "$wid" "$sig" >> "$tmpj"
+        prev="$(lookup "$wid" "$journaled")"
+        if [ -z "$prev" ]; then
+          printf '[%s] + %s joined (%s)\n' "$(now_hm)" "$wname" "${card:-agent}" >> "$JOURNAL"
+        elif [ "$prev" != "$sig" ]; then
+          printf '[%s] %s · %s · %s\n' "$(now_hm)" "$wname" "$state" \
+            "$(headline "$state" "$summ" "$work" "$last")" >> "$JOURNAL"
+        fi
+      done
+      # departures: in old journaled, gone from current
+      while IFS="$(printf '\t')" read -r wid sig; do
+        [ -n "$wid" ] || continue
+        printf '%s\n' "$cur_wids" | grep -qx "$wid" || \
+          printf '[%s] - window %s left the pod\n' "$(now_hm)" "$wid" >> "$JOURNAL"
+      done < "$journaled"
+      mv "$tmpj" "$journaled" 2>/dev/null
+      # cap growth: keep last 400 lines once it crosses 500
+      lc="$(wc -l < "$JOURNAL" 2>/dev/null | tr -d ' ')"
+      if [ "${lc:-0}" -gt 500 ] 2>/dev/null; then
+        tail -n 400 "$JOURNAL" > "$JOURNAL.tmp" 2>/dev/null && mv "$JOURNAL.tmp" "$JOURNAL"
+      fi
+      rmdir "$lock" 2>/dev/null
+    fi
+
+    # ---------- per-reader injection: OTHER agents only, delta vs my cursor ----------
+    newcursor="$BRIEF/.cursor.tmp.$$"; : > "$newcursor"
+    inj="$BRIEF/.inject.tmp.$$"; : > "$inj"
+    printf '%s\n' "$wins" | while IFS='|' read -r wid wname state work_at last_at card; do
+      [ -n "$wid" ] || continue
+      work="$(get_opt "$wid" @work)"; last="$(get_opt "$wid" @last)"; summ="$(get_opt "$wid" @summary)"
+      sig="$(b64 "$state|$summ|$work|$last")"
+      printf '%s\t%s\n' "$wid" "$sig" >> "$newcursor"
+      [ "$wid" = "$me_id" ] && continue
+      prev="$(lookup "$wid" "$cursor")"
+      [ "$prev" = "$sig" ] && continue
+      ag="$(age_of "${work_at:-$last_at}")"; [ -n "$ag" ] && ag=" $ag"
+      if [ -z "$prev" ]; then
+        printf '  • %s spawned — %s (%s)\n' "$wname" "${card:-agent}" "${state:-?}" >> "$inj"
+      else
+        printf '  • %s (%s%s): %s\n' "$wname" "$state" "$ag" "$(headline "$state" "$summ" "$work" "$last")" >> "$inj"
+      fi
+    done
+    # departures from my own cursor's perspective
+    while IFS="$(printf '\t')" read -r wid sig; do
+      [ -n "$wid" ] || continue
+      [ "$wid" = "$me_id" ] && continue
+      printf '%s\n' "$cur_wids" | grep -qx "$wid" || \
+        printf '  • window %s left the pod\n' "$wid" >> "$inj"
+    done < "$cursor"
+    mv "$newcursor" "$cursor" 2>/dev/null
+    body="$(cat "$inj" 2>/dev/null)"; rm -f "$inj" 2>/dev/null
+    [ -n "$body" ] || exit 0
+    emit_ctx "$EVENT" "[pod] changes since your last turn:
+$body"
+    ;;
+
+  *)
+    echo "usage: pod-brief {refresh [event]|boot|note <text>|log [N]}" >&2; exit 1 ;;
+esac
+exit 0

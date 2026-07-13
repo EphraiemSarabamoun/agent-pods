@@ -80,13 +80,16 @@ The point of pod-comms is that **every** agent is deliverable. There is no "this
 doesn't support comms, message skipped." What differs is *how* a message reaches each
 recipient, and `pod-deliver` decides that per agent.
 
-**Hook agents get it as context.** An agent with lifecycle hooks (Claude Code) surfaces
-its own mailbox: its `pod-mail-check` hook fires at session start and on each turn, and
-if there's unread mail it emits the count and a preview as `additionalContext`. The agent
-learns it has mail as *context* at its next turn, never injected into its input, never
-auto-acted. For these agents `pod-deliver` does nothing; the agent is its own delivery.
+**Hook agents get the messages delivered as context.** An agent with lifecycle hooks
+(Claude Code, Codex) surfaces its own mailbox: its `pod-mail-check` hook fires at session
+start and on each turn, and if there's unread mail it injects the FULL messages as
+`additionalContext`, atomically drains the mailbox (archived to the window's `.read`
+log), and clears the red pill — "agent got prompted" always means "mail delivered and
+badge gone." Still non-intrusive: context, never typed input, never auto-acted.
+`pod-mail` remains the manual read path (it mostly finds an empty box). For these agents
+`pod-deliver` does nothing; the agent is its own delivery.
 
-**Hookless agents get a send-keys notification, when idle.** A poll agent (Codex, Cursor,
+**Hookless agents get a send-keys notification, when idle.** A poll agent (Cursor,
 a shell, anything without hooks) has no way to surface its own mailbox, so `pod-deliver`
 gives it the floor: it types a one-line notification into the pane,
 
@@ -147,3 +150,34 @@ is strongest for agents that bring lifecycle hooks. That's the same "generic is
 first-class, hooks are an upgrade" line that runs through the whole project: hookless
 agents are fully in the pod and fully messaged; hooks make their reaction tighter and
 hands-free.
+
+## The pod journal (pod-brief / pod-note)
+
+Chat is point-to-point and ephemeral; the **journal** is the pod's running, shared
+memory. Every pod keeps one `journal.md` in its comms subtree (it dies with the pod,
+like the feed), fed from two directions:
+
+- **Auto-journal.** `pod-brief refresh`, wired into each hook agent's per-turn hook,
+  notices podmate transitions — joins, departures, state flips with a one-line headline
+  (the `@summary` from pod-summarize when there is one, never a raw prompt) — and logs
+  each once, mkdir-locked and deduped across concurrent observers:
+
+  ```
+  [08:31] + Esme joined (Codex · gpt-5.5 · high)
+  [08:40] Ivy · busy · Porting the queue module
+  [08:51] NOTE (Ivy): queue port landed; mgr-poll now reclaims dead workers
+  [09:10] - window @4 left the pod
+  ```
+
+- **Hand-fed notes.** Any agent (or you) runs `pod-note "..."` to append a curated
+  line — decisions, claims, handoffs. The boot hint teaches agents to use it.
+
+Two injections close the loop, both as `additionalContext` (never typed input):
+**`pod-brief boot`** (SessionStart) hands a fresh agent the journal tail, so it starts
+already knowing recent pod history — and re-hands it after a context compaction.
+**`pod-brief refresh`** (each prompt) injects only what changed among podmates since
+THIS agent's last turn, tracked by a per-reader cursor: a quiet pod costs zero context.
+
+The journal needs no configuration; it degrades gracefully. Without `pod-summarize`
+stamps the headlines fall back to "task in flight…" placeholders and last-reply
+digests; without any hook agents it simply stays a hand-fed notebook.

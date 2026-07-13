@@ -42,13 +42,29 @@ done
 PROMPT_PATH="${INBOX_ROOT}/${TASK_ID}/prompt.txt"
 [ -f "$PROMPT_PATH" ] || { echo "ERROR: prompt not found at $PROMPT_PATH. Stage it first via mgr-stage." >&2; exit 1; }
 
+# Priority must be an integer 0-999: the queue filename zero-pads it to 3 digits
+# for lexical = dispatch ordering, which only sorts correctly in that range.
+# Normalize through base-10 so a zero-padded "08" can't be read as bad octal.
+case "$PRIORITY" in
+  ''|*[!0-9]*) echo "ERROR: --priority must be a non-negative integer (got '$PRIORITY')" >&2; exit 2 ;;
+esac
+PRIORITY=$((10#$PRIORITY))
+[ "$PRIORITY" -le 999 ] || { echo "ERROR: --priority must be 0-999 for correct queue ordering (got '$PRIORITY')" >&2; exit 2; }
+
 mkdir -p "$QUEUE_DIR"
 TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
 PRI_PADDED=$(printf '%03d' "$PRIORITY")
 QUEUE_FILE="${QUEUE_DIR}/${PRI_PADDED}-${TS}-${TASK_ID}.json"
 
-# Refuse if already queued (don't double-queue).
-existing=$(find "$QUEUE_DIR" -maxdepth 1 -name "*-${TASK_ID}.json" 2>/dev/null | head -1)
+# Refuse if already queued (don't double-queue). The filename suffix is lossy —
+# a front-unanchored "*-<id>.json" glob also matches "*-<prefix>-<id>.json" —
+# so confirm each candidate's authoritative .task_id field before refusing.
+existing=""
+for qf in "$QUEUE_DIR"/*-"${TASK_ID}".json; do
+  [ -e "$qf" ] || continue
+  [ "$(jq -r '.task_id // empty' "$qf" 2>/dev/null)" = "$TASK_ID" ] || continue
+  existing="$qf"; break
+done
 if [ -n "$existing" ]; then
   echo "ERROR: ${TASK_ID} already queued at ${existing}. Remove it first if re-queueing intentionally." >&2
   exit 1
