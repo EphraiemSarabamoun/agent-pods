@@ -27,10 +27,8 @@ POD_BIN="$(cd "$(dirname "$0")/../../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh
 T="$POD_TMUX"
 
 INBOX_ROOT="$POD_INBOX"
-QUEUE_DIR="$POD_INBOX/_queue"
 WORKERS_PATH="$POD_STATE/workers.json"
 LOG_PATH="$POD_STATE/log.jsonl"
-DISPATCHED="$POD_STATE/dispatched"
 
 # The trigger message a worker reads after dispatch (points it at its staged prompt).
 TRIGGER_TPL="Read $POD_INBOX/{{task_id}}/prompt.txt and execute the task it describes end-to-end. Write result.json, touch DONE as your last action."
@@ -38,21 +36,29 @@ TRIGGER_TPL="Read $POD_INBOX/{{task_id}}/prompt.txt and execute the task it desc
 # Scheduling scope is the CALLING pod. Window ids are server-global, so every
 # target below is re-anchored to this session before anything is fired at it.
 CURRENT_POD="$(mgr_current_pod)"
+CURRENT_POD="$(mgr_pod_component "$CURRENT_POD")" || exit 2
+QUEUE_DIR="$(mgr_queue_dir "$CURRENT_POD")"
+DISPATCHED="$(mgr_dispatched_dir "$CURRENT_POD")"
 MGR_WIN="$(mgr_manager_window "$CURRENT_POD")"
+WORKERS_UPDATE="$POD_BIN/pod-workers-json"
 
 # live window probes (empty when the window is gone)
 win_session() { "$T" display-message -p -t "$1" '#{session_name}' 2>/dev/null || true; }
 win_state()   { "$T" show-options -w -t "$1" -qv @cc_state 2>/dev/null || true; }
+win_agent()   { "$T" show-options -w -t "$1" -qv @agent_id 2>/dev/null || true; }
 
 TASK_ID=""; TMUX_WINDOW=""; PRINT_ONLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --task)        TASK_ID="$2"; shift 2 ;;
-    --tmux-window) TMUX_WINDOW="$2"; shift 2 ;;
+    --task|--tmux-window)
+      [ "$#" -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
+      case "$1" in --task) TASK_ID="$2" ;; --tmux-window) TMUX_WINDOW="$2" ;; esac
+      shift 2 ;;
     --print-only)  PRINT_ONLY=1; shift ;;
     *) echo "ERROR: unrecognized arg: $1" >&2; exit 2 ;;
   esac
 done
+[ -z "$TASK_ID" ] || pod_valid_component "$TASK_ID" || { echo "ERROR: invalid task id '$TASK_ID'" >&2; exit 2; }
 
 # Resolve task: explicit --task wins; otherwise pop the lex-first queue entry.
 QUEUE_FILE=""
@@ -70,11 +76,14 @@ if [ -n "$TASK_ID" ]; then
   [ -n "$QUEUE_FILE" ] || { echo "ERROR: ${TASK_ID} not in queue (looked in ${QUEUE_DIR})" >&2; exit 1; }
 else
   AUTO_TASK=1
-  QUEUE_FILE=$(ls "$QUEUE_DIR" 2>/dev/null | sort | head -1)
+  for f in "$QUEUE_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    QUEUE_FILE="$f"; break
+  done
   [ -n "$QUEUE_FILE" ] || { echo "queue empty — nothing to dispatch" >&2; exit 0; }
-  QUEUE_FILE="${QUEUE_DIR}/${QUEUE_FILE}"
   TASK_ID=$(jq -r .task_id "$QUEUE_FILE")
 fi
+pod_valid_component "$TASK_ID" || { echo "ERROR: queue contains invalid task id '$TASK_ID'" >&2; exit 2; }
 
 PROMPT_PATH="${INBOX_ROOT}/${TASK_ID}/prompt.txt"
 if [ ! -f "$PROMPT_PATH" ]; then
@@ -103,6 +112,7 @@ fi
 DESC=$(jq -r '.description // ""' "$QUEUE_FILE" 2>/dev/null || echo "")
 [ -n "$DESC" ] || DESC="$TASK_ID"
 DESC="${DESC//$'\n'/ }"   # @work reads back as a single-line list-windows -F field
+DESC="$(printf '%s' "$DESC" | python3 -c 'import sys; print("".join(c for c in sys.stdin.read() if ord(c) >= 32 and ord(c) != 127), end="")')"
 
 # Resolve worker: explicit --tmux-window wins; else the first workers.json-idle
 # worker whose LIVE window agrees. The registry can go stale (a window killed
@@ -112,8 +122,15 @@ R_TMUX_WIN=""
 EXPLICIT=0
 if [ -n "$TMUX_WINDOW" ]; then
   EXPLICIT=1
-  REC=$(jq -c --arg tw "$TMUX_WINDOW" 'first(.workers[] | select(.tmux_window==$tw))' "$WORKERS_PATH")
+  REC=$(jq -c --arg tw "$TMUX_WINDOW" --arg pod "$CURRENT_POD" \
+    'first(.workers[] | select(.tmux_window==$tw and .tmux_session==$pod))' "$WORKERS_PATH")
   [ -n "$REC" ] && [ "$REC" != "null" ] || { echo "ERROR: ${TMUX_WINDOW} is not a registered worker (see ${WORKERS_PATH})" >&2; exit 1; }
+  AGENT_ID="$(printf '%s' "$REC" | jq -r '.agent_id // empty')"
+  [ -n "$AGENT_ID" ] || AGENT_ID="$(win_agent "$TMUX_WINDOW")"
+  case "$AGENT_ID" in
+    ""|generic-shell)
+      echo "ERROR: ${TMUX_WINDOW} is not a dispatchable agent worker" >&2; exit 1 ;;
+  esac
   R_TMUX_WIN="$TMUX_WINDOW"
 else
   for cand in $(jq -r '[.workers[] | select(.status=="idle")] | sort_by(.registered_at) | .[].tmux_window // empty' "$WORKERS_PATH" 2>/dev/null); do
@@ -121,6 +138,7 @@ else
     [ "$cand" = "$MGR_WIN" ] && continue
     [ "$(win_session "$cand")" = "$CURRENT_POD" ] || continue
     [ "$(win_state "$cand")" = "idle" ] || continue
+    case "$(win_agent "$cand")" in ""|generic-shell) continue ;; esac
     R_TMUX_WIN="$cand"; break
   done
   [ -n "$R_TMUX_WIN" ] || { echo "no live idle worker in pod '${CURRENT_POD}' — register one or pass --tmux-window" >&2; exit 1; }
@@ -165,6 +183,64 @@ if [ "$PRINT_ONLY" -eq 1 ]; then
   echo "    [print-only] ${T} send-keys -t ${R_TMUX_WIN} -l \"${TRIGGER}\" ; send-keys -t ${R_TMUX_WIN} Enter"
   exit 0
 fi
+# Claim under the shared workers.json lock before sending anything. This is the
+# compare-and-swap that prevents two concurrent dispatchers from both consuming an
+# old idle snapshot and interrupting the same worker.
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+STARTED_EPOCH=$(date +%s)
+CLAIMED=0
+ARCHIVED=0
+TRIGGER_TYPED=0
+TRIGGER_SUBMITTED=0
+ARCHIVE_FILE=""
+
+# Until Enter is successfully submitted, every exit path rolls both claims back.
+# This includes HUP/INT/TERM, not only the explicit send-keys failures. After Enter,
+# the durable "dispatching" archive is deliberately left for mgr-poll to heal rather
+# than risking a duplicate task by guessing whether the agent received the prompt.
+rollback_unsubmitted_dispatch() {
+  [ "$CLAIMED" -eq 1 ] || return 0
+  [ "$TRIGGER_SUBMITTED" -eq 0 ] || return 0
+  if [ "$TRIGGER_TYPED" -eq 1 ]; then
+    "$T" send-keys -t "$R_TMUX_WIN" C-u >/dev/null 2>&1 || true
+  fi
+  if [ "$ARCHIVED" -eq 1 ] && [ -f "$ARCHIVE_FILE" ]; then
+    mv "$ARCHIVE_FILE" "$QUEUE_FILE" >/dev/null 2>&1 || true
+  fi
+  "$WORKERS_UPDATE" --path "$WORKERS_PATH" release \
+    "$R_TMUX_WIN" "$CURRENT_POD" "$TASK_ID" >/dev/null 2>&1 || true
+}
+trap rollback_unsubmitted_dispatch EXIT
+trap 'exit 130' HUP INT TERM
+
+"$WORKERS_UPDATE" --path "$WORKERS_PATH" claim "$R_TMUX_WIN" "$CURRENT_POD" "$TASK_ID" "$NOW" || {
+  echo "ERROR: ${R_TMUX_WIN} was claimed by another dispatcher" >&2
+  exit 1
+}
+CLAIMED=1
+# Move the queue record to its in-flight archive BEFORE sending. The rename is the
+# atomic task claim: if two dispatchers selected the same queue file, exactly one move
+# succeeds and the loser frees its worker without ever typing the trigger.
+mkdir -p "$DISPATCHED"
+ARCHIVE_FILE="${DISPATCHED}/${TASK_ID}.json"
+if ! mv "$QUEUE_FILE" "$ARCHIVE_FILE"; then
+  echo "ERROR: task ${TASK_ID} was claimed by another dispatcher" >&2
+  exit 1
+fi
+ARCHIVED=1
+
+# Record the pre-delivery transaction durably. If this process is SIGKILLed, a later
+# mgr-poll can distinguish a stale half-dispatch from an ordinary in-flight task.
+archive_tmp="${ARCHIVE_FILE}.tmp.$$"
+if ! jq --arg pod "$CURRENT_POD" --arg target "$R_TMUX_WIN" \
+    --arg started "$NOW" --argjson epoch "$STARTED_EPOCH" \
+    '. + {status:"dispatching", pod:$pod, target:$target,
+          dispatch_started_at:$started, dispatch_started_epoch:$epoch}' \
+    "$ARCHIVE_FILE" > "$archive_tmp" || ! mv "$archive_tmp" "$ARCHIVE_FILE"; then
+  rm -f "$archive_tmp" 2>/dev/null || true
+  echo "ERROR: could not persist dispatch transaction for ${TASK_ID}" >&2
+  exit 1
+fi
 # type the trigger literally, then submit with Enter. The gap lets the REPL
 # register the text before the submit so Enter can't race ahead of it (a race
 # that was observed historically — hence the guard). Measured against a live
@@ -172,19 +248,28 @@ fi
 # overly conservative. 0.1 keeps a 2x margin over the smallest tested gap while
 # being imperceptible. Do NOT drop to 0 — that removes the margin the race
 # guard exists for.
-"$T" send-keys -t "$R_TMUX_WIN" -l "$TRIGGER"
+if ! "$T" send-keys -t "$R_TMUX_WIN" -l "$TRIGGER"; then
+  exit 1
+fi
+TRIGGER_TYPED=1
 sleep 0.1
-"$T" send-keys -t "$R_TMUX_WIN" Enter
+if ! "$T" send-keys -t "$R_TMUX_WIN" Enter; then
+  # The literal trigger may be sitting unsubmitted in the input buffer. Clear it
+  # before restoring the durable queue record so a later human Enter cannot create
+  # a duplicate dispatch.
+  exit 1
+fi
+TRIGGER_SUBMITTED=1
 
-# Mark the worker busy — match on its tmux_window handle.
-NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-TMP=$(mktemp)
-jq --arg tw "$R_TMUX_WIN" --arg tid "$TASK_ID" --arg now "$NOW" '
-  .workers |= map(
-    if (.tmux_window == $tw)
-    then .status = "busy" | .current_task_id = $tid | .started_at = $now
-    else . end)
-' "$WORKERS_PATH" > "$TMP" && mv "$TMP" "$WORKERS_PATH"
+# Commit immediately after Enter. A failure here leaves status=dispatching; mgr-poll
+# heals it once the live worker reports busy/wait instead of requeueing blindly.
+archive_tmp="${ARCHIVE_FILE}.tmp.$$"
+if jq --arg sent "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '. + {status:"dispatched", dispatched_at:$sent}' "$ARCHIVE_FILE" > "$archive_tmp"; then
+  mv "$archive_tmp" "$ARCHIVE_FILE" 2>/dev/null || true
+else
+  rm -f "$archive_tmp" 2>/dev/null || true
+fi
 
 # Stamp the live board immediately: the REAL task headline (@work), plus an
 # instant busy dot so the strip and roster flip the moment the task is fired
@@ -198,9 +283,7 @@ NOWS="$(date +%s)"
 "$T" set-option -w -t "$R_TMUX_WIN" @state_since "$NOWS" 2>/dev/null || true
 "$T" refresh-client -S 2>/dev/null || true
 
-# Archive queue file + log the dispatch.
-mkdir -p "$DISPATCHED"
-mv "$QUEUE_FILE" "${DISPATCHED}/${TASK_ID}.json"
+# Log the dispatch. The queue record was atomically archived before send.
 jq -nc --arg ts "$NOW" --arg tid "$TASK_ID" --arg tgt "$R_TMUX_WIN" --arg pod "$CURRENT_POD" --arg mode "tmux" \
   '{ts: $ts, event: "dispatched", task_id: $tid, target: $tgt, pod: $pod, mode: $mode}' \
   >> "$LOG_PATH"
@@ -219,3 +302,4 @@ if [ -n "$WNAME" ]; then
 fi
 
 echo "==> Dispatched. Worker is now busy."
+trap - EXIT HUP INT TERM

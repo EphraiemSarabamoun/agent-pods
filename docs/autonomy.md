@@ -50,9 +50,10 @@ session option `@full_auto=1`; see [keybindings.md](keybindings.md) for how to f
   seat), the gate is a no-op and the queue behaves exactly as it would without the switch.
 
 When you flip FULL AUTO back **on**, `pod-auto` looks for a paused `pod-task` belonging to
-this pod and, if it finds one, types a self-contained resume trigger into the manager's
-REPL — so even a freshly-compacted manager can pick the loop back up from the state file
-alone.
+this pod and, if it finds one, queues a self-contained resume instruction in the manager's
+mailbox. It then uses the normal guarded delivery path to submit that instruction only if
+the manager is an idle agent with a stable pane. A busy manager is never interrupted; its
+durable mailbox resumes the loop at the next safe prompt instead.
 
 Two helpers keep the loop honest without you watching it:
 
@@ -65,18 +66,17 @@ Two helpers keep the loop honest without you watching it:
   requeued automatically (the dispatched archive is restored before the dead registry
   row drops, so an assignment can never vanish), and once the queue fully drains,
   finished worker windows are closed so a long-running loop doesn't accumulate idle
-  agents (`MGR_REAP_FINISHED_WORKERS=0` to keep them).
+  agents (`MGR_REAP_FINISHED_WORKERS=0` to keep them). Queue and archive state is
+  namespaced by pod, and interrupted pre-delivery transactions are recovered after a
+  short grace period.
 
-## State: `pod-task.json`
+## State: per-pod task files
 
-The loop's state lives in one host-global file, `$POD_STATE/pod-task.json`. It carries at
-least:
+Each loop's state lives in `$POD_STATE/pod-tasks/<pod>.json`. It carries at least:
 
-- `pod` — which pod owns this loop (so a second pod's flip can't terminate the primary's
-  loop).
+- `pod` — the owning pod, retained as useful metadata.
 - `status` — `running` | `paused` | `done`. `pod-task-wait` honors a terminal
-  `done`/`paused` only when the `pod` field matches the caller's pod (or, for files
-  written before the field existed, when the caller is the recorded primary).
+  `done`/`paused` in that pod's own state file.
 
 The manager owns this file: it sets `running` when it starts, `paused` when FULL AUTO goes
 off, `done` when the objective is complete.
@@ -89,9 +89,9 @@ informational:
 
 | Reason | Meaning |
 | --- | --- |
-| `idle-change` | a `DONE` sentinel appeared or disappeared — a worker finished. The clean, protocol-native signal. |
-| `timeout` | the safety heartbeat elapsed with no `DONE` change. Lets the manager wake anyway and sweep for workers that went idle *without* a `DONE` (errored, never-tasked, stuck at a prompt). |
-| `stopped` | this pod's `pod-task.json` was marked `done`/`paused` (a stale watcher self-ends). |
+| `idle-change` | this pod gained a DONE-backed dispatch/completion marker — a worker finished. Durable per-pod markers prevent a concurrent poll from hiding it. |
+| `timeout` | the safety heartbeat elapsed with no completion change. Lets the manager wake anyway and sweep for workers that went idle *without* a `DONE` (errored, never-tasked, stuck at a prompt). |
+| `stopped` | this pod's task-state file was marked `done`/`paused` (a stale watcher self-ends). |
 | `auto-off` | the pod's FULL AUTO switch is off. The manager should pause: mark `status` `paused`, dispatch nothing, don't re-arm. |
 
 Override the poll interval with `POD_TASK_WAIT_POLL=<secs>` (default 3).

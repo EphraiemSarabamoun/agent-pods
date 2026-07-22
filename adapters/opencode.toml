@@ -1,5 +1,5 @@
-# OpenCode (open-source terminal agent). Poll agent. --model usually takes a
-# provider/model id; adjust to your configured providers.
+# OpenCode (open-source terminal agent). Poll agent. The bundled adapter inherits
+# OpenCode's locally configured provider/model rather than shipping a model catalog.
 [agent]
 id       = "opencode"
 label    = "OpenCode"
@@ -16,7 +16,7 @@ content_patterns  = ['(?i)opencode']
 reject_content    = []
 
 [defaults]
-model             = ""
+model             = "inherit"
 effort            = ""
 card_scrape_regex = ''
 
@@ -25,9 +25,3 @@ mode            = "poll"
 installer       = ""
 native_delivery = false
 state_source    = "poll"
-
-[[models]]
-slug  = "default"
-label = "Default"
-model = ""
-efforts = []

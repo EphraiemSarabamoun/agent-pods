@@ -1,7 +1,8 @@
-# OpenClaw (self-hosted agent runtime, often backed by a local Ollama). Poll agent.
+# OpenClaw (self-hosted agent runtime). Poll agent.
 # base_cmd assumes an `openclaw` CLI on PATH; if you front it with a wrapper (e.g. one
-# that SSHes to a GPU box), point base_cmd at that wrapper instead. Models depend on
-# your Ollama/backend — edit [[models]] to match `ollama list`.
+# that SSHes to a GPU box), point base_cmd at that wrapper instead. The bundled adapter
+# inherits OpenClaw's own configured model because a separate `ollama list` is not proof
+# that OpenClaw is actually configured to use those models.
 [agent]
 id       = "openclaw"
 label    = "OpenClaw"
@@ -20,7 +21,7 @@ content_patterns  = ['(?i)openclaw']
 reject_content    = []
 
 [defaults]
-model             = ""
+model             = "inherit"
 effort            = ""
 card_scrape_regex = ''
 
@@ -29,21 +30,3 @@ mode            = "poll"
 installer       = ""
 native_delivery = false
 state_source    = "poll"
-
-# Live discovery from the Ollama backend. `ollama list` prints a table whose first
-# column is the model name (e.g. "qwen3:8b"), each followed by a 12-char hex id —
-# the regex matches a name immediately followed by that id, which conveniently skips
-# the "NAME  ID  SIZE  MODIFIED" header. If your Ollama backend is a REMOTE box, point
-# this at it: models_cmd = "ssh <your-ollama-host> ollama list". No effort axis on Ollama.
-[discover]
-models_cmd   = "ollama list"
-models_regex = '^(\S+)\s+[0-9a-f]{12}\b'
-timeout_s    = 6
-efforts      = []
-
-# Fallback only — used if discovery fails (no ollama, backend down, etc.).
-[[models]]
-slug  = "default"
-label = "Default"
-model = ""
-efforts = []

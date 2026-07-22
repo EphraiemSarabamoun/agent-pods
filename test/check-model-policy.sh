@@ -1,71 +1,135 @@
 #!/usr/bin/env bash
-# check-model-policy.sh — the provider-backend model policy for claude-code.
-#
-# Behind Bedrock/Vertex/a gateway, first-party model IDs 400 — so pod-adapter must
-# (1) skip --model entirely when a provider env var is set (seat inherits the
-#     environment's model), while still passing --effort through,
-# (2) honor POD_CLAUDE_MODEL as a verbatim pin that bypasses the catalog,
-# (3) leave first-party setups and non-claude agents byte-identical to before.
-# Exercised through `launch`, `card`, and `resolve-model` with a scrubbed env so a
-# developer's real Bedrock/pin config can't leak into the assertions. No tmux needed.
-set -u
+# Local model discovery is authoritative; hardcoded/static rows never assert access.
+set -eu
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 ADAPTER="$REPO/bin/pod-adapter"
-TMP="$(mktemp -d)"
+DISCOVER="$REPO/bin/pod-discover-local-agent"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/agent-pods-model-policy.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$TMP/adapters" "$TMP/state"
 
-fails=0
-note() { echo "check-model-policy: $*" >&2; }
+cat > "$TMP/claude-screen.txt" <<'EOF'
+   Select model
+   Switch between Claude models.
 
-# every invocation runs with provider + pin vars scrubbed, discovery cache isolated,
-# and no API key (so the claude-code [discover] block falls back to the static list).
-run() {
-  env -u CLAUDE_CODE_USE_BEDROCK -u CLAUDE_CODE_USE_VERTEX -u CLAUDE_CODE_USE_FOUNDRY \
-      -u POD_CLAUDE_MODEL -u ANTHROPIC_API_KEY POD_TMP="$TMP" "$@"
+   ❯ 1. Default (recommended) ✔  Acme Prime · Company default
+     2. AcmePrime               Acme Prime · Best for complex work
+     3. AcmeFast                Acme Fast · Low-latency company model
+EOF
+
+cat > "$TMP/codex-screen.txt" <<'EOF'
+  Select Model and Effort
+  Access legacy models by running codex -m <model_name>
+
+› 1. corp-codex-pro (current)  Company coding model.
+  2. corp-codex-fast           Fast company coding model.
+
+  Press enter to confirm or esc to go back
+EOF
+
+claude_rows="$($DISCOVER claude-code --screen "$TMP/claude-screen.txt")"
+grep -qx $'default\tDefault (Acme Prime)\t' <<<"$claude_rows"
+grep -qx $'acmeprime\tAcme Prime\tAcmePrime' <<<"$claude_rows"
+grep -qx $'acmefast\tAcme Fast\tAcmeFast' <<<"$claude_rows"
+
+codex_rows="$($DISCOVER codex --screen "$TMP/codex-screen.txt")"
+grep -qx $'corp-codex-pro\tcorp-codex-pro\tcorp-codex-pro' <<<"$codex_rows"
+grep -qx $'corp-codex-fast\tcorp-codex-fast\tcorp-codex-fast' <<<"$codex_rows"
+
+cat > "$TMP/adapters/corporate.toml" <<EOF
+[agent]
+id = "corporate"
+label = "Corporate Agent"
+
+[launch]
+base_cmd = "agent"
+model_arg = ["--model", "{model}"]
+effort_arg = ["--effort", "{effort}"]
+
+[defaults]
+model = "inherit"
+effort = ""
+
+[lifecycle]
+mode = "poll"
+installer = ""
+native_delivery = false
+state_source = "poll"
+
+[discover]
+models_cmd = "$DISCOVER claude-code --screen $TMP/claude-screen.txt"
+models_format = "tsv"
+timeout_s = 2
+ttl_s = 300
+efforts = [ { slug = "high", label = "high", value = "high" } ]
+
+# Annotation for a model discovery did not return. It must never become selectable.
+[[models]]
+slug = "ghost"
+label = "Hardcoded Ghost"
+model = "ghost-model"
+efforts = []
+EOF
+
+run_adapter() {
+  POD_ADAPTERS_DIR="$TMP/adapters" POD_USER_ADAPTERS="$TMP/missing" \
+    POD_STATE="$TMP/state" "$ADAPTER" "$@"
 }
 
-expect() {  # <desc> <needle> <<< haystack ; needle="" asserts --model absent
-  desc="$1"; needle="$2"; got="$(cat)"
-  if [ -z "$needle" ]; then
-    case "$got" in *--model*) note "FAIL: $desc — expected no --model, got: $got"; fails=$((fails+1)) ;; esac
-  else
-    case "$got" in *"$needle"*) : ;; *) note "FAIL: $desc — expected '$needle' in: $got"; fails=$((fails+1)) ;; esac
-  fi
-}
+models="$(run_adapter models corporate)"
+grep -qx $'inherit\tAgent default (inherited)' <<<"$models"
+grep -qx $'acmeprime\tAcme Prime' <<<"$models"
+if grep -q 'ghost\|Hardcoded Ghost' <<<"$models"; then
+  echo "static model incorrectly asserted as available" >&2
+  exit 1
+fi
 
-# 1. first-party (no provider env): today's behavior, catalog slug resolves
-run "$ADAPTER" launch claude-code --model opus --effort high \
-  | expect "first-party launch keeps catalog ID" "--model claude-opus-4-8"
+[ "$(run_adapter launch corporate --model inherit)" = "agent" ]
+[ "$(run_adapter launch corporate --model inherit --effort high)" = "agent --effort high" ]
+[ "$(run_adapter launch corporate --model acmeprime)" = "agent --model AcmePrime" ]
+[ "$(run_adapter resolve-model corporate ghost)" = "inherit" ]
+[ "$(run_adapter resolve-effort corporate inherit high)" = "high" ]
+[ -z "$(run_adapter resolve-effort corporate inherit ghost)" ]
+[ "$(run_adapter card corporate --model inherit)" = "Corporate Agent · Agent default (inherited)" ]
+[ "$(run_adapter card corporate --model inherit --effort high)" = "Corporate Agent · Agent default (inherited) · high" ]
 
-# 2. provider backend: --model dropped, --effort survives
-run env CLAUDE_CODE_USE_BEDROCK=1 "$ADAPTER" launch claude-code --model opus --effort high \
-  | expect "bedrock launch drops --model" ""
-run env CLAUDE_CODE_USE_BEDROCK=1 "$ADAPTER" launch claude-code --model opus --effort high \
-  | expect "bedrock launch keeps --effort" "--effort high"
+# A malformed but valid-JSON cache must be ignored and refreshed, not crash the
+# picker or become launch metadata.
+printf '%s\n' '{"models":[1]}' > "$TMP/state/discover/corporate.json"
+grep -qx $'acmeprime\tAcme Prime' <<<"$(run_adapter models corporate)"
 
-# 3. pin: POD_CLAUDE_MODEL passes verbatim (provider ID format, not in the catalog)
-run env CLAUDE_CODE_USE_BEDROCK=1 POD_CLAUDE_MODEL="us.anthropic.claude-opus-4-8-v1:0" \
-    "$ADAPTER" launch claude-code --model opus \
-  | expect "pin overrides catalog verbatim" "--model us.anthropic.claude-opus-4-8-v1:0"
+# Persisted quick-pick metadata is only a preference. Both the menu label and the
+# click command must resolve a removed model through today's local catalog.
+printf '%s\n' '{"slots":[{"label":"Corporate Agent · Hardcoded Ghost","agent":"corporate","model":"ghost","effort":"high","cmd":"agent --model ghost-model"}]}' > "$TMP/slots.json"
+menu="$(POD_MENU_PRINT=1 POD_SLOTS="$TMP/slots.json" POD_ADAPTERS_DIR="$TMP/adapters" \
+  POD_USER_ADAPTERS="$TMP/missing" POD_STATE="$TMP/state" \
+  "$REPO/bin/pod-spawn-menu-build")"
+grep -q 'Corporate Agent · Agent default (inherited) · high' <<<"$menu"
+if grep -q 'Hardcoded Ghost\|ghost-model\|--label' <<<"$menu"; then
+  echo "quick picker leaked stale model metadata" >&2
+  exit 1
+fi
 
-# 4. resolve-model: inherit prints empty, pin prints the pin, plain passes through
-r="$(run env CLAUDE_CODE_USE_BEDROCK=1 "$ADAPTER" resolve-model claude-code opus)"
-[ -z "$r" ] || { note "FAIL: resolve-model under bedrock should be empty, got '$r'"; fails=$((fails+1)); }
-r="$(run env POD_CLAUDE_MODEL=my-gateway-model "$ADAPTER" resolve-model claude-code opus)"
-[ "$r" = "my-gateway-model" ] || { note "FAIL: resolve-model pin, got '$r'"; fails=$((fails+1)); }
-r="$(run "$ADAPTER" resolve-model claude-code opus)"
-[ "$r" = "opus" ] || { note "FAIL: resolve-model passthrough, got '$r'"; fails=$((fails+1)); }
+# Agent ids become cache keys and shell-menu arguments, so unsafe ids are rejected at
+# the adapter boundary.
+cat > "$TMP/adapters/unsafe.toml" <<'EOF'
+[agent]
+id = "../../escape"
+label = "Unsafe"
+[launch]
+base_cmd = "agent"
+model_arg = ["--model", "{model}"]
+EOF
+if run_adapter list 2>/dev/null | grep -q escape; then
+  echo "unsafe adapter id was loaded" >&2
+  exit 1
+fi
 
-# 5. other agents are untouched by the claude policy
-r="$(run env CLAUDE_CODE_USE_BEDROCK=1 "$ADAPTER" resolve-model codex gpt-5.5)"
-[ "$r" = "gpt-5.5" ] || { note "FAIL: non-claude agent passthrough, got '$r'"; fails=$((fails+1)); }
+# Bundled adapters must not ship authoritative model rows.
+if rg -n '^\[\[models\]\]' "$REPO/adapters" --glob '!_schema.toml'; then
+  echo "bundled adapter contains a hardcoded model catalog" >&2
+  exit 1
+fi
 
-# 6. card mirrors the launch decision: no stale first-party label under inherit
-run env CLAUDE_CODE_USE_BEDROCK=1 "$ADAPTER" card claude-code --model opus --effort high \
-  | expect "bedrock card omits first-party model label" "Claude Code · high"
-run env POD_CLAUDE_MODEL=my-gateway-model "$ADAPTER" card claude-code --model opus \
-  | expect "pinned card shows the pin" "my-gateway-model"
-
-if [ "$fails" -gt 0 ]; then note "$fails failure(s)"; exit 1; fi
-note "ok — provider-backend model policy holds"
+echo "check-model-policy: local discovery is authoritative"

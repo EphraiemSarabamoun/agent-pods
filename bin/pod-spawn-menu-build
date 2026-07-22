@@ -14,7 +14,11 @@
 #
 # Set POD_MENU_PRINT=1 to print the tmux argv (one per line) instead of opening the
 # menu — used to validate the generated command without popping a menu at someone.
-import json, os, subprocess, sys
+import json
+import os
+import shlex
+import subprocess
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Resolve from the environment (set by _pod-paths.sh), with repo-relative fallbacks.
@@ -25,8 +29,13 @@ SLOTS = os.environ.get("POD_SLOTS") or os.path.join(
 )
 ADD = os.path.join(POD_BIN, "pod-add-worker")
 SETTINGS = os.path.join(POD_BIN, "pod-settings-menu")
+ADAPTER = os.environ.get("POD_ADAPTER") or os.path.join(POD_BIN, "pod-adapter")
 STATE = os.environ.get("POD_STATE") or os.path.join(
-    os.environ.get("POD_TMP", "/tmp/pod"), "state"
+    os.environ.get(
+        "POD_TMP",
+        os.path.join(os.environ.get("TMPDIR", "/tmp"), f"agent-pods-{os.getuid()}"),
+    ),
+    "state",
 )
 # Prefer $POD_TMUX from env; else resolve on PATH (no hardcoded path).
 TMUX = os.environ.get("POD_TMUX") or "tmux"
@@ -43,6 +52,17 @@ with open(SLOTS) as f:
     data = json.load(f)
 slots = (data.get("slots") or [])[:10]
 
+
+def adapter(*args):
+    """Return adapter stdout, or None when the semantic selection is unavailable."""
+    try:
+        result = subprocess.run(
+            [ADAPTER, *args], capture_output=True, text=True, timeout=40
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.rstrip("\n") if result.returncode == 0 else None
+
 # NO -c: tmux resolves the current client automatically here, exactly like the ✕
 # button's `tmux confirm-before` does from the same backgrounded run-shell context.
 # Passing -c "<#{client_name} tty>" made display-menu return 1.
@@ -51,23 +71,42 @@ _ = client  # accepted for compat; intentionally unused (see note above)
 
 for i, s in enumerate(slots):
     key = str(i)  # 0-9, the slot index doubles as the mnemonic
-    label = s.get("label") or "(empty)"
+    saved_label = s.get("label") or "(empty)"
+    label = saved_label
     cmd = s.get("cmd", "")
-    if cmd:
-        # The tab gets a random human name (pod-add-worker -> pod-name); the real
-        # identity rides in --label (the slot's pretty "Agent · Model · effort"),
-        # which pod-add-worker stamps into #{@card} for the status bar. `label` keeps
-        # the value computed above (with its "(empty)" fallback) — do NOT re-fetch it.
-        #
-        # run-shell arg is single-quoted; --label and --cmd values are double-quoted
-        # (they carry no quotes: words, '·', paths, flags). EVERY flag is omitted when
-        # its value is empty, so a blank value can't make the flag swallow the FOLLOWING
-        # flag as its argument in pod-add-worker's `--x) X="${2:-}"; shift 2` parser.
-        agent_arg  = f"--agent {s['agent']} "   if s.get("agent")  else ""
-        model_arg  = f"--model {s['model']} "   if s.get("model")  else ""
-        effort_arg = f"--effort {s['effort']} " if s.get("effort") else ""
-        item = (f"run-shell -b '{ADD} {agent_arg}{model_arg}{effort_arg}"
-                f"--label \"{label}\" --cmd \"{cmd}\"'")
+    agent = s.get("agent", "")
+    if agent or cmd:
+        # Known agents are resolved when the menu OPENS and again when the item is
+        # clicked. Both the visible label and launched seat therefore follow the
+        # models offered by the locally installed agent; a stale saved model becomes
+        # "inherit" and cannot leave an old model name on the tab. A command-only
+        # legacy/custom slot keeps its explicit command and label. shlex.join/quote
+        # makes every catalog value literal.
+        spawn = [ADD]
+        if agent:
+            model = adapter("resolve-model", agent, s.get("model", ""))
+            if model is None:
+                model = s.get("model", "")
+            effort = adapter("resolve-effort", agent, model, s.get("effort", ""))
+            if effort is None:
+                effort = ""
+            card_args = ["card", agent]
+            if model:
+                card_args += ["--model", model]
+            if effort:
+                card_args += ["--effort", effort]
+            current_label = adapter(*card_args)
+            if current_label:
+                label = current_label
+            spawn += ["--agent", agent]
+            if model:
+                spawn += ["--model", model]
+            if effort:
+                spawn += ["--effort", effort]
+        else:
+            spawn += ["--cmd", cmd]
+            spawn += ["--label", saved_label]
+        item = "run-shell -b " + shlex.quote(shlex.join(spawn))
     else:
         # empty slot (shouldn't happen post-seed): clicking it jumps straight into
         # editing that slot via the settings drill-down.

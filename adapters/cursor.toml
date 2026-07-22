@@ -1,6 +1,6 @@
 # Cursor Agent (Cursor's headless CLI). Poll agent, no hooks. Paid accounts expose
 # named models through live discovery below; free accounts may still be restricted
-# to `auto`. The static model entry is only the offline/not-logged-in fallback.
+# to `auto`. Failed discovery falls back to the agent's own default.
 [agent]
 id       = "cursor"
 label    = "Cursor Agent"
@@ -17,7 +17,7 @@ content_patterns  = ['(?i)cursor']
 reject_content    = []
 
 [defaults]
-model             = "auto"
+model             = "inherit"
 effort            = ""
 card_scrape_regex = ''
 
@@ -36,11 +36,5 @@ state_source    = "poll"
 models_cmd   = "cursor-agent --list-models"
 models_regex = '^(\S+)\s+-\s+(.+?)(?:\s+\(current\))?$'
 timeout_s    = 30
+ttl_s        = 300
 efforts      = []
-
-# Fallback only — used verbatim if discovery fails (offline, not logged in, etc.).
-[[models]]
-slug  = "auto"
-label = "Auto"
-model = "auto"
-efforts = []

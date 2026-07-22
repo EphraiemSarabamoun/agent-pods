@@ -18,9 +18,6 @@ POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null
 . "$POD_BIN/_mgr-runtime.sh" 2>/dev/null || exit 0   # mgr_manager_window
 T="$POD_TMUX"
 
-STATE="$POD_STATE/pod-task.json"
-GROUP="$POD_STATE/tmux_group.json"
-
 [ -n "${TMUX:-}" ] || exit 0
 pane="${TMUX_PANE:-}"
 [ -n "$pane" ] || exit 0
@@ -28,6 +25,7 @@ pane="${TMUX_PANE:-}"
 meta="$("$T" display-message -p -t "$pane" '#{window_id}|#{session_name}' 2>/dev/null)"
 me_id="${meta%%|*}"; sess="${meta#*|}"
 { [ -n "$me_id" ] && [ -n "$sess" ]; } || exit 0
+STATE="$POD_STATE/pod-tasks/$(pod_path_component "$sess").json"
 
 # only stamped pods ("=${sess}:" target form per the show-options quirk in _mgr-runtime.sh)
 [ "$("$T" show-options -t "=${sess}:" -qv @is_pod 2>/dev/null)" = "1" ] || exit 0
@@ -40,17 +38,9 @@ emit_ctx() {
   exit 0
 }
 
-# does the host-global pod-task state file belong to THIS pod? (".pod" field;
-# pre-field files belong to the recorded primary — same rule as pod-auto)
 state_is_mine() {
   [ -f "$STATE" ] || return 1
-  local tpod
-  tpod="$(pod_json_get "$STATE" pod)"
-  if [ -n "$tpod" ]; then
-    [ "$tpod" = "$sess" ]
-  else
-    [ "$(pod_json_get "$GROUP" session)" = "$sess" ]
-  fi
+  return 0
 }
 
 if [ "$("$T" show-options -t "=${sess}:" -qv @full_auto 2>/dev/null)" = "1" ]; then

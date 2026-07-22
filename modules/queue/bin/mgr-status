@@ -11,12 +11,13 @@ POD_BIN="$(cd "$(dirname "$0")/../../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh
 . "$POD_BIN/_mgr-runtime.sh"                       # mgr_current_pod, mgr_pod_auto_state
 
 INBOX_ROOT="$POD_INBOX"
-QUEUE_DIR="$POD_INBOX/_queue"
 WORKERS_PATH="$POD_STATE/workers.json"
 LOG_PATH="$POD_STATE/log.jsonl"
-DISPATCHED="$POD_STATE/dispatched"
 
 CURRENT_POD="$(mgr_current_pod)"
+CURRENT_POD="$(mgr_pod_component "$CURRENT_POD")" || exit 2
+QUEUE_DIR="$(mgr_queue_dir "$CURRENT_POD")"
+DISPATCHED="$(mgr_dispatched_dir "$CURRENT_POD")"
 AUTO_STATE="$(mgr_pod_auto_state "$CURRENT_POD")"   # on | off | none (non-pod)
 
 EMIT_JSON=0
@@ -32,8 +33,10 @@ if [ "$EMIT_JSON" -eq 1 ]; then
     --slurpfile workers "$WORKERS_PATH" \
     --argjson queue "$(ls "$QUEUE_DIR" 2>/dev/null | jq -R . | jq -s . || echo '[]')" \
     --arg inbox "$INBOX_ROOT" \
+    --arg pod "$CURRENT_POD" \
     --argjson fa "$fa" \
-    '{workers: $workers[0].workers, queue_files: $queue, inbox_root: $inbox, full_auto: $fa}'
+    '{workers: [$workers[0].workers[] | select(.tmux_session==$pod)],
+      queue_files: $queue, inbox_root: $inbox, pod:$pod, full_auto: $fa}'
   exit 0
 fi
 
@@ -45,8 +48,9 @@ esac
 echo "================================================================"
 echo " WORKERS"
 echo "================================================================"
-jq -r '.workers[] | "  " + (.tmux_window // "?") + " " + (.color // "") + " [" + (.label // "—") + "] " + .status + (if .current_task_id then " · " + .current_task_id else "" end) + (if .started_at then " · started " + .started_at else "" end)' "$WORKERS_PATH" 2>/dev/null
-[ "$(jq '.workers | length' "$WORKERS_PATH" 2>/dev/null || echo 0)" -eq 0 ] && echo "  (no workers registered — spawn one via the + button or pod-add-worker)"
+jq -r --arg pod "$CURRENT_POD" '.workers[] | select(.tmux_session==$pod)
+  | "  " + (.tmux_window // "?") + " " + (.color // "") + " [" + (.label // "—") + "] " + .status + (if .current_task_id then " · " + .current_task_id else "" end) + (if .started_at then " · started " + .started_at else "" end)' "$WORKERS_PATH" 2>/dev/null
+[ "$(jq --arg pod "$CURRENT_POD" '[.workers[]|select(.tmux_session==$pod)] | length' "$WORKERS_PATH" 2>/dev/null || echo 0)" -eq 0 ] && echo "  (no workers registered — spawn one via the + button or pod-add-worker)"
 
 echo ""
 echo "================================================================"
@@ -72,7 +76,8 @@ echo "================================================================"
 echo " RECENT COMPLETIONS (last 10)"
 echo "================================================================"
 if [ -s "$LOG_PATH" ]; then
-  grep '"event":"completed"' "$LOG_PATH" | tail -10 | jq -r '"  \(.ts)  \(.task_id)"'
+  jq -c --arg pod "$CURRENT_POD" 'select(.event=="completed" and .pod==$pod)' \
+    "$LOG_PATH" 2>/dev/null | tail -10 | jq -r '"  \(.ts)  \(.task_id)"'
 else
   echo "  (no completions logged yet)"
 fi

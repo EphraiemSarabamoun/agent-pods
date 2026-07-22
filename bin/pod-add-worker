@@ -26,28 +26,55 @@ while read -r code name _; do
 done < "$POD_PALETTE"
 [ "${#COLORS[@]}" -gt 0 ] || { COLORS=(colour18 colour52 colour22 colour58); NAMES=(ocean maroon forest olive); }
 
-AGENT=""; MODEL=""; EFFORT=""; CMD=""; LABEL=""; win=""
+AGENT=""; MODEL=""; EFFORT=""; CMD=""; LABEL=""; win=""; SPAWNED=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --agent)  AGENT="${2:-}";  shift 2 ;;
-    --model)  MODEL="${2:-}";  shift 2 ;;
-    --effort) EFFORT="${2:-}"; shift 2 ;;
-    --cmd)    CMD="${2:-}";    shift 2 ;;
-    --label)  LABEL="${2:-}";  shift 2 ;;
+    --agent|--model|--effort|--cmd|--label)
+      [ "$#" -ge 2 ] || { echo "pod-add-worker: $1 requires a value" >&2; exit 2; }
+      case "$1" in
+        --agent)  AGENT="$2" ;;
+        --model)  MODEL="$2" ;;
+        --effort) EFFORT="$2" ;;
+        --cmd)    CMD="$2" ;;
+        --label)  LABEL="$2" ;;
+      esac
+      shift 2 ;;
     @*)       win="$1";        shift   ;;
     *)        shift                    ;;
   esac
 done
 
-# default agent/command: a bare spawn with nothing chosen is a plain shell worker —
-# the universal floor that works with no AI agent installed.
-[ -n "$AGENT" ] || AGENT="generic-shell"
-[ -n "$CMD" ]   || CMD="${SHELL:-/bin/bash}"
+# A pane keeps the POD_SESSION value it inherited at birth, so a renamed pod can leave
+# it stale. When a live calling pane exists, its session is authoritative.
+if [ -n "${TMUX_PANE:-}" ]; then
+  live_session="$("$T" display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null || true)"
+  [ -n "$live_session" ] && S="$live_session"
+fi
 
-# provider-backend policy (Bedrock/Vertex inherit, POD_CLAUDE_MODEL pin): resolve
-# the requested model through the adapter so the stamped @model and card match
-# what the seat actually serves ("" = inherits the environment's model).
+# A bare spawn is a generic shell. A named agent, however, must be launched through
+# its adapter unless the caller explicitly supplied --cmd; otherwise the old behavior
+# created a shell and falsely stamped it as Claude/Codex/etc.
+[ -n "$AGENT" ] || AGENT="generic-shell"
+
+# Resolve through the current local discovery result. A stale saved choice becomes
+# "inherit" instead of replaying a model the agent no longer advertises.
 MODEL="$("$POD_ADAPTER" resolve-model "$AGENT" "$MODEL" 2>/dev/null || printf '%s' "$MODEL")"
+EFFORT="$("$POD_ADAPTER" resolve-effort "$AGENT" "$MODEL" "$EFFORT" 2>/dev/null || printf '')"
+
+if [ -z "$CMD" ]; then
+  if [ "$AGENT" = "generic-shell" ]; then
+    CMD="${SHELL:-/bin/bash}"
+  else
+    launch_args=(launch "$AGENT")
+    [ -n "$MODEL" ]  && launch_args+=(--model "$MODEL")
+    [ -n "$EFFORT" ] && launch_args+=(--effort "$EFFORT")
+    CMD="$("$POD_ADAPTER" "${launch_args[@]}" 2>/dev/null || true)"
+    [ -n "$CMD" ] || {
+      echo "pod-add-worker: adapter could not launch agent '$AGENT'" >&2
+      exit 1
+    }
+  fi
+fi
 
 if [ -z "$win" ]; then
   # Tab name = a random friendly human name; the real identity (agent · model · effort)
@@ -66,6 +93,7 @@ if [ -z "$win" ]; then
           | awk '{print $NF}' | sort -n | tail -1)"
   [ -n "$last" ] && tgt="${S}:${last}" || tgt="$S"
   win="$("$T" new-window -a -t "$tgt" -n "$wname" -P -F '#{window_id}' "cd \"\$HOME\" && $launch")"
+  [ -n "$win" ] && SPAWNED=1
 fi
 
 # EMPTY-TARGET FOOTGUN guard: with no window id, every `setw -t "$win"` below would
@@ -128,41 +156,28 @@ nd="$("$POD_ADAPTER" field "$AGENT" native_delivery 2>/dev/null || echo false)"
 if [ "$nd" = "true" ]; then "$T" set-option -w -t "$win" @pod_native_delivery 1
 else "$T" set-option -w -t "$win" @pod_native_delivery 0; fi
 
-# register in workers.json (idempotent), fcntl-locked + atomic so concurrent +/✕/sync
-# writers can't drop each other's entries. All three writers lock the SAME .lock file.
+# Register through the shared locked/atomic registry mutator so +, ✕, queue, MCP and
+# rename operations all serialize on the same lock and use the same upsert semantics.
 wname="$("$T" display-message -p -t "$win" '#{window_name}')"
 HOSTSHORT="$(hostname -s 2>/dev/null || echo localhost)"
 WORKERS="$POD_STATE/workers.json"
-python3 - "$win" "$S" "$cname" "$wname" "$agent_pretty" "$MODEL" "$HOSTSHORT" "$EFFORT" "$card" "$AGENT" "$WORKERS" <<'PY'
-import json, sys, os, fcntl, datetime, tempfile
-wid, sess, color, label, agent_type, model, host, effort, card, agent_id, p = sys.argv[1:12]
-os.makedirs(os.path.dirname(p), exist_ok=True)
-lf = open(p + ".lock", "w")
-fcntl.flock(lf, fcntl.LOCK_EX)
-try:
-    try:
-        d = json.load(open(p))
-        if not isinstance(d, dict):
-            d = {"workers": []}
-    except Exception:
-        d = {"workers": []}
-    ws = d.setdefault("workers", [])
-    if not any(w.get("tmux_window") == wid for w in ws):
-        ws.append({
-            "window_id": None, "dispatch_mode": "tmux", "tmux_session": sess,
-            "tmux_window": wid, "color": color, "agent_type": agent_type, "agent_id": agent_id,
-            "model": model, "effort": effort, "card": card, "label": label, "host": host,
-            "status": "idle", "current_task_id": None, "started_at": None,
-            "registered_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        })
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".workers.", suffix=".tmp")
-        with os.fdopen(fd, "w") as tf:
-            json.dump(d, tf, indent=2)
-        os.replace(tmp, p)
-finally:
-    fcntl.flock(lf, fcntl.LOCK_UN)
-    lf.close()
+worker_json="$(python3 - "$win" "$S" "$cname" "$wname" "$agent_pretty" "$MODEL" "$HOSTSHORT" "$EFFORT" "$card" "$AGENT" <<'PY'
+import datetime, json, sys
+wid, sess, color, label, agent_type, model, host, effort, card, agent_id = sys.argv[1:11]
+print(json.dumps({
+    "window_id": None, "dispatch_mode": "tmux", "tmux_session": sess,
+    "tmux_window": wid, "color": color, "agent_type": agent_type, "agent_id": agent_id,
+    "model": model, "effort": effort, "card": card, "label": label, "host": host,
+    "status": "idle", "current_task_id": None, "started_at": None,
+    "registered_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}))
 PY
+)"
+if ! "$POD_BIN/pod-workers-json" --path "$WORKERS" register "$worker_json"; then
+  echo "pod-add-worker: registry update failed for $S/$win" >&2
+  [ "$SPAWNED" = "1" ] && "$T" kill-window -t "$win" 2>/dev/null || true
+  exit 1
+fi
 # Identity + registration complete -> release the bootstrap gate (the spawned
 # window's pod-worker-bootstrap is polling for this stamp before exec'ing the agent).
 "$T" set-option -w -t "$win" @pod_registered 1 2>/dev/null || true

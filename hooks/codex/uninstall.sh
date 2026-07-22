@@ -2,8 +2,7 @@
 # uninstall.sh — remove the agent-pods Codex hook entries that install.sh added,
 # leaving every other hook intact. Atomic write; the prior file is backed up first.
 #
-# A hook command is "ours" if it references this repo's bin ($POD_BIN) OR names one of
-# the pod hook scripts (pod-codex-state / pod-mail-check / pod-awareness / pod-brief).
+# A hook command is "ours" only when it exactly matches a command this installer emits.
 # After removing matching entries, any hook group left with zero hooks is dropped, and
 # any event left with zero groups is dropped — so we don't leave empty scaffolding.
 #
@@ -16,7 +15,9 @@ POD_BIN="$(cd "$(dirname "$0")/../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
 HOOKS_FILE=""; RESTORE=0; BACKUP=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --hooks-file) HOOKS_FILE="${2:-}"; shift 2 ;;
+    --hooks-file)
+      [ "$#" -ge 2 ] || { echo "uninstall.sh: --hooks-file requires a value" >&2; exit 2; }
+      HOOKS_FILE="$2"; shift 2 ;;
     --restore)    RESTORE=1; shift
                   case "${1:-}" in --*|"") ;; *) BACKUP="$1"; shift ;; esac ;;
     -h|--help)
@@ -24,7 +25,7 @@ while [ "$#" -gt 0 ]; do
       echo "  Removes agent-pods Codex hook entries from hooks.json,"
       echo "  or restores it from a .pod-bak.* backup with --restore."
       exit 0 ;;
-    *) shift ;;
+    *) echo "uninstall.sh: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
 if [ -z "$HOOKS_FILE" ]; then
@@ -44,7 +45,7 @@ if [ "$RESTORE" = "1" ]; then
     BACKUP="$(ls -1t "${HOOKS_FILE}".pod-bak.* 2>/dev/null | head -1)"
   fi
   [ -n "$BACKUP" ] && [ -f "$BACKUP" ] || { echo "uninstall.sh: no backup found to restore" >&2; exit 1; }
-  cp "$BACKUP" "$HOOKS_FILE"
+  cp -p "$BACKUP" "$HOOKS_FILE"
   echo "uninstall.sh: restored $HOOKS_FILE from $BACKUP"
   exit 0
 fi
@@ -52,14 +53,25 @@ fi
 [ -f "$HOOKS_FILE" ] || { echo "uninstall.sh: $HOOKS_FILE does not exist — nothing to remove."; exit 0; }
 
 python3 - "$HOOKS_FILE" "$POD_BIN" <<'PY'
-import json, os, sys, tempfile, datetime
+import json, os, shutil, sys, tempfile, datetime
 
 hooks_path, pod_bin = sys.argv[1], sys.argv[2]
 
-# A command is one of ours if it points at this repo's bin or names a pod hook script.
-NEEDLES = (pod_bin, "pod-codex-state", "pod-mail-check", "pod-awareness", "pod-brief")
+awareness = os.path.join(os.path.dirname(pod_bin), "hooks", "claude-code", "pod-awareness.sh")
+OWNED = {
+    'bash "%s/pod-codex-state" idle' % pod_bin,
+    'bash "%s" codex' % awareness,
+    'bash "%s/pod-codex-state" busy user_prompt_submit' % pod_bin,
+    'bash "%s/pod-mail-check" UserPromptSubmit' % pod_bin,
+    'bash "%s/pod-codex-state" wait' % pod_bin,
+    'bash "%s/pod-codex-state" busy' % pod_bin,
+    'bash "%s/pod-codex-state" idle stop --json' % pod_bin,
+    'bash "%s/pod-brief" boot' % pod_bin,
+    'bash "%s/pod-brief" refresh UserPromptSubmit' % pod_bin,
+    'bash "%s/pod-primer"' % pod_bin,
+}
 def is_ours(cmd):
-    return isinstance(cmd, str) and any(n in cmd for n in NEEDLES)
+    return isinstance(cmd, str) and cmd in OWNED
 
 try:
     with open(hooks_path) as f:
@@ -110,11 +122,10 @@ if not removed:
     sys.exit(0)
 
 # back up the existing file before rewriting
-stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 backup = "%s.pod-bak.%s" % (hooks_path, stamp)
 try:
-    with open(hooks_path) as src, open(backup, "w") as dst:
-        dst.write(src.read())
+    shutil.copy2(hooks_path, backup)
     print("uninstall.sh: backed up %s -> %s" % (hooks_path, backup))
 except Exception as e:
     print("uninstall.sh: backup failed (%s); aborting" % e, file=sys.stderr)
@@ -123,6 +134,7 @@ except Exception as e:
 # atomic write
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(hooks_path)), prefix=".hooks.", suffix=".tmp")
 try:
+    os.fchmod(fd, os.stat(hooks_path).st_mode & 0o777)
     with os.fdopen(fd, "w") as tf:
         json.dump(data, tf, indent=2)
         tf.write("\n")

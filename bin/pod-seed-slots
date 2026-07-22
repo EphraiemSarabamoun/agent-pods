@@ -8,10 +8,12 @@
 #
 # Every entry is resolved through pod-adapter, so the agent/model/effort/cmd/label
 # are guaranteed consistent with the catalog (no hand-maintained launch strings).
+import fcntl
 import json
 import os
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 POD_BIN = os.environ.get("POD_BIN") or HERE
@@ -61,7 +63,9 @@ def _slot(agent_id, m):
     if not cmd:
         return None
     label = adapter("card", agent_id, *cargs) or agent_id
-    return {"label": label, "agent": agent_id, "model": m, "effort": eff, "cmd": cmd}
+    # Persist the semantic choice, not a command containing today's provider model
+    # id. The quick picker resolves it through pod-adapter when it opens/clicks.
+    return {"label": label, "agent": agent_id, "model": m, "effort": eff}
 
 
 def build_slots():
@@ -96,9 +100,28 @@ def main():
         sys.stderr.write("pod-seed-slots: catalog produced no available agents; "
                          "nothing seeded.\n")
         return 1
-    os.makedirs(os.path.dirname(SLOTS), exist_ok=True)
-    with open(SLOTS, "w") as f:
-        json.dump({"title": "Spawn agent (0-9)", "slots": slots}, f, indent=2)
+    directory = os.path.dirname(SLOTS) or "."
+    os.makedirs(directory, exist_ok=True)
+    # Share the settings menu's lock. Recheck after acquiring it because another
+    # seeder/menu may have completed while model discovery was running.
+    with open(SLOTS + ".lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.path.exists(SLOTS) and not force:
+            return 0
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".slots.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as output:
+                json.dump({"title": "Spawn agent (0-9)", "slots": slots}, output, indent=2)
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(tmp, SLOTS)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     sys.stderr.write(f"pod-seed-slots: wrote {len(slots)} default slots to {SLOTS}\n")
     return 0
 

@@ -86,10 +86,10 @@ if [ "${1:-}" = "--deliver-pending" ]; then
 fi
 
 # --- caller (awarder) + pod session, pinned to the CALLING pane --------------
-pane="${TMUX_PANE:-}"; S=""; AWARDER=""; AWIDX=""
+pane="${TMUX_PANE:-}"; S=""; _awarder=""; _award_idx=""
 if [ -n "$pane" ]; then
   meta="$("$T" display-message -p -t "$pane" '#{session_name}|#{window_name}|#{window_index}' 2>/dev/null)"
-  IFS='|' read -r S AWARDER AWIDX <<<"$meta"
+  IFS='|' read -r S _awarder _award_idx <<<"$meta"
 fi
 [ -n "$S" ]       || S="${POD_SESSION:-$POD_SESSION_PREFIX}"
 STARLOG="$(pod_dir_for "$S")/stars.log"
@@ -98,7 +98,9 @@ STARLOG="$(pod_dir_for "$S")/stars.log"
 worker=""; n=1; revoke=0; board=0; dumplog=0; reason=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    -n|--count)        n="${2:-1}"; shift 2 ;;
+    -n|--count)
+      [ "$#" -ge 2 ] || { echo "pod-star: $1 requires a value" >&2; exit 2; }
+      n="$2"; shift 2 ;;
     --revoke|--remove) revoke=1; shift ;;
     -b|--board)        board=1; shift ;;
     --log)             dumplog=1; shift ;;
@@ -118,7 +120,7 @@ fi
 # --- board view (default when no worker given) -------------------------------
 if [ "$board" = "1" ] || [ -z "$worker" ]; then
   rows="$("$T" list-windows -t "=$S" -F '#{window_index}|#{window_id}|#{window_name}' 2>/dev/null \
-    | while IFS='|' read -r idx wid wname; do
+    | while IFS='|' read -r _idx wid wname; do
         s="$("$T" show-options -wqv -t "$wid" @stars 2>/dev/null)"
         { [ -n "$s" ] && [ "$s" -gt 0 ] 2>/dev/null; } || continue
         # one glyph per star, capped so a 20-star worker does not wrap the terminal

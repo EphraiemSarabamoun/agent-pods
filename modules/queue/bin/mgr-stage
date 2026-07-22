@@ -35,6 +35,10 @@ if [ $# -lt 1 ]; then
 fi
 
 TEMPLATE_NAME="$1"; shift
+pod_valid_component "$TEMPLATE_NAME" || {
+  echo "ERROR: invalid template name '$TEMPLATE_NAME'" >&2
+  exit 2
+}
 # Look in the inbox's _templates first (user-customized), then fall back to the queue
 # module's shipped templates — so the queue works out of the box with no seeding step.
 TEMPLATE_PATH="${TEMPLATES_DIR}/${TEMPLATE_NAME}.tpl.txt"
@@ -45,11 +49,20 @@ TASK_ID=""
 KV_PAIRS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --id) TASK_ID="$2"; shift 2 ;;
+    --id)
+      [ "$#" -ge 2 ] || { echo "ERROR: --id requires a value" >&2; exit 2; }
+      TASK_ID="$2"; shift 2 ;;
     *=*)  KV_PAIRS+=("$1"); shift ;;
     *)    echo "ERROR: unrecognized arg: $1 (expected --id <id> or key=value)" >&2; exit 2 ;;
   esac
 done
+
+if [ -n "$TASK_ID" ]; then
+  pod_valid_component "$TASK_ID" || {
+    echo "ERROR: invalid task id '$TASK_ID' (use letters, digits, dot, underscore or hyphen)" >&2
+    exit 2
+  }
+fi
 
 # Auto-allocate task-id if not given: <template-name>-<N> where N is the next
 # free integer. The mkdir IS the claim — it fails if another stager already took
@@ -69,11 +82,10 @@ if [ -z "$TASK_ID" ]; then
 else
   TASK_DIR="${INBOX_ROOT}/${TASK_ID}"
   PROMPT_PATH="${TASK_DIR}/prompt.txt"
-  [ -d "$TASK_DIR" ] && [ -f "$PROMPT_PATH" ] && {
-    echo "ERROR: ${PROMPT_PATH} already exists. Refuse to overwrite. Use a different --id or rm the dir first." >&2
+  if ! mkdir "$TASK_DIR" 2>/dev/null; then
+    echo "ERROR: ${TASK_DIR} already exists. Refuse to reuse task state. Use a different --id or remove the old task dir first." >&2
     exit 1
-  }
-  mkdir -p "$TASK_DIR"
+  fi
 fi
 
 # Read template into memory; substitute {{task_id}} and every key=value pair.
@@ -106,7 +118,7 @@ done
 # Warn (but don't fail) if any {{key}} placeholders remain unsubstituted.
 remaining_keys=$(printf '%s' "$content" | grep -oE '\{\{[a-zA-Z0-9_]+\}\}' | sort -u || true)
 if [ -n "$remaining_keys" ]; then
-  echo "WARN: unsubstituted placeholders in ${PROMPT_PATH}: $(echo $remaining_keys | tr '\n' ' ')" >&2
+  echo "WARN: unsubstituted placeholders in ${PROMPT_PATH}: $(printf '%s\n' "$remaining_keys" | tr '\n' ' ')" >&2
 fi
 
 printf '%s' "$content" > "$PROMPT_PATH"

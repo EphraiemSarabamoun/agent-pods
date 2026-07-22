@@ -33,6 +33,16 @@ new="${1:-}"
 
 old="$("$T" show-options -t "$new" -qv @pod_name 2>/dev/null)"
 
+# Session names are also filesystem namespace keys. Refuse non-canonical names so
+# distinct tmux names can never collapse onto the same comms directory.
+if ! pod_valid_component "$new"; then
+  if [ -n "$old" ] && [ "$old" != "$new" ]; then
+    "$T" rename-session -t "$new" "$old" 2>/dev/null || true
+  fi
+  echo "pod-sync-pod-name: refused invalid pod name '$new'" >&2
+  exit 1
+fi
+
 # always leave the stamp + env consistent with the live name
 "$T" set-option -t "$new" @pod_name "$new" 2>/dev/null || true
 "$T" set-environment -t "$new" POD_SESSION "$new" 2>/dev/null || true
@@ -47,17 +57,79 @@ if [ -d "$od" ] && [ ! -e "$nd" ]; then
   mv "$od" "$nd" 2>/dev/null || true
 fi
 
-# 2. primary-pod record follows too (only if it pointed at the OLD name; a secondary
-# pod's rename must not clobber the primary's record)
-if [ -f "$STATE_GRP" ] && command -v jq >/dev/null 2>&1; then
-  if [ "$(jq -r '.session // empty' "$STATE_GRP" 2>/dev/null)" = "$old" ]; then
-    tmp="${STATE_GRP}.tmp.$$"
-    if jq --arg n "$new" '.session = $n | .pod = $n' "$STATE_GRP" > "$tmp" 2>/dev/null; then
-      mv "$tmp" "$STATE_GRP"
-    else
-      rm -f "$tmp"
+# Queue ownership follows the pod too. Each namespace contains globally-unique task
+# ids, so a target collision is left untouched and reported instead of overwritten.
+migrate_namespace_dir() {
+  local src="$1" dst="$2" entry base
+  [ -d "$src" ] || return 0
+  mkdir -p "$dst" 2>/dev/null || return 1
+  for entry in "$src"/*; do
+    [ -e "$entry" ] || continue
+    base="${entry##*/}"
+    if [ -e "$dst/$base" ]; then
+      echo "pod-sync-pod-name: queue-state collision left at $entry" >&2
+      continue
     fi
+    mv "$entry" "$dst/$base" 2>/dev/null || true
+  done
+  rmdir "$src" 2>/dev/null || true
+}
+migrate_namespace_dir "$POD_INBOX/_queue/$old" "$POD_INBOX/_queue/$new"
+migrate_namespace_dir "$POD_STATE/dispatched/$old" "$POD_STATE/dispatched/$new"
+migrate_namespace_dir "$POD_STATE/completed/$old" "$POD_STATE/completed/$new"
+
+mkdir -p "$POD_STATE/pod-tasks" 2>/dev/null || true
+for suffix in .json .wait-completions; do
+  src="$POD_STATE/pod-tasks/${old}${suffix}"
+  dst="$POD_STATE/pod-tasks/${new}${suffix}"
+  [ -e "$src" ] || continue
+  if [ -e "$dst" ]; then
+    echo "pod-sync-pod-name: task-loop state collision left at $src" >&2
+  else
+    mv "$src" "$dst" 2>/dev/null || true
   fi
+done
+
+# Registry rows follow a rename too; otherwise queue/MCP cross-pod checks would
+# correctly reject every worker because its row retained the old session name.
+if [ -f "$POD_STATE/workers.json" ]; then
+  "$POD_BIN/pod-workers-json" --path "$POD_STATE/workers.json" rename-session "$old" "$new" \
+    >/dev/null 2>&1 || true
+fi
+
+# 2. primary-pod record follows too (only if it pointed at the OLD name; a secondary
+# pod's rename must not clobber the primary's record). Share pod-launch's lock and use
+# an atomic replace so a concurrent launch/rename cannot tear or lose the JSON.
+if [ -f "$STATE_GRP" ]; then
+python3 - "$STATE_GRP" "$old" "$new" <<'PY'
+import fcntl, json, os, sys, tempfile
+path, old, new = sys.argv[1:4]
+with open(path + ".lock", "a+") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        with open(path) as source:
+            data = json.load(source)
+        if not isinstance(data, dict) or data.get("session") != old:
+            raise SystemExit(0)
+        data["session"] = new
+        data["pod"] = new
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmux-group.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as output:
+                json.dump(data, output, indent=2)
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+PY
 fi
 
 # 3. announce in the pod's own feed (same format pod-kill-worker uses)

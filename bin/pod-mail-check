@@ -13,7 +13,6 @@
 # reaching the model's context.
 set -u
 EVENT="${1:-UserPromptSubmit}"
-command -v tmux >/dev/null 2>&1 || exit 0
 [ -n "${TMUX:-}" ] || exit 0
 pane="${TMUX_PANE:-}"; [ -n "$pane" ] || exit 0
 # per-pod mailbox (the helper resolves THIS pod from $TMUX_PANE). Guarded so a
@@ -21,6 +20,7 @@ pane="${TMUX_PANE:-}"; [ -n "$pane" ] || exit 0
 POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || exit 0
 . "$POD_BIN/_pod-common.sh" 2>/dev/null || exit 0
 T="$POD_TMUX"
+[ -x "$T" ] || command -v "$T" >/dev/null 2>&1 || exit 0
 me_id="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
 # Command sandbox: socket blocked -> self-identify from the spawn-time environment.
 # The mailbox is already a FILE, so with identity restored the whole drain+deliver

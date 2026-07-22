@@ -36,7 +36,7 @@
 # vs worker — how to run/participate in the pod) plus your own operator memory, and a
 # proactive notice if the seat is in a command sandbox. Set POD_PRIMER=0 to silence it.
 # Your durable, cross-session operator memory (append with `pod-remember "<lesson>"`,
-# injected into every seat you spawn afterward) lives here by default:
+# injected into every hook-enabled Claude Code/Codex seat you spawn afterward) lives here by default:
 # POD_PRIMER=1
 # POD_OPERATOR_MEMORY="$HOME/.config/pod/operator-memory.md"
 
@@ -46,11 +46,13 @@
 # POD_STAR_AWARDER="the human"
 
 # --- state location ------------------------------------------------------------
-# All ephemeral state lives under one tmp tree. Override the base if /tmp is unusual.
-# On a MULTI-USER host, namespace it per user — the default is shared across users,
-# which is a collision risk (registry, comms, and mirror files would interleave):
-#   POD_TMP="/tmp/pod-$USER"
-# POD_TMP=/tmp/pod
+# All ephemeral state lives under one private per-user tmp tree. Override the base if
+# the system temp directory is unusual. Default: ${TMPDIR:-/tmp}/agent-pods-$(id -u).
+# POD_TMP=
+
+# Model choices are not configured here. Each adapter queries the locally installed
+# agent/provider and falls back to that agent's inherited default when discovery is
+# unavailable. `pod-adapter refresh <agent>` forces an immediate re-query.
 
 # --- tmux binary ---------------------------------------------------------------
 # Empty -> resolved on PATH. Set an absolute path only if tmux isn't on PATH for
@@ -60,6 +62,10 @@
 # --- foreign-state poller (state dot for agents without lifecycle hooks) --------
 # POD_FOREIGN_INTERVAL=3     # seconds between idle/busy polls
 # POD_FOREIGN_TRIM=8         # bottom lines (input box + footer) excluded from the hash
+
+# AI poll-agents normally receive a safe idle-time nudge plus Enter. Set this to 0
+# to leave every nudge as editable text for a human to submit.
+# POD_DELIVER_SUBMIT=1
 
 # --- one-line agent summaries (@summary, shown in pod / pod-summary / the journal) --
 # pod-summarize turns an agent's recent output into a one-line "what it's doing"
@@ -79,8 +85,13 @@
 # POD_AUTO_ANIM=1
 # POD_AUTO_HOLD=4
 
+# Detached manager-only pods may still be doing real work, so launch-time cleanup is
+# off by default. Opt in only if you explicitly want those sessions killed/reused.
+# POD_REAP_ABANDONED=0
+
 # --- queue module (modules/queue) ------------------------------------------------
 # When a mgr-poll sweep finds the queue fully drained, workers whose task just
 # completed are closed (window killed + deregistered) so finished agents don't pile
 # up idle. Guarded (never the manager, never a busy/wait window). 0 disables.
 # MGR_REAP_FINISHED_WORKERS=1
+# POD_TASK_WAIT_POLL=3       # autonomous-loop watcher interval, seconds

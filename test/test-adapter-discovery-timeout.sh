@@ -20,18 +20,13 @@ label = "Slow"
 
 [launch]
 base_cmd = "sh"
-model_arg = []
+model_arg = ["--model", "{model}"]
 effort_arg = []
 
 [discover]
 models_cmd = "$TMP/slow-discovery"
 timeout_s = 0.2
 
-[[models]]
-slug = "fallback"
-label = "Fallback"
-model = "fallback"
-efforts = []
 EOF
 
 SECONDS=0
@@ -39,7 +34,7 @@ output="$(POD_ADAPTERS_DIR="$TMP/adapters" POD_USER_ADAPTERS="$TMP/missing" \
   POD_STATE="$TMP/state" "$REPO/bin/pod-adapter" models slow)"
 elapsed="$SECONDS"
 
-[ "$output" = $'fallback\tFallback' ] || {
+[ "$output" = $'inherit\tAgent default (inherited)' ] || {
   echo "unexpected fallback output: $output" >&2
   exit 1
 }

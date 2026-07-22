@@ -16,7 +16,7 @@ CONSTRAINTS:
 {{constraints}}
 
 COMPLETION PROTOCOL:
-- Write your structured result to your task directory: $POD_INBOX/{{task_id}}/result.json (default $POD_INBOX is /tmp/pod/inbox) with this shape:
+- Write your structured result to your task directory: $POD_INBOX/{{task_id}}/result.json with this shape:
 {{output_schema}}
 - Include `recommendation`, `reasoning`, and `evidence` (file:line citations or URLs).
 - As your ABSOLUTE LAST action: `touch $POD_INBOX/{{task_id}}/DONE`.

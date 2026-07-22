@@ -57,7 +57,9 @@ if ! mkdir "$lock" 2>/dev/null; then
   lock_mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
   age=$(( $(date +%s) - lock_mtime ))
   [ "$age" -gt 600 ] 2>/dev/null || exit 0
-  rmdir "$lock" 2>/dev/null || rm -rf "$lock" 2>/dev/null
+  stale="$lock.stale.$$"
+  mv "$lock" "$stale" 2>/dev/null || exit 0
+  rmdir "$stale" 2>/dev/null || true
   mkdir "$lock" 2>/dev/null || exit 0
 fi
 trap 'rmdir "$lock" 2>/dev/null' EXIT INT TERM
@@ -132,14 +134,57 @@ summary="$(printf '%s' "$ctx" | sed -n 's/.*<!-- *STATUS: *"\(.*\)" *-->.*/\1/p'
 # Watchdog-killed after $POD_SUMMARIZE_TIMEOUT so a wedged command can't hold the lock.
 if [ -z "$summary" ] && [ -n "${POD_SUMMARIZE_CMD:-}" ]; then
   outf="$D/$safe.out.$$"
-  ( printf '%s' "$ctx" | env -u TMUX -u TMUX_PANE sh -c "$POD_SUMMARIZE_CMD" > "$outf" 2>>"$LOG" ) &
-  cpid=$!
-  ( sleep "${POD_SUMMARIZE_TIMEOUT:-45}"; kill "$cpid" 2>/dev/null ) 2>/dev/null &
-  wpid=$!
-  wait "$cpid" 2>/dev/null
-  kill "$wpid" 2>/dev/null
+  ctxf="$D/$safe.ctx.$$"
+  printf '%s' "$ctx" > "$ctxf"
+  # Python owns a dedicated process group and performs a bounded TERM/KILL wait.
+  # Redirect to files rather than pipes so a detached descendant cannot keep a pipe
+  # open and wedge communicate() after the timeout.
+  python3 - "$ctxf" "$outf" "$LOG" "${POD_SUMMARIZE_TIMEOUT:-45}" "$POD_SUMMARIZE_CMD" <<'PY' || true
+import os
+import signal
+import subprocess
+import sys
+
+context_path, output_path, log_path, timeout_text, command = sys.argv[1:]
+try:
+    timeout = max(0.1, float(timeout_text))
+except ValueError:
+    timeout = 45.0
+env = os.environ.copy()
+env.pop("TMUX", None)
+env.pop("TMUX_PANE", None)
+with open(context_path, "rb") as source, open(output_path, "wb") as output, open(log_path, "ab") as errors:
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        executable="/bin/sh",
+        stdin=source,
+        stdout=output,
+        stderr=errors,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+PY
   summary="$(tr -d '\r' < "$outf" 2>/dev/null | grep -v '^[[:space:]]*$' | head -1)"
-  rm -f "$outf" 2>/dev/null
+  rm -f "$ctxf" "$outf" 2>/dev/null
 fi
 
 # sanitize: single line, trim, hard-cap ~72 chars (one short sentence — a glanceable

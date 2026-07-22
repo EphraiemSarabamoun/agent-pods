@@ -23,8 +23,8 @@ content_patterns  = ['(?i)codex', 'model_reasoning_effort']
 reject_content    = []
 
 [defaults]
-model             = "gpt-5.5"
-effort            = "high"
+model             = "inherit"
+effort            = ""
 # Scrape "<model> <effort> · <cwd>" from the footer (e.g. "gpt-5.5 high · ~"). Group 1
 # = model (must contain a digit), group 2 = effort (a known level). Only used when the
 # poller owns the window (the poll-floor override); with hooks wired the poller backs off.
@@ -36,31 +36,16 @@ installer       = "hooks/codex/install.sh"
 native_delivery = true
 state_source    = "hooks"
 
-# Live discovery via the OpenAI REST API. The Codex CLI has no list-models command,
-# but GET /v1/models does — pod-discover-api calls it (filtered to gpt/codex/o-series)
-# with an OPENAI_API_KEY from the env, ~/.codex/auth.json (if you logged in with a
-# key), or one captured by `pod-login codex`. A ChatGPT *subscription* Codex login has
-# no platform API key and can't list models, so discovery falls back to the curated
-# [[models]] below. Reasoning effort isn't enumerable from any API, so it's declared.
+# Query the locally installed Codex /model menu. This reflects the account/provider
+# Codex is actually using, unlike the public platform API model index.
 [discover]
-auth         = "openai"
-models_cmd   = "pod-discover-api openai"
-models_regex = '^(\S+)\s+-\s+(.+)$'
-timeout_s    = 12
+models_cmd    = "pod-discover-local-agent codex"
+models_format = "tsv"
+timeout_s     = 35
+ttl_s         = 300
 efforts = [
   { slug = "high",    label = "high",    value = "high" },
   { slug = "medium",  label = "medium",  value = "medium" },
   { slug = "low",     label = "low",     value = "low" },
   { slug = "minimal", label = "minimal", value = "minimal" },
-]
-
-# Fallback / offline list (also the right answer for ChatGPT-subscription users).
-[[models]]
-slug  = "gpt5.5"
-label = "GPT-5.5"
-model = "gpt-5.5"
-efforts = [
-  { slug = "high",   label = "high",   value = "high" },
-  { slug = "medium", label = "medium", value = "medium" },
-  { slug = "low",    label = "low",    value = "low" },
 ]

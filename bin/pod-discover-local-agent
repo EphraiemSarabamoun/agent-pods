@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Discover the models offered by an installed interactive coding agent.
+
+Claude Code and Codex do not expose a non-interactive ``list-models`` command, but
+their local ``/model`` menus are the authoritative view of the models available to
+the currently authenticated account/provider.  This helper opens the installed CLI
+in a disposable tmux server, captures that menu, cancels without selecting anything,
+and emits tab-separated ``slug, label, launch value`` rows for pod-adapter.
+
+No model names live in this file.  If the local agent cannot be queried safely, the
+command exits non-zero and pod-adapter offers only its inherited-default choice.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+
+ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+NUMBERED = re.compile(r"^\s*(?:[❯›>]\s*)?(\d+)\.\s+(.+?)\s*$")
+
+
+def _clean(text: str) -> str:
+    return ANSI.sub("", text).replace("\r", "")
+
+
+def _slug(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip().lower()).strip("-")
+    return value or "model"
+
+
+def _numbered_rows(screen: str) -> list[str]:
+    rows: list[str] = []
+    for line in _clean(screen).splitlines():
+        match = NUMBERED.match(line)
+        if match:
+            rows.append(match.group(2).strip())
+    return rows
+
+
+def parse_claude(screen: str) -> list[tuple[str, str, str]]:
+    """Parse Claude Code's local ``Select model`` menu."""
+    if "Select model" not in _clean(screen):
+        return []
+    out: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for body in _numbered_rows(screen):
+        parts = re.split(r"\s{2,}", body, maxsplit=1)
+        choice = parts[0].replace("✔", "").strip()
+        detail = parts[1].strip() if len(parts) > 1 else ""
+        choice = re.sub(r"\s*\(recommended\)\s*", "", choice, flags=re.I).strip()
+        if not choice:
+            continue
+        slug = _slug(choice)
+        if slug in seen:
+            continue
+        seen.add(slug)
+        resolved = detail.split(" · ", 1)[0].replace("✔", "").strip()
+        if choice.lower() == "default":
+            model = ""
+            label = "Default" + (f" ({resolved})" if resolved else "")
+        else:
+            # The left-hand menu value is the alias Claude Code itself accepts via
+            # --model. Preserve it rather than inventing a first-party/provider ID.
+            model = choice
+            label = resolved or choice
+        out.append((slug, label, model))
+    return out
+
+
+def parse_codex(screen: str) -> list[tuple[str, str, str]]:
+    """Parse Codex's local ``Select Model and Effort`` menu."""
+    if "Select Model and Effort" not in _clean(screen):
+        return []
+    out: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for body in _numbered_rows(screen):
+        left = re.split(r"\s{2,}", body, maxsplit=1)[0]
+        model = re.sub(r"\s*\(current\)\s*$", "", left, flags=re.I).strip()
+        if not model or any(ch.isspace() for ch in model):
+            continue
+        slug = _slug(model)
+        if slug in seen:
+            continue
+        seen.add(slug)
+        out.append((slug, model, model))
+    return out
+
+
+PARSERS = {"claude-code": parse_claude, "codex": parse_codex}
+
+
+def _capture(tmux: str, socket: str) -> str:
+    result = subprocess.run(
+        [tmux, "-L", socket, "capture-pane", "-p", "-t", "models:0.0", "-S", "-200"],
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+    return result.stdout if result.returncode == 0 else ""
+
+
+def _wait_for(tmux: str, socket: str, predicate, deadline: float) -> str:
+    while time.monotonic() < deadline:
+        screen = _capture(tmux, socket)
+        if predicate(screen):
+            return screen
+        time.sleep(0.2)
+    return ""
+
+
+def discover(agent: str, timeout: float) -> str:
+    tmux = shutil.which("tmux")
+    binary = shutil.which("claude" if agent == "claude-code" else "codex")
+    if not tmux or not binary:
+        raise RuntimeError("required local executable is not installed")
+
+    socket = f"agent-pods-models-{os.getuid()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    env = dict(os.environ)
+    # Never let discovery masquerade as a seat in the caller's real pod.
+    for key in ("TMUX", "TMUX_PANE", "POD_SESSION", "POD_WINDOW", "POD_ROLE", "POD_AGENT_ID"):
+        env.pop(key, None)
+    home = str(Path.home())
+    if agent == "claude-code":
+        command = shlex.join([binary, "--safe-mode"])
+
+        def ready(screen):
+            cleaned = _clean(screen)
+            return "Claude Code v" in cleaned and "Safe mode:" in cleaned
+
+        def menu(screen):
+            return "Select model" in _clean(screen)
+    else:
+        # Suppress the startup updater prompt. We also explicitly abort below if an
+        # older Codex build ignores this config key, so discovery can never accept it.
+        command = shlex.join(
+            [binary, "-c", "check_for_update_on_startup=false", "--no-alt-screen"]
+        )
+        def ready(screen):
+            cleaned = _clean(screen)
+            return "OpenAI Codex" in cleaned and "/model to change" in cleaned
+
+        def menu(screen):
+            return "Select Model and Effort" in _clean(screen)
+
+    deadline = time.monotonic() + timeout
+    try:
+        started = subprocess.run(
+            [tmux, "-L", socket, "new-session", "-d", "-s", "models", "-x", "160", "-y", "60",
+             "-c", home, f"exec {command}"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if started.returncode != 0:
+            raise RuntimeError(started.stderr.strip() or "could not start disposable tmux session")
+        screen = _wait_for(tmux, socket, ready, deadline)
+        if not screen or "Update available!" in _clean(screen):
+            raise RuntimeError("agent did not reach a safe input prompt")
+        subprocess.run(
+            [tmux, "-L", socket, "send-keys", "-t", "models:0.0", "-l", "/model"],
+            env=env,
+            timeout=2,
+            check=True,
+        )
+        # As with task dispatch, give the TUI one render tick to register literal
+        # input before submitting it. Without this gap Codex can leave `/model`
+        # visibly buffered even though tmux accepted the following Enter.
+        time.sleep(0.15)
+        # Codex 0.144.x treats a literal C-m differently inside its TUI; tmux's
+        # named Enter key opens the menu reliably. Claude Code accepts C-m and
+        # retaining it avoids changing its already-proven discovery path.
+        submit_key = "Enter" if agent == "codex" else "C-m"
+        subprocess.run(
+            [tmux, "-L", socket, "send-keys", "-t", "models:0.0", submit_key],
+            env=env,
+            timeout=2,
+            check=True,
+        )
+        screen = _wait_for(tmux, socket, menu, deadline)
+        if not screen:
+            raise RuntimeError("local /model menu did not appear")
+        # Escape first, then tear down the disposable server. No default or
+        # session-only selection is ever confirmed.
+        subprocess.run(
+            [tmux, "-L", socket, "send-keys", "-t", "models:0.0", "Escape"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        return screen
+    finally:
+        subprocess.run(
+            [tmux, "-L", socket, "kill-server"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("agent", choices=sorted(PARSERS))
+    parser.add_argument("--screen", help="parse a captured screen instead of launching (tests/debug)")
+    parser.add_argument("--timeout", type=float, default=25.0)
+    args = parser.parse_args()
+    try:
+        screen = Path(args.screen).read_text() if args.screen else discover(args.agent, args.timeout)
+        rows = PARSERS[args.agent](screen)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        print(f"pod-discover-local-agent: {exc}", file=sys.stderr)
+        return 1
+    if not rows:
+        print("pod-discover-local-agent: local model menu yielded no models", file=sys.stderr)
+        return 1
+    for slug, label, model in rows:
+        print(f"{slug}\t{label}\t{model}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

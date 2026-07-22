@@ -154,6 +154,12 @@ def notification(ts, text):
     head = f" {DIM}{ts}{R} " if ts else " "
     return f"{head}{A}{body}{R}"
 def render_one(raw):
+    # channel.log is shared input, not terminal bytecode. Strip every C0/C1 control
+    # except tab before the renderer adds its own ANSI. splitlines already removed
+    # newlines, so ESC/OSC and carriage-return spoofing cannot reach the terminal.
+    raw = re.sub(r'\x1b\][^\x07]*(?:\x07|\x1b\\)', '', raw)  # OSC (title, links, clipboard)
+    raw = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', raw)       # CSI
+    raw = re.sub(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]', '', raw)
     m = LINE.match(raw)
     if m and m.group(2) == "full-auto switch":      # legacy arrow lines -> notification
         ts, _, disp, body = m.groups()

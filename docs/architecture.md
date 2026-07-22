@@ -28,20 +28,24 @@ calls them. You can delete `modules/` entirely and the deck still runs.
 
 ## State layout
 
-Everything ephemeral lives under one tmp tree, `$POD_TMP` (default `/tmp/pod/`), split
+Everything ephemeral lives under one private per-user tmp tree, `$POD_TMP` (default
+`${TMPDIR:-/tmp}/agent-pods-$(id -u)`), split
 into three subdirs:
 
 ```
-/tmp/pod/
+$POD_TMP/
 ├── state/                      # the deck's own runtime state
 │   ├── workers.json            # the worker registry (one entry per worker window)
 │   ├── workers.json.lock       # the shared fcntl lock every registry writer takes
 │   ├── tmux_group.json         # which pod is PRIMARY + its manager window + host + tmux bin
+│   ├── dispatched/<pod>/       # this pod's in-flight queue records
+│   ├── completed/<pod>/        # durable watcher completion markers
+│   ├── pod-tasks/<pod>.json    # autonomous-loop state
 │   ├── pod-foreign-state.pid   # singleton guard for the state poller
 │   └── *.log                   # pod-add-worker etc. log here (never to stdout)
 ├── inbox/                      # the queue module's task dirs (only if you use the queue)
 │   ├── _templates/             # <name>.tpl.txt prompt templates
-│   ├── _queue/                 # queued task metadata
+│   ├── _queue/<pod>/           # this pod's queued task metadata
 │   └── <task-id>/              # prompt.txt, result.json, DONE
 └── comms/                      # pod-comms, PER POD
     └── <pod>/                  # <pod> = the tmux session (pod) name
@@ -64,17 +68,17 @@ spawn/kill/sync can't drop each other's entries.
 default, so running several pods at once doesn't confuse them. Only the primary writes
 it; a second pod that launches while a live primary exists leaves it alone.
 
-`pod-task.json` (also under `state/`) is the autonomous loop's state — `pod` (which pod
-owns the loop) and `status` (`running`/`paused`/`done`). It's a host-global singleton
-scoped by its `pod` field so one pod's loop can't terminate another's. See
+`pod-tasks/<pod>.json` (also under `state/`) is each autonomous loop's state — `pod`
+(the owner) and `status` (`running`/`paused`/`done`). Per-pod files let several loops
+run without overwriting each other. See
 [autonomy.md](autonomy.md).
 
 The `comms/<pod>/` subtree is deleted when the pod closes (a `session-closed` hook runs
 `pod-mail-gc`) and swept on launch if a same-named pod died without cleanup. It is keyed
-by the pod's *name*, so a pod **rename** moves the whole subtree: the `session-renamed`
-hook runs `pod-sync-pod-name`, which `mv`s `comms/<old>` to `comms/<new>`, updates the
-primary record if it pointed at the old name, and re-stamps the `@pod_name` session option
-(so the pod's chat history follows the rename instead of orphaning).
+by the pod's *name*, as are its queue, dispatch, completion, and loop-state namespaces.
+A pod **rename** migrates all of them: the `session-renamed` hook runs
+`pod-sync-pod-name`, updates the primary record if it pointed at the old name, and
+re-stamps `@pod_name` so neither chat history nor schedulable work is orphaned.
 
 ## How the pieces fit
 
@@ -148,8 +152,8 @@ a worker; you dispatch by hand with `mgr-dispatch --tmux-window <@id>`. In AUTO 
 manager may run the autonomous loop (see [autonomy.md](autonomy.md)). The gate **fails
 OPEN** for non-pods: `mgr_pod_auto_state` returns `none` for any session without `@is_pod`,
 and callers treat `none` as unrestricted, so a plain tmux session or a headless seat never
-notices the switch exists. The switch's transitions also notify the manager (an mbox note,
-or a typed resume trigger when a paused loop for this pod is found).
+notices the switch exists. The switch's transitions also notify the manager through its
+mailbox, including a resume instruction when a paused loop for this pod is found.
 
 ## The docked summary pane (mission control)
 
@@ -184,7 +188,7 @@ just the orientation.
 **Launch and lifecycle**
 - `pod-launch`: create-or-attach a pod, stamp its identity (`@is_pod` / `@full_auto` / `@pod_name`), build the status strip + all key bindings + hooks, spawn the manager (window 0), and start the foreign-state poller. The integration hub — read it to see the full bind-key and hook set.
 - `pod-city`: pick a random free city name for a new pod (overridable via `POD_CITIES`).
-- `pod-shell`: the default manager seat, a shell that prints the `pod` roster.
+- `pod-shell`: the manager fallback when none of the preferred agents is installed; it prints the `pod` roster.
 - `pod`: print the roster of agents sharing this session.
 - `pod-sync-pod-name`: the `session-renamed` hook — migrate a renamed pod's comms subtree + primary record + `@pod_name`.
 
@@ -221,8 +225,9 @@ just the orientation.
 - `pod-star-menu`: the `⭐` button / `C-a *` one-click star picker.
 
 **Hooks**
-- `hooks/claude-code/install.sh`: wire Claude Code's lifecycle events to `pod-state` / `pod-mail-check` / `pod-work` / `pod-awareness.sh`. The only agent with hooks shipped.
-- `hooks/claude-code/pod-awareness.sh`: SessionStart roster plus stamp the window as that agent.
+- `hooks/claude-code/install.sh`: wire Claude Code lifecycle state, mail, work, awareness, journal, and primer events.
+- `hooks/codex/install.sh`: wire the equivalent Codex lifecycle events.
+- `hooks/claude-code/pod-awareness.sh`: shared startup roster plus agent stamp.
 
 When in doubt, [gotchas.md](gotchas.md) is the file to read before touching the status
 strip or anything that targets tmux windows.

@@ -38,9 +38,9 @@ esac
 src="$("$T" display-message -p -t "=${sess}:" '#{window_id}' 2>/dev/null)"
 [ -n "$src" ] || exit 0
 
-# debug tap: `touch /tmp/pod-drag-debug` to trace what the binding expanded.
-[ -e /tmp/pod-drag-debug ] && \
-  printf '%s mode=%s sess=%s src=%s tgt=%s\n' "$(date +%T)" "$mode" "$sess" "$src" "$tgt" >> /tmp/pod-drag-debug.log
+# debug tap: `touch "$POD_STATE/pod-drag-debug"` to trace what the binding expanded.
+[ -e "$POD_STATE/pod-drag-debug" ] && \
+  printf '%s mode=%s sess=%s src=%s tgt=%s\n' "$(date +%T)" "$mode" "$sess" "$src" "$tgt" >> "$POD_STATE/pod-drag-debug.log"
 
 # keyboard path: tgt = index-neighbour of src, no wrap (list-windows output is
 # index-ordered; awk picks the line before/after src)
@@ -62,11 +62,16 @@ mgr="$("$T" display-message -p -t "=${sess}:" '#{@pod_manager_win}' 2>/dev/null)
 # DROP (don't queue) events arriving while one is in flight. Stale-steal after 3s so
 # a killed holder can't wedge dragging forever. mtime read works on BSD (stat -f %m)
 # and GNU (stat -c %Y) coreutils.
-lock="${TMPDIR:-/tmp}/pod-drag-reorder.${sess//[!A-Za-z0-9._-]/_}.lock"
+mkdir -p "$POD_STATE/locks" 2>/dev/null || exit 0
+lock="$POD_STATE/locks/pod-drag-reorder.${sess//[!A-Za-z0-9._-]/_}.lock"
 if ! mkdir "$lock" 2>/dev/null; then
   mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
   age=$(( $(date +%s) - mtime ))
-  { [ "$age" -gt 3 ] && rm -rf "$lock" 2>/dev/null && mkdir "$lock" 2>/dev/null; } || exit 0
+  [ "$age" -gt 3 ] 2>/dev/null || exit 0
+  stale="$lock.stale.$$"
+  mv "$lock" "$stale" 2>/dev/null || exit 0
+  rmdir "$stale" 2>/dev/null || true
+  mkdir "$lock" 2>/dev/null || exit 0
 fi
 trap 'rmdir "$lock" 2>/dev/null' EXIT
 

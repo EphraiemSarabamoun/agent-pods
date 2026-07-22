@@ -14,9 +14,10 @@ Subcommands:
   detect <pane_cmd> [content]   id of the adapter that claims this pane (priority order)
   launch <id> [--model S] [--effort S]   the launch command (space-joined argv tokens)
   card <id> [--model S] [--effort S] [--suffix S]   "Label · Model · effort · suffix"
-  models <id>                   "slug\tlabel" per model (LIVE if the adapter has a
-                                [discover] block; static [[models]] otherwise)
+  models <id>                   "slug\tlabel" per locally discovered model, plus
+                                the inherited agent-default choice
   efforts <id> <model_slug>     "slug\tlabel" per effort
+  resolve-effort <id> <model> [requested]  validate a saved effort, else empty
   refresh [id]                  re-query live discovery, busting the cache
   field <id> <key>              one scalar from [agent]/[launch]/[lifecycle]/[defaults]
   dump [--json]                 the whole resolved catalog (debug)
@@ -30,9 +31,11 @@ import json
 import os
 import re
 import signal
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 try:
@@ -40,6 +43,9 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     sys.stderr.write("pod-adapter: needs Python 3.11+ (tomllib). Found %s\n" % sys.version.split()[0])
     sys.exit(3)
+
+
+SAFE_ADAPTER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def _repo_root():
@@ -79,6 +85,9 @@ def load_adapters():
             aid = ag.get("id")
             if not aid:
                 continue
+            if not isinstance(aid, str) or not SAFE_ADAPTER_ID.fullmatch(aid):
+                sys.stderr.write("pod-adapter: skipping %s (unsafe agent id %r)\n" % (path, aid))
+                continue
             data["_path"] = path
             data["_id"] = aid
             out[aid] = data
@@ -87,13 +96,11 @@ def load_adapters():
 
 # ---------------------------------------------------------------------------------
 # Live model discovery. An adapter may carry an optional [discover] block that names
-# a command which lists the agent's CURRENTLY served models (e.g. cursor-agent
-# --list-models, or `ollama list` for an openclaw/ollama backend). When present and
-# the command succeeds, its output REPLACES the static [[models]] list — so the "+"
-# picker always shows what the device actually serves, not a hand-maintained list
-# that drifts. Agents whose CLI exposes no enumeration (claude-code, codex) simply
-# omit [discover] and keep their curated [[models]]; that static list is also the
-# fallback whenever a discovery command times out, errors, or returns nothing.
+# a command which lists the agent's CURRENTLY served models (e.g. its local /model
+# menu or cursor-agent --list-models). Discovery is authoritative:
+# static [[models]] entries may annotate discovered rows but never assert availability.
+# If discovery is absent or fails, the picker exposes only "Agent default (inherited)"
+# and launches without a model flag.
 #
 # Only the models VARY across releases and machines, so only they are discovered.
 # Effort ladders are a stable per-agent vocabulary that no CLI enumerates, so they
@@ -104,32 +111,71 @@ def load_adapters():
 # menu stays snappy; `pod-adapter refresh [id]` busts the cache and re-queries.
 
 def _state_dir():
-    return os.environ.get("POD_STATE") or os.path.join(
-        os.environ.get("POD_TMP", "/tmp/pod"), "state")
+    runtime = os.environ.get("POD_TMP") or os.path.join(
+        os.environ.get("TMPDIR", "/tmp"), "agent-pods-%d" % os.getuid())
+    return os.environ.get("POD_STATE") or os.path.join(runtime, "state")
 
 
 def _discover_cache_path(aid):
     return os.path.join(_state_dir(), "discover", "%s.json" % aid)
 
 
+def _write_discovery_cache(path, models):
+    """Write discovery results atomically with private runtime permissions."""
+    parent = os.path.dirname(path)
+    tmp = ""
+    try:
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        os.chmod(parent, 0o700)
+        fd, tmp = tempfile.mkstemp(prefix=".models-", suffix=".json", dir=parent)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"ts": int(time.time()), "models": models}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _valid_discovery_rows(value):
+    """Validate cached/discovered rows before they influence launch arguments."""
+    if not isinstance(value, list):
+        return None
+    rows = []
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        slug, label, model = item.get("slug"), item.get("label"), item.get("model")
+        if not all(isinstance(part, str) for part in (slug, label, model)) or not slug:
+            return None
+        rows.append({"slug": slug, "label": label or slug, "model": model})
+    return rows or None
+
+
 def _run_discovery(disc):
     """Run the adapter's discovery command and parse its model list.
 
-    Returns [{slug, label, model}, ...] or None on any failure (so callers fall
-    back to the static [[models]]). The command runs via the shell, so a user can
-    point it at a remote backend ("ssh gpu-box ollama list") in their adapter.
+    Returns [{slug, label, model}, ...] or None on any failure (so callers expose
+    only the inherited agent default). The command runs via the shell, so a user can
+    invoke the same agent wrapper on another machine when needed.
     """
     cmd = disc.get("models_cmd")
     if not cmd:
         return None
+    fmt = disc.get("models_format", "regex")
     # default regex: "<id>" optionally followed by " - <label>"
     regex = disc.get("models_regex") or r"^(\S+)(?:\s+-\s+(.+))?$"
     try:
         pat = re.compile(regex)
     except re.error:
         return None
-    # Prepend POD_BIN to PATH so a models_cmd can call sibling helpers (e.g.
-    # "pod-discover-api anthropic") even before bin/ is symlinked onto the user's PATH.
+    # Prepend POD_BIN to PATH so models_cmd can call sibling discovery helpers even
+    # before bin/ is symlinked onto the user's PATH.
     env = dict(os.environ)
     podbin = os.environ.get("POD_BIN") or os.path.dirname(os.path.abspath(__file__))
     env["PATH"] = podbin + os.pathsep + env.get("PATH", "")
@@ -148,7 +194,20 @@ def _run_discovery(disc):
                 os.killpg(p.pid, signal.SIGKILL)
             except (OSError, AttributeError):
                 p.kill()
-            p.communicate()
+            # A grandchild can escape the process group while retaining the pipe
+            # descriptors. Never let that escaped process make discovery hang after
+            # our advertised timeout: reap briefly, then close our pipe ends.
+            try:
+                p.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                for stream in (p.stdout, p.stderr):
+                    if stream is not None:
+                        stream.close()
+                try:
+                    p.kill()
+                    p.wait(timeout=1)
+                except (OSError, subprocess.SubprocessError):
+                    pass
             return None
         r = subprocess.CompletedProcess(cmd, p.returncode, stdout, stderr)
     except (subprocess.SubprocessError, OSError, ValueError):
@@ -157,18 +216,27 @@ def _run_discovery(disc):
         return None
     out, seen = [], set()
     for line in r.stdout.splitlines():
-        m = pat.search(line)
-        if not m:
-            continue                       # header / blank / noise lines just skip
-        mid = (m.group(1) or "").strip()
+        if fmt == "tsv":
+            fields = line.split("\t")
+            if len(fields) < 2:
+                continue
+            mid = fields[0].strip()
+            label = fields[1].strip() or mid
+            model = fields[2].strip() if len(fields) >= 3 else mid
+        else:
+            m = pat.search(line)
+            if not m:
+                continue                   # header / blank / noise lines just skip
+            mid = (m.group(1) or "").strip()
+            label = mid
+            if m.lastindex and m.lastindex >= 2 and m.group(2):
+                label = m.group(2).strip()
+            model = mid
         if not mid or mid in seen:
             continue
         seen.add(mid)
-        label = mid
-        if m.lastindex and m.lastindex >= 2 and m.group(2):
-            label = m.group(2).strip()
-        out.append({"slug": mid, "label": label, "model": mid})
-    return out or None
+        out.append({"slug": mid, "label": label, "model": model})
+    return _valid_discovery_rows(out)
 
 
 def _cached_discovery(aid, disc):
@@ -177,17 +245,16 @@ def _cached_discovery(aid, disc):
         age = time.time() - os.stat(path).st_mtime
         if age < float(disc.get("ttl_s", 21600)):
             with open(path) as f:
-                return json.load(f).get("models") or None
-    except (OSError, ValueError):
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                cached = _valid_discovery_rows(payload.get("models"))
+                if cached:
+                    return cached
+    except (OSError, TypeError, ValueError):
         pass
     models = _run_discovery(disc)
     if models:
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
-                json.dump({"ts": int(time.time()), "models": models}, f)
-        except OSError:
-            pass
+        _write_discovery_cache(path, models)
     return models
 
 
@@ -208,28 +275,45 @@ def _merge_discovered(discovered, static, disc):
     return out
 
 
+def _inherited_model(adapter=None):
+    disc = (adapter or {}).get("discover") or {}
+    return {"slug": "inherit", "model": "",
+            "label": "Agent default (inherited)",
+            "efforts": disc.get("efforts", []) or []}
+
+
 def models_of(adapter):
-    """The effective model list: live (cached) when [discover] is set and works,
-    static otherwise. Memoized on the adapter dict so a single invocation queries
-    at most once."""
+    """The effective model list, derived from the local agent when possible.
+
+    A static entry can improve the label/effort metadata of a model that discovery
+    actually returned, but it never creates an available model by itself.
+    """
     if "_models" in adapter:
         return adapter["_models"]
+    if not (adapter.get("launch", {}).get("model_arg") or []):
+        adapter["_models"] = []
+        return []
     static = adapter.get("models", []) or []
     disc = adapter.get("discover") or {}
-    resolved = static
+    resolved = [_inherited_model(adapter)]
     if disc.get("models_cmd"):
         discovered = _cached_discovery(adapter.get("_id", ""), disc)
         if discovered:
-            resolved = _merge_discovered(discovered, static, disc)
+            resolved += [m for m in _merge_discovered(discovered, static, disc)
+                         if m.get("slug") != "inherit"]
     adapter["_models"] = resolved
     return resolved
 
 
 def _model(adapter, slug):
+    # Inheritance is a built-in semantic choice and never needs a potentially slow
+    # discovery query just to prove it exists.
+    if slug == "inherit" and (adapter.get("launch", {}).get("model_arg") or []):
+        return _inherited_model(adapter)
     for m in models_of(adapter):
         if m.get("slug") == slug:
             return m
-    # tolerant: match by the substituted model value too (e.g. "claude-opus-4-8")
+    # tolerant: match by the substituted provider model value too.
     for m in models_of(adapter):
         if slug and m.get("model") == slug:
             return m
@@ -241,34 +325,6 @@ def _effort(model, slug):
         if e.get("slug") == slug:
             return e
     return None
-
-
-# Claude Code behind a provider backend (Amazon Bedrock, Google Vertex AI, or an
-# enterprise gateway) rejects Anthropic's first-party model IDs — Bedrock wants
-# provider-prefixed IDs like "us.anthropic.claude-...". The claude-code catalog is
-# first-party, so injecting its IDs onto --model 400s every spawn the moment
-# CLAUDE_CODE_USE_BEDROCK / CLAUDE_CODE_USE_VERTEX is set. Resolution order:
-#   1. POD_CLAUDE_MODEL set -> that value, passed to --model verbatim (any
-#      provider's ID format works; it never goes through the catalog).
-#   2. provider env present -> NO model flag at all: the seat inherits the
-#      environment's own model (ANTHROPIC_MODEL or the gateway default) — the same
-#      config that already makes bare `claude` work on that machine.
-#   3. neither              -> the requested slug/value, exactly as before.
-_PROVIDER_ENV = ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
-                 "CLAUDE_CODE_USE_FOUNDRY")
-
-
-def _resolve_model_request(aid, requested):
-    """(verbatim, requested) — verbatim bypasses the catalog; requested == ""
-    means inject no model flag. Agents other than claude-code pass through."""
-    if aid != "claude-code":
-        return (None, requested)
-    pinned = os.environ.get("POD_CLAUDE_MODEL", "").strip()
-    if pinned:
-        return (pinned, None)
-    if any(os.environ.get(v, "").strip() for v in _PROVIDER_ENV):
-        return (None, "")
-    return (None, requested)
 
 
 def cmd_list(adapters, args):
@@ -316,20 +372,24 @@ def cmd_detect(adapters, args):
         if rejected(aid):
             continue
         if not con_pats(aid) and cmd_pats(aid) and any(re.search(p, pane_cmd) for p in cmd_pats(aid)):
-            print(aid); return
+            print(aid)
+            return
     for aid in order:
         if rejected(aid):
             continue
         if content and con_pats(aid) and any(re.search(p, content) for p in con_pats(aid)):
-            print(aid); return
+            print(aid)
+            return
     for aid in order:
         if rejected(aid):
             continue
         if cmd_pats(aid) and any(re.search(p, pane_cmd) for p in cmd_pats(aid)):
-            print(aid); return
+            print(aid)
+            return
     for aid in order:
         if ".*" in (det(aid).get("pane_cmd_patterns", []) or []):
-            print(aid); return
+            print(aid)
+            return
     sys.exit(1)
 
 
@@ -338,24 +398,26 @@ def cmd_launch(adapters, args):
     if not a:
         sys.exit(1)
     launch = a.get("launch", {})
-    tokens = [launch.get("base_cmd", "")]
-    verbatim, requested = _resolve_model_request(args.id, args.model)
+    base = launch.get("base_cmd", "")
+    if base == "${SHELL:-/bin/bash}":
+        base = os.environ.get("SHELL") or "/bin/bash"
+    tokens = [base]
+    requested = args.model
     m = _model(a, requested) if requested else None
-    if verbatim:
-        for t in launch.get("model_arg", []) or []:
-            tokens.append(t.replace("{model}", verbatim))
-    elif m and m.get("model"):
+    if requested and not m:
+        sys.exit(1)
+    if m and m.get("model"):
         for t in launch.get("model_arg", []) or []:
             tokens.append(t.replace("{model}", m["model"]))
     # effort is a CLI-side knob independent of which backend serves the model —
-    # under a pin or inherit there's no catalog model, so borrow the default
-    # model's ladder rather than dropping --effort.
     em = m or _model(a, a.get("defaults", {}).get("model", ""))
     e = _effort(em, args.effort) if (em and args.effort) else None
+    if args.effort and not e:
+        sys.exit(1)
     if e and e.get("value"):
         for t in launch.get("effort_arg", []) or []:
             tokens.append(t.replace("{effort}", e["value"]))
-    print(" ".join(t for t in tokens if t))
+    print(shlex.join([t for t in tokens if t]))
 
 
 def cmd_card(adapters, args):
@@ -364,20 +426,18 @@ def cmd_card(adapters, args):
     model_label = ""
     effort_label = ""
     if a:
-        verbatim, requested = _resolve_model_request(args.id, args.model)
+        requested = args.model
         m = _model(a, requested) if requested else None
-        if verbatim:
-            model_label = verbatim
-        elif m:
+        if m:
             model_label = m.get("label", requested or "")
         elif requested:
             model_label = requested
         em = m or _model(a, a.get("defaults", {}).get("model", ""))
+        if em is None:
+            em = next(iter(models_of(a)), None)
         e = _effort(em, args.effort) if args.effort else None
         if e:
             effort_label = e.get("label", args.effort or "")
-        elif args.effort:
-            effort_label = args.effort
     else:
         model_label = args.model or ""
         effort_label = args.effort or ""
@@ -394,11 +454,33 @@ def cmd_models(adapters, args):
 
 
 def cmd_resolve_model(adapters, args):
-    """Effective model for a spawn, after the provider-backend policy: prints the
-    pinned POD_CLAUDE_MODEL, nothing (inherit) under a provider backend, else the
-    requested value unchanged. Shell callers use this to stamp honest @model."""
-    verbatim, requested = _resolve_model_request(args.id, args.requested)
-    print(verbatim or requested or "")
+    """Return a currently available semantic model slug.
+
+    A removed/stale saved choice resolves to ``inherit`` instead of replaying a model
+    the local agent no longer advertises.
+    """
+    a = adapters.get(args.id)
+    if not a:
+        sys.exit(1)
+    if not (a.get("launch", {}).get("model_arg") or []):
+        print("")
+        return
+    requested = args.requested or a.get("defaults", {}).get("model", "inherit")
+    if requested == "inherit":
+        print("inherit")
+        return
+    print(requested if _model(a, requested) else "inherit")
+
+
+def cmd_resolve_effort(adapters, args):
+    """Return a currently valid semantic effort slug, or an empty string."""
+    a = adapters.get(args.id)
+    if not a:
+        sys.exit(1)
+    model_slug = args.model or a.get("defaults", {}).get("model", "inherit")
+    model = _model(a, model_slug)
+    requested = args.requested or a.get("defaults", {}).get("effort", "")
+    print(requested if requested and _effort(model, requested) else "")
 
 
 def cmd_refresh(adapters, args):
@@ -406,6 +488,7 @@ def cmd_refresh(adapters, args):
     that has a [discover] block. Prints "<id>\\t<n> models" per refreshed agent."""
     ids = [args.id] if args.id else list(adapters)
     any_disc = False
+    failed = False
     for aid in ids:
         a = adapters.get(aid)
         if not a:
@@ -421,18 +504,17 @@ def cmd_refresh(adapters, args):
         models = _run_discovery(disc)
         if models:
             path = _discover_cache_path(aid)
-            try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w") as f:
-                    json.dump({"ts": int(time.time()), "models": models}, f)
-            except OSError:
-                pass
+            _write_discovery_cache(path, models)
             print("%s\t%d models" % (aid, len(models)))
         else:
-            sys.stderr.write("%s: discovery returned nothing; static fallback in use\n" % aid)
+            failed = True
+            sys.stderr.write("%s: discovery returned nothing; inherited default only\n" % aid)
     if not any_disc:
         sys.stderr.write("pod-adapter refresh: no adapter with a [discover] block%s\n"
                          % ("" if not args.id else " for '%s'" % args.id))
+        sys.exit(1)
+    if failed:
+        sys.exit(1)
 
 
 def cmd_efforts(adapters, args):
@@ -472,16 +554,39 @@ def main():
     p = argparse.ArgumentParser(prog="pod-adapter")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("list"); s.add_argument("--available", action="store_true")
-    s = sub.add_parser("detect"); s.add_argument("pane_cmd"); s.add_argument("content", nargs="?", default="")
-    s = sub.add_parser("launch"); s.add_argument("id"); s.add_argument("--model", default=""); s.add_argument("--effort", default="")
-    s = sub.add_parser("card"); s.add_argument("id"); s.add_argument("--model", default=""); s.add_argument("--effort", default=""); s.add_argument("--suffix", default="")
-    s = sub.add_parser("models"); s.add_argument("id")
-    s = sub.add_parser("resolve-model"); s.add_argument("id"); s.add_argument("requested", nargs="?", default="")
-    s = sub.add_parser("efforts"); s.add_argument("id"); s.add_argument("model")
-    s = sub.add_parser("refresh"); s.add_argument("id", nargs="?", default="")
-    s = sub.add_parser("field"); s.add_argument("id"); s.add_argument("key")
-    s = sub.add_parser("dump"); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("list")
+    s.add_argument("--available", action="store_true")
+    s = sub.add_parser("detect")
+    s.add_argument("pane_cmd")
+    s.add_argument("content", nargs="?", default="")
+    s = sub.add_parser("launch")
+    s.add_argument("id")
+    s.add_argument("--model", default="")
+    s.add_argument("--effort", default="")
+    s = sub.add_parser("card")
+    s.add_argument("id")
+    s.add_argument("--model", default="")
+    s.add_argument("--effort", default="")
+    s.add_argument("--suffix", default="")
+    s = sub.add_parser("models")
+    s.add_argument("id")
+    s = sub.add_parser("resolve-model")
+    s.add_argument("id")
+    s.add_argument("requested", nargs="?", default="")
+    s = sub.add_parser("resolve-effort")
+    s.add_argument("id")
+    s.add_argument("model", nargs="?", default="")
+    s.add_argument("requested", nargs="?", default="")
+    s = sub.add_parser("efforts")
+    s.add_argument("id")
+    s.add_argument("model")
+    s = sub.add_parser("refresh")
+    s.add_argument("id", nargs="?", default="")
+    s = sub.add_parser("field")
+    s.add_argument("id")
+    s.add_argument("key")
+    s = sub.add_parser("dump")
+    s.add_argument("--json", action="store_true")
 
     args = p.parse_args()
     adapters = load_adapters()
@@ -489,6 +594,7 @@ def main():
         "list": cmd_list, "detect": cmd_detect, "launch": cmd_launch, "card": cmd_card,
         "models": cmd_models, "efforts": cmd_efforts, "field": cmd_field, "dump": cmd_dump,
         "refresh": cmd_refresh, "resolve-model": cmd_resolve_model,
+        "resolve-effort": cmd_resolve_effort,
     }[args.cmd](adapters, args)
 
 

@@ -33,10 +33,11 @@ unset __pp __d
 POD_TMUX="${POD_TMUX:-$(command -v tmux 2>/dev/null || echo tmux)}"
 
 # tmp roots: one tree, three subdirs.
-#   state/  workers.json, tmux_group.json, log.jsonl, *.pid, *.log
-#   inbox/  <task-id>/{prompt.txt,result.json,DONE}, _queue/, _templates/  (queue module)
+#   state/  workers.json, tmux_group.json, log.jsonl, dispatched/<pod>/,
+#           completed/<pod>/, *.pid, *.log
+#   inbox/  <task-id>/{prompt.txt,result.json,DONE}, _queue/<pod>/, _templates/
 #   comms/  <pod>/{channel.log, <wid>.mbox, <wid>.read, work/}            (pod-comms)
-POD_TMP="${POD_TMP:-/tmp/pod}"
+POD_TMP="${POD_TMP:-${TMPDIR:-/tmp}/agent-pods-$(/usr/bin/id -u)}"
 
 # deck identity (agent-agnostic: the manager defaults to a plain shell, not any one agent).
 POD_SESSION_PREFIX="${POD_SESSION_PREFIX:-pod}"
@@ -76,6 +77,55 @@ fi
 POD_STATE="${POD_STATE:-$POD_TMP/state}"
 POD_INBOX="${POD_INBOX:-$POD_TMP/inbox}"
 POD_COMMS="${POD_COMMS:-$POD_TMP/comms}"
+
+# Runtime state contains prompts, results, mail and pane metadata. Keep the default
+# user-scoped and private, and reject a pre-planted symlink before creating anything.
+# Explicit POD_TMP overrides remain supported but receive the same ownership/mode
+# checks because recursive cleanup assumes this is an application-owned root.
+if [ -z "$POD_TMP" ] || [ "$POD_TMP" = "/" ] || { [ -n "${HOME:-}" ] && [ "$POD_TMP" = "$HOME" ]; }; then
+  printf 'pod: refusing broad runtime root: %s\n' "$POD_TMP" >&2
+  return 1 2>/dev/null || exit 1
+fi
+if [ -L "$POD_TMP" ]; then
+  printf 'pod: refusing symlink runtime root: %s\n' "$POD_TMP" >&2
+  return 1 2>/dev/null || exit 1
+fi
+/bin/mkdir -p "$POD_TMP" "$POD_STATE" "$POD_INBOX" "$POD_COMMS" 2>/dev/null || {
+  printf 'pod: cannot create runtime root: %s\n' "$POD_TMP" >&2
+  return 1 2>/dev/null || exit 1
+}
+# Resolve every created directory physically, then require the three application
+# trees to remain strict descendants of POD_TMP. This keeps cleanup commands safe
+# even when a config accidentally supplies `..` or a symlinked subdirectory.
+__pod_tmp_real="$(cd -P "$POD_TMP" 2>/dev/null && pwd)"
+__pod_state_real="$(cd -P "$POD_STATE" 2>/dev/null && pwd)"
+__pod_inbox_real="$(cd -P "$POD_INBOX" 2>/dev/null && pwd)"
+__pod_comms_real="$(cd -P "$POD_COMMS" 2>/dev/null && pwd)"
+for __pod_child in "$__pod_state_real" "$__pod_inbox_real" "$__pod_comms_real"; do
+  case "$__pod_child" in
+    "$__pod_tmp_real"/*) ;;
+    *)
+      printf 'pod: runtime directories must live below %s (got %s)\n' "$__pod_tmp_real" "$__pod_child" >&2
+      unset __pod_tmp_real __pod_state_real __pod_inbox_real __pod_comms_real __pod_child
+      return 1 2>/dev/null || exit 1 ;;
+  esac
+done
+POD_TMP="$__pod_tmp_real"
+POD_STATE="$__pod_state_real"
+POD_INBOX="$__pod_inbox_real"
+POD_COMMS="$__pod_comms_real"
+unset __pod_tmp_real __pod_state_real __pod_inbox_real __pod_comms_real __pod_child
+case "$(/usr/bin/uname -s 2>/dev/null)" in
+  Darwin) __pod_owner="$(/usr/bin/stat -f '%u' "$POD_TMP" 2>/dev/null || true)" ;;
+  *)      __pod_owner="$(/usr/bin/stat -c '%u' "$POD_TMP" 2>/dev/null || true)" ;;
+esac
+if [ -n "$__pod_owner" ] && [ "$__pod_owner" != "$(/usr/bin/id -u)" ]; then
+  printf 'pod: runtime root is owned by uid %s, not %s: %s\n' "$__pod_owner" "$(/usr/bin/id -u)" "$POD_TMP" >&2
+  unset __pod_owner
+  return 1 2>/dev/null || exit 1
+fi
+/bin/chmod 700 "$POD_TMP" "$POD_STATE" "$POD_INBOX" "$POD_COMMS" 2>/dev/null || true
+unset __pod_owner
 
 # adapters: repo defaults, then user overrides (~/.config/pod/adapters/*.toml win by
 # basename — handled by pod-adapter, which globs both with user last).
@@ -156,6 +206,17 @@ pod_require_socket() {
 # one safe path component (mirrors _pod-common.sh's pod_sanitize; duplicated here so
 # path-only consumers don't have to pull in the comms layer).
 pod_path_component() { LC_ALL=C printf '%s' "${1:-$POD_SESSION_PREFIX}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_'; }
+
+# Conservative one-component identifiers used for pod names, task ids and template
+# names. This simultaneously prevents namespace collisions and path traversal.
+pod_valid_component() {
+  case "${1:-}" in
+    [A-Za-z0-9]*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+  [ "${#1}" -le 128 ]
+}
 
 # where a sandboxed seat's hooks MIRROR the per-window state they cannot stamp onto
 # tmux ( <win> = "state ts agent_id" · <win>.work = "ts\ttext" · <win>.last =

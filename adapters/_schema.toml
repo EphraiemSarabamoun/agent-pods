@@ -24,7 +24,7 @@ content_patterns  = []              # regex vs capture-pane output (fallback; fo
 reject_content    = []              # if any matches the pane content, do NOT claim it (veto)
 
 [defaults]
-model             = "default"       # used when the manager seat / a bare spawn picks this agent
+model             = "inherit"       # launch with no model flag; inherit the local agent config
 effort            = ""
 card_scrape_regex = ''              # optional: a regex to read live model/effort from the pane
                                     # footer; must capture group 1 = model, group 2 = effort.
@@ -35,38 +35,35 @@ installer       = ""               # path (repo-relative) to a hook installer; o
 native_delivery = false            # true = agent surfaces pod-mail itself -> pod-deliver skips send-keys
 state_source    = "poll"           # "hooks" = agent stamps its own @cc_state; "poll" = the poller infers it
 
-# [discover] (OPTIONAL) — live model discovery. When present and the command exits 0
-# with >=1 parsed model, the live list REPLACES [[models]] below (which then serves
-# only as the offline fallback and as a source of prettier labels / effort ladders by
-# matching slug). Use it for agents whose CLI can enumerate models (cursor-agent
-# --list-models, `ollama list` for an Ollama backend). Omit it for agents with no such
-# command (e.g. claude-code, codex) — their curated [[models]] is the source of truth.
-# Results are cached under $POD_STATE/discover/<id>.json for ttl_s; `pod-adapter
-# refresh [id]` busts the cache. The command runs via the shell, so it can reach a
-# remote backend (e.g. "ssh gpu-box ollama list").
+# [discover] (OPTIONAL) — authoritative local model discovery. When the command exits
+# 0 with >=1 parsed model, those are the selectable models. If it is absent/fails, the
+# picker offers only "Agent default (inherited)" and injects no model flag. Results are
+# cached under $POD_STATE/discover/<id>.json for ttl_s; `pod-adapter refresh [id]`
+# busts the cache. The command runs via the shell, so it can invoke the same agent
+# wrapper on another machine if that wrapper is the seat's real provider surface.
 [discover]
 models_cmd   = "agent --list-models"   # shell command; its stdout is parsed per line
 models_regex = '^(\S+)\s+-\s+(.+)$'     # group 1 = model id (= {model} + slug);
                                         # optional group 2 = pretty label. Non-matching
                                         # lines (headers, blanks) are skipped.
+models_format = "regex"                 # "regex", or "tsv": slug<TAB>label<TAB>model
 timeout_s    = 6                        # kill discovery after this many seconds
-ttl_s        = 21600                    # cache lifetime (6h); refresh to re-query
+ttl_s        = 300                      # short cache; refresh to re-query immediately
 # auth (OPTIONAL): names a provider whose models come from a REST API behind a key
 # (e.g. models_cmd = "pod-discover-api anthropic"). `pod-login <agent>` reads this to
 # know which key to ask for; if no key is available the command just fails and the
-# static fallback below is used. Omit for discovery that needs no key (cursor/ollama).
+# inherited default remains available. Omit for discovery that needs no key.
 auth         = ""                       # "" | "anthropic" | "openai" | <your provider>
 # Effort ladder applied to EVERY discovered model (efforts aren't CLI-enumerable, so
 # they stay declarative here). Empty [] = the agent has no effort axis.
 efforts = []
 
-# Zero or more models. efforts is an inline array of tables (may be empty []). With a
-# [discover] block above, this list is the OFFLINE FALLBACK; without one, it's the
-# authoritative model list.
+# Optional annotations for discovered slugs. These can improve labels or effort
+# ladders, but they NEVER make a model available if discovery did not return it.
 [[models]]
-slug   = "default"
-label  = "Default"
-model  = "the-model-id"            # substituted into {model}
+slug   = "model-from-local-cli"
+label  = "Pretty local label"
+model  = "model-from-local-cli"
 efforts = [
   { slug = "high",   label = "high",   value = "high" },
   { slug = "low",    label = "low",    value = "low" },

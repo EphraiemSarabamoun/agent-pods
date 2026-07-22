@@ -28,8 +28,9 @@
 #   - status-strip redraw on every attached client (+ a flash on the clicking one)
 #   - manager window renamed to POD_MANAGER_NAME / POD_MANAGER_NAME_AUTO to signal mode
 #   - manager notification: OFF -> mbox note (an armed pod-task-wait exits "auto-off"
-#     within ~3s, pausing the loop); ON with a paused pod-task for THIS pod -> a
-#     resume trigger TYPED into the manager's REPL; ON otherwise -> mbox note.
+#     within ~3s, pausing the loop); ON with a paused pod-task for THIS pod -> a safe
+#     resume instruction queued in the manager's mailbox and submitted only when the
+#     manager is provably idle; ON otherwise -> mbox note.
 #   The mbox is appended DIRECTLY (pod-tell skips delivery when sender == recipient,
 #   which would silently drop a click made while window 0 is focused).
 # bash 3.2 safe.
@@ -38,9 +39,6 @@ POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
 . "$POD_BIN/_mgr-runtime.sh"   # mgr_pod_auto_state, mgr_manager_window, pod_dir_for, pod_chan_for, pod_name
 . "$POD_BIN/_pod-strip.sh"     # POD_STRIP_LEFT / POD_STRIP_RIGHT / POD_STRIP_RIGHT_LEN (single source)
 T="$POD_TMUX"
-
-STATE="$POD_STATE/pod-task.json"
-GROUP="$POD_STATE/tmux_group.json"
 
 # The manager's display name communicates the operating mode. Default AUTO == MANUAL
 # (rename is a visible no-op) unless the user configures a distinct POD_MANAGER_NAME_AUTO.
@@ -52,8 +50,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     on|off|toggle|status|install) ACTION="$1"; shift ;;
     --install) ACTION="install"; shift ;;
-    --pod)    POD_ARG="${2:-}"; shift 2 ;;
-    --client) CLIENT="${2:-}"; shift 2 ;;
+    --pod|--client)
+      [ "$#" -ge 2 ] || { echo "pod-auto: $1 requires a value" >&2; exit 2; }
+      case "$1" in --pod) POD_ARG="$2" ;; --client) CLIENT="$2" ;; esac
+      shift 2 ;;
     -h|--help|*)
       echo "usage: pod-auto [on|off|toggle|status|install] [--pod <name>] [--client <name>]" >&2
       exit 2 ;;
@@ -61,6 +61,8 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$ACTION" ] || ACTION="status"
 POD="${POD_ARG:-$(pod_name)}"
+STATE="$POD_STATE/pod-tasks/$(pod_path_component "$POD").json"
+mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
 
 flash() {  # best-effort one-liner in the clicking client's status line
   [ -n "$CLIENT" ] && "$T" display-message -c "$CLIENT" "$1" 2>/dev/null
@@ -83,7 +85,7 @@ play_full_auto_animation() {  # the ⚡ celebration on the OFF->ON transition: a
 
 journal() {  # the env override pins pod-brief's pod_name() to the TARGET pod, not the
   # caller's pane (TMUX cleared -> pod_name falls through to POD_SESSION).
-  TMUX= TMUX_PANE= POD_SESSION="$POD" POD_BRIEF_WHO="full-auto switch" \
+  TMUX='' TMUX_PANE='' POD_SESSION="$POD" POD_BRIEF_WHO="full-auto switch" \
     "$POD_BIN/pod-brief" note "$1" >/dev/null 2>&1 || true
 }
 
@@ -129,31 +131,24 @@ notify_manager() {  # direct mbox append in pod-tell's "[HH:MM] sender: msg" for
   printf '[%s] %s %s · cc @manager\n' "$ts" "$glyph" "${msg%% — *}" >> "$(pod_chan_for "$POD")"
 }
 
-# A paused pod-task belongs to THIS pod when its "pod" field matches, or — for state
-# files written before the field existed — when this pod is the recorded primary. A
-# secondary pod's flip must never resume the primary's task.
+# The task-state path is already scoped to this pod.
 paused_task_for_pod() {
   [ -f "$STATE" ] || return 1
   [ "$(pod_json_get "$STATE" status)" = "paused" ] || return 1
-  local tpod
-  tpod="$(pod_json_get "$STATE" pod)"
-  if [ -n "$tpod" ]; then
-    [ "$tpod" = "$POD" ]
-  else
-    [ "$(pod_json_get "$GROUP" session)" = "$POD" ]
-  fi
+  return 0
 }
 
-send_resume_trigger() {  # typed into the manager REPL; self-contained so a fresh/compacted manager can recover from the state file alone
-  local mgrwin trigger
+queue_resume_trigger() {  # durable mailbox first; guarded delivery wakes an idle seat
+  local mgrwin agent_id
+  notify_manager "FULL AUTO turned ON — resume the paused pod-task: read ${STATE}, set status to running, run mgr-pick-next --all-idle, then re-arm pod-task-wait in the background."
   mgrwin="$(mgr_manager_window "$POD")"
   [ -n "$mgrwin" ] || return 0
-  trigger="[pod-auto] FULL AUTO is back ON for pod ${POD} — resume the paused pod-task: read ${STATE}, set status to \"running\", run mgr-pick-next --all-idle, then re-arm pod-task-wait in the background."
-  # literal type + gap + Enter: the mgr-dispatch race-guard pattern (do not drop the gap)
-  "$T" send-keys -t "$mgrwin" -l "$trigger" 2>/dev/null || return 0
-  sleep 0.1
-  "$T" send-keys -t "$mgrwin" Enter 2>/dev/null
-  return 0
+  agent_id="$("$T" show-options -w -t "$mgrwin" -qv @agent_id 2>/dev/null || true)"
+  case "$agent_id" in ""|generic-shell) return 0 ;; esac
+  # pod-deliver rechecks @cc_state, rejects full-screen programs, waits for a stable
+  # pane, then submits. Forcing submit here is intentional: this is the one transition
+  # that must wake a paused manager, and the delivery gates make it safe while busy.
+  POD_DELIVER_SUBMIT=1 "$POD_BIN/pod-deliver" "$mgrwin" --mode submit >/dev/null 2>&1 || true
 }
 
 # every pod-auto action reads/writes tmux options (the @full_auto stamp, the pill,
@@ -213,8 +208,8 @@ if [ "$new" = "on" ]; then
   journal "⚡ FULL AUTO ON"
   flash "${POD}: ⚡ FULL AUTO ON"
   if paused_task_for_pod; then
-    send_resume_trigger
-    echo "pod '$POD': full-auto ON ⚡ — resume trigger sent to the manager (paused pod-task found)"
+    queue_resume_trigger
+    echo "pod '$POD': full-auto ON ⚡ — resume queued and the manager was nudged if idle"
   else
     notify_manager "FULL AUTO turned ON — treat work objectives as autonomous-loop objectives from here."
     echo "pod '$POD': full-auto ON ⚡"

@@ -49,10 +49,11 @@ Each agent you want to drive must be installed and on your `PATH` (`claude`, `co
 `aider`, and so on). agent-pods launches them; it doesn't bundle them. With none installed
 you still get a deck of plain shells.
 
-Running Claude Code through Amazon Bedrock, Vertex AI, or an enterprise gateway? That
-works out of the box — seats inherit your environment's configured model instead of the
-first-party catalog defaults. See
-[Claude Code behind Bedrock, Vertex, or an enterprise gateway](docs/adapters.md#claude-code-behind-bedrock-vertex-or-an-enterprise-gateway).
+Model choices come from each installed agent on the current device. Claude Code and
+Codex are queried through their local `/model` menus and Cursor through
+`--list-models`. Agents without trustworthy account-scoped enumeration inherit their
+own configured default rather than presenting a guessed catalog. See
+[local model discovery](docs/adapters.md#discover-authoritative-local-models).
 
 ## Quickstart
 
@@ -65,10 +66,10 @@ pod-launch              # open your first pod
 
 `install.sh` symlinks `bin/*` into `~/.local/bin` (make sure that's on your `PATH`) and
 copies `config/config.sh.example` to `~/.config/pod/config.sh` for you to edit. If you
-use Claude Code and want the richer integration (instant state dots, work headlines,
-mail surfaced as context), let the installer wire its lifecycle hooks. See
+use Claude Code or Codex and want the richer integration (instant state dots, work
+headlines, mail surfaced as context), let the installer wire its lifecycle hooks. See
 [docs/adapters.md](docs/adapters.md) and the per-agent installer under
-`hooks/claude-code/`.
+`hooks/`.
 
 Then:
 
@@ -205,22 +206,21 @@ POD_SESSION_PREFIX=pod                 # the <prefix>-N fallback series
 POD_CITIES="Rome Kyoto Cairo Oslo"     # your own pool (single words)
 ```
 
-### State location (multi-user hosts)
+### State location
 
-All ephemeral state lives under one tmp tree (`/tmp/pod` by default), shared per host. On
-a machine several people log into, namespace it per user so registries and mailboxes
-don't interleave:
+All ephemeral state lives under one private per-user tmp tree
+(`${TMPDIR:-/tmp}/agent-pods-$(id -u)` by default). Override it when needed:
 
 ```sh
-POD_TMP="/tmp/pod-$USER"
+POD_TMP="$HOME/.cache/agent-pods/runtime"
 ```
 
 ### Operator primer & memory
 
-At each seat's session start, the deck injects a concise **role primer** — how to run the
+At each hook-enabled seat's session start (Claude Code and Codex), the deck injects a concise **role primer** — how to run the
 pod (manager) or participate in it (worker) — plus any **operator memory** you've saved.
 Grow that memory with `pod-remember "<lesson>"`; it's durable and cross-session (unlike the
-per-pod journal `pod-note` feeds) and reaches every seat you spawn afterward. `POD_PRIMER=0`
+per-pod journal `pod-note` feeds) and reaches every hooked seat you spawn afterward. `POD_PRIMER=0`
 turns the injection off; `POD_OPERATOR_MEMORY` relocates the file.
 
 If a seat runs in a command sandbox that can't reach the tmux socket, the primer also tells
@@ -228,11 +228,12 @@ that agent up front which pod features work from there (roster, journal, pod-mai
 that reads or exchanges) and which are blocked (spawning/killing workers, driving other
 panes — anything that changes the deck). See Troubleshooting.
 
-### Claude Code behind Bedrock / Vertex / a gateway
+### Local and managed model catalogs
 
-Seats inherit your environment's configured model automatically — no override needed. To
-pin a model ID verbatim (skipping the catalog), set `POD_CLAUDE_MODEL`. Full detail in
-[docs/adapters.md](docs/adapters.md#claude-code-behind-bedrock-vertex-or-an-enterprise-gateway).
+The `+` picker queries the agent installed on this device, so Claude Code automatically
+reflects Bedrock, Vertex, Foundry, enterprise policy, and account-specific availability.
+Run `pod-adapter refresh claude-code` to force an immediate re-query. No model IDs are
+configured in agent-pods.
 
 The complete annotated list of knobs lives in
 [`config/config.sh.example`](config/config.sh.example).
@@ -285,7 +286,7 @@ Neither is needed to use the deck interactively.
 ## Architecture
 
 The repo is three rings, the deck (always present), the queue, and the mcp, over a
-single state tree under `/tmp/pod/`. Paths, config, and the adapter catalog meet in
+single private per-user runtime tree. Paths, config, and the adapter catalog meet in
 `bin/_pod-paths.sh`. See [docs/architecture.md](docs/architecture.md) for the full map,
 [docs/keybindings.md](docs/keybindings.md) for every chord and mouse action,
 [docs/autonomy.md](docs/autonomy.md) for the FULL AUTO loop, and

@@ -6,7 +6,7 @@
 #                       [--template <str>] [--deps <id,id,...>]
 #
 # Priority: lower number = higher priority. Default 100.
-# Queue file: $POD_INBOX/_queue/<priority>-<timestamp>-<task-id>.json
+# Queue file: $POD_INBOX/_queue/<pod>/<priority>-<timestamp>-<task-id>.json
 #
 # The filename prefix sorts naturally (lexicographic = priority-then-time)
 # so `ls _queue/` already shows the dispatch order.
@@ -16,14 +16,22 @@
 
 set -euo pipefail
 POD_BIN="$(cd "$(dirname "$0")/../../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+. "$POD_BIN/_mgr-runtime.sh"
 
-QUEUE_DIR="$POD_INBOX/_queue"
 INBOX_ROOT="$POD_INBOX"
+CURRENT_POD="$(mgr_current_pod)"
+CURRENT_POD="$(mgr_pod_component "$CURRENT_POD")" || exit 2
+QUEUE_DIR="$(mgr_queue_dir "$CURRENT_POD")"
+DISPATCHED="$(mgr_dispatched_dir "$CURRENT_POD")"
 DEFAULT_PRIORITY=100
 
 [ $# -ge 1 ] || { echo "usage: mgr-queue <task-id> [--priority N] [--description S] [--template T] [--deps id,id]" >&2; exit 2; }
 
 TASK_ID="$1"; shift
+pod_valid_component "$TASK_ID" || {
+  echo "ERROR: invalid task id '$TASK_ID' (use letters, digits, dot, underscore or hyphen)" >&2
+  exit 2
+}
 PRIORITY="$DEFAULT_PRIORITY"
 DESCRIPTION=""
 TEMPLATE=""
@@ -31,16 +39,67 @@ DEPS="[]"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --priority)    PRIORITY="$2"; shift 2 ;;
-    --description) DESCRIPTION="$2"; shift 2 ;;
-    --template)    TEMPLATE="$2"; shift 2 ;;
-    --deps)        DEPS=$(echo "$2" | jq -Rc 'split(",")'); shift 2 ;;
+    --priority|--description|--template|--deps)
+      [ "$#" -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
+      case "$1" in
+        --priority) PRIORITY="$2" ;;
+        --description) DESCRIPTION="$2" ;;
+        --template) TEMPLATE="$2" ;;
+        --deps) DEPS=$(echo "$2" | jq -Rc 'split(",")') ;;
+      esac
+      shift 2 ;;
     *) echo "ERROR: unrecognized arg: $1" >&2; exit 2 ;;
   esac
 done
 
+[ -z "$TEMPLATE" ] || pod_valid_component "$TEMPLATE" || {
+  echo "ERROR: invalid template name '$TEMPLATE'" >&2
+  exit 2
+}
+if [ "$DEPS" != "[]" ]; then
+  while IFS= read -r dep; do
+    pod_valid_component "$dep" || { echo "ERROR: invalid dependency id '$dep'" >&2; exit 2; }
+  done < <(printf '%s' "$DEPS" | jq -r '.[]')
+fi
+
 PROMPT_PATH="${INBOX_ROOT}/${TASK_ID}/prompt.txt"
 [ -f "$PROMPT_PATH" ] || { echo "ERROR: prompt not found at $PROMPT_PATH. Stage it first via mgr-stage." >&2; exit 1; }
+
+# Serialize queue admission per task. Without this, two callers can both pass the
+# duplicate scan and create distinct timestamped records for the same task.
+LOCK_ROOT="$POD_INBOX/_state/queue-locks"
+LOCK_DIR="$LOCK_ROOT/${TASK_ID}.lock"
+mkdir -p "$LOCK_ROOT"
+mkdir "$LOCK_DIR" 2>/dev/null || {
+  echo "ERROR: another queue operation is already handling ${TASK_ID}" >&2
+  exit 1
+}
+cleanup_lock() { rmdir "$LOCK_DIR" 2>/dev/null || true; }
+trap cleanup_lock EXIT HUP INT TERM
+
+# An archived record is the durable in-flight claim. Refuse to overwrite it or to
+# queue a task the registry still assigns to any worker.
+# Task ids intentionally remain globally unique because prompt/result directories are
+# still the stable public $POD_INBOX/<task-id> contract. Refuse a sibling pod's queued
+# or in-flight id as well as this pod's own record.
+global_record=""
+for record in "$POD_STATE/dispatched"/*/"${TASK_ID}.json"; do
+  [ -e "$record" ] || continue
+  global_record="$record"; break
+done
+if [ -z "$global_record" ]; then
+  for record in "$POD_INBOX/_queue"/*/*-"${TASK_ID}".json; do
+    [ -e "$record" ] || continue
+    [ "$(jq -r '.task_id // empty' "$record" 2>/dev/null)" = "$TASK_ID" ] || continue
+    global_record="$record"; break
+  done
+fi
+if [ -n "$global_record" ] || \
+   jq -e --arg tid "$TASK_ID" '.workers[]? | select(.current_task_id==$tid)' \
+      "$POD_STATE/workers.json" >/dev/null 2>&1; then
+  echo "ERROR: ${TASK_ID} is already queued or in flight${global_record:+ at $global_record}" >&2
+  exit 1
+fi
 
 # Priority must be an integer 0-999: the queue filename zero-pads it to 3 digits
 # for lexical = dispatch ordering, which only sorts correctly in that range.
@@ -76,9 +135,11 @@ jq -n \
   --arg queued_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg description "$DESCRIPTION" \
   --arg template "$TEMPLATE" \
+  --arg pod "$CURRENT_POD" \
   --argjson deps "$DEPS" \
-  '{task_id: $id, priority: $priority, queued_at: $queued_at, description: $description, template: $template, deps: $deps, status: "queued"}' \
-  > "$QUEUE_FILE"
+  '{task_id: $id, priority: $priority, queued_at: $queued_at, description: $description, template: $template, deps: $deps, pod: $pod, status: "queued"}' \
+  > "${QUEUE_FILE}.tmp.$$"
+mv "${QUEUE_FILE}.tmp.$$" "$QUEUE_FILE"
 
 # (durability layer removed — the queue file is the only record.)
 

@@ -19,7 +19,6 @@ POD_BIN="$(cd "$QBIN/../../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
 . "$POD_BIN/_mgr-runtime.sh"                       # mgr_current_pod, mgr_full_auto
 T="$POD_TMUX"
 
-QUEUE_DIR="$POD_INBOX/_queue"
 WORKERS_PATH="$POD_STATE/workers.json"
 
 ALL_IDLE=0
@@ -41,6 +40,8 @@ echo "==> Polling for completions"
 # non-pods (plain tmux / no @is_pod stamp) so the queue works outside a stamped pod.
 # In MANUAL mode the queue holds — dispatch by hand with mgr-dispatch --tmux-window.
 POD_SESS="$(mgr_current_pod)"
+POD_SESS="$(mgr_pod_component "$POD_SESS")" || exit 2
+QUEUE_DIR="$(mgr_queue_dir "$POD_SESS")"
 if ! mgr_full_auto "$POD_SESS"; then
   echo "==> FULL AUTO is OFF for pod '$POD_SESS' — manual mode, holding the queue"
   echo "    (dispatch by hand: mgr-dispatch --tmux-window <@id>)"
@@ -54,16 +55,25 @@ fi
 # count here never promises a worker that dispatch will then refuse.
 live_idle_count() {
   n=0
-  for w in $(jq -r '.workers[] | select(.status=="idle") | .tmux_window // empty' "$WORKERS_PATH" 2>/dev/null); do
+  for w in $(jq -r --arg pod "$POD_SESS" '.workers[]
+      | select(.tmux_session==$pod and .status=="idle")
+      | .tmux_window // empty' "$WORKERS_PATH" 2>/dev/null); do
     [ -n "$w" ] || continue
     [ "$("$T" display-message -p -t "$w" '#{session_name}' 2>/dev/null || true)" = "$POD_SESS" ] || continue
     [ "$("$T" show-options -w -t "$w" -qv @cc_state 2>/dev/null || true)" = "idle" ] || continue
+    case "$("$T" show-options -w -t "$w" -qv @agent_id 2>/dev/null || true)" in
+      ""|generic-shell) continue ;;
+    esac
     n=$((n + 1))
   done
   echo "$n"
 }
 idle_count=$(live_idle_count)
-queue_count=$(ls "$QUEUE_DIR" 2>/dev/null | wc -l | tr -d ' ')
+queue_count=0
+for qf in "$QUEUE_DIR"/*.json; do
+  [ -e "$qf" ] || continue
+  queue_count=$((queue_count + 1))
+done
 echo "==> pod: ${POD_SESS}, live idle workers: ${idle_count}, queue depth: ${queue_count}"
 
 if [ "$idle_count" -eq 0 ]; then

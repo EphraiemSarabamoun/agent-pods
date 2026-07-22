@@ -12,7 +12,8 @@ If you're dispatched a task via the queue, the completion contract is:
 - Read the task's prompt file, do the work, then write your result to the task's
   `result.json` and `touch` its `DONE` sentinel as your LAST action.
 - If you get stuck, report `status: "blocked"` with the reason and signal anyway —
-  never loop silently. Don't write outside your task's inbox dir.
+  never loop silently. Result artifacts stay in the task's inbox; implementation edits
+  must stay inside the explicit scope authorized by the task prompt.
 
 Stay aware of your podmates (the roster and journal update as they work), and don't kill
 a process you didn't start — assume it's load-bearing until proven otherwise.

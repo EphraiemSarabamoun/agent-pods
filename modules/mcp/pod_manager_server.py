@@ -14,12 +14,15 @@ First call should be pod_init() to bootstrap the inbox + state trees.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,10 +36,10 @@ from mcp.server.fastmcp import FastMCP
 # with repo-relative fallbacks so the server is runnable standalone. Nothing here is
 # host-, user-, or persona-specific.
 
-# This file lives at <repo>/modules/mcp/pod_manager_server.py.
-REPO_ROOT = Path(
-    os.environ.get("POD_REPO") or Path(__file__).resolve().parents[2]
-)
+# This module is checkout-bound because it is a thin wrapper around the repository's
+# shell runtime. POD_REPO can point at another checkout; otherwise resolve this file's
+# <repo>/modules/mcp location directly.
+REPO_ROOT = Path(os.environ.get("POD_REPO") or Path(__file__).resolve().parents[2])
 POD_MODULES = Path(os.environ.get("POD_MODULES") or (REPO_ROOT / "modules"))
 POD_BIN = Path(os.environ.get("POD_BIN") or (REPO_ROOT / "bin"))
 
@@ -44,12 +47,18 @@ POD_BIN = Path(os.environ.get("POD_BIN") or (REPO_ROOT / "bin"))
 MGR_BIN = POD_MODULES / "queue" / "bin"
 REPO_TEMPLATES = POD_MODULES / "queue" / "templates"
 
-# One state/inbox tree under POD_INBOX / POD_STATE. Defaults to /tmp/pod/*.
-INBOX_ROOT = Path(os.environ.get("POD_INBOX") or "/tmp/pod/inbox")
-STATE_DIR = Path(os.environ.get("POD_STATE") or "/tmp/pod/state")
-QUEUE_DIR = INBOX_ROOT / "_queue"
+# One state/inbox tree under POD_INBOX / POD_STATE. Match _pod-paths.sh's private,
+# per-user default for direct module launches that did not source the shell config.
+_RUNTIME_ROOT = Path(
+    os.environ.get("POD_TMP")
+    or (Path(os.environ.get("TMPDIR") or "/tmp") / f"agent-pods-{os.getuid()}")
+)
+INBOX_ROOT = Path(os.environ.get("POD_INBOX") or (_RUNTIME_ROOT / "inbox"))
+STATE_DIR = Path(os.environ.get("POD_STATE") or (_RUNTIME_ROOT / "state"))
+QUEUE_DIR = INBOX_ROOT / "_queue"  # per-pod children live below this root
 TEMPLATES_DIR = INBOX_ROOT / "_templates"
-DISPATCHED_DIR = STATE_DIR / "dispatched"
+DISPATCHED_DIR = STATE_DIR / "dispatched"  # per-pod children live below this root
+COMPLETED_DIR = STATE_DIR / "completed"
 
 CONFIG_PATH = STATE_DIR / "inbox-config.json"
 WORKERS_PATH = STATE_DIR / "workers.json"
@@ -112,17 +121,100 @@ def _read_json(path: Path, default: Any = None) -> Any:
         return default
     try:
         return json.loads(path.read_text())
-    except json.JSONDecodeError as e:
+    except (OSError, json.JSONDecodeError) as e:
         return {"_error": f"invalid JSON at {path}: {e}"}
 
 
 def _write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n")
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(data, out, indent=2)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _mutate_workers(mutator: Any) -> Any:
+    """Serialize every MCP workers.json read-modify-write with the CLI lock."""
+    WORKERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(WORKERS_PATH) + ".lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            data = _read_json(WORKERS_PATH, {"workers": []})
+            if not isinstance(data, dict) or "_error" in data:
+                detail = data.get("_error") if isinstance(data, dict) else "root is not an object"
+                return {"error": f"workers registry is unreadable: {detail}"}
+            if not isinstance(data.get("workers"), list):
+                return {"error": "workers registry has no workers array"}
+            if any(not isinstance(worker, dict) for worker in data["workers"]):
+                return {"error": "workers registry contains a non-object row"}
+            result = mutator(data["workers"])
+            if isinstance(result, dict) and "error" in result:
+                return result
+            _write_json(WORKERS_PATH, data)
+            return result
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+_SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _valid_component(value: str | None) -> bool:
+    return bool(value and value not in {".", ".."} and _SAFE_COMPONENT.fullmatch(value))
+
+
+def _runtime_layout_error(create: bool = False) -> str | None:
+    """Mirror _pod-paths.sh's private descendant/ownership contract."""
+    root = _RUNTIME_ROOT.expanduser()
+    if str(root) in {"", "/", str(Path.home())}:
+        return f"refusing broad runtime root: {root}"
+    if root.is_symlink():
+        return f"refusing symlink runtime root: {root}"
+    try:
+        if create:
+            root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if not root.exists():
+            return None
+        root_real = root.resolve()
+        if root.stat().st_uid != os.getuid():
+            return f"runtime root is not owned by uid {os.getuid()}: {root}"
+        for child in (INBOX_ROOT, STATE_DIR):
+            if child.is_symlink():
+                return f"refusing symlink runtime directory: {child}"
+            if create:
+                child.mkdir(parents=True, mode=0o700, exist_ok=True)
+            if not child.exists():
+                continue
+            try:
+                child.resolve().relative_to(root_real)
+            except ValueError:
+                return f"runtime directory must live below {root_real}: {child.resolve()}"
+            if child.stat().st_uid != os.getuid():
+                return f"runtime directory is not owned by uid {os.getuid()}: {child}"
+        if create:
+            for directory in (root, INBOX_ROOT, STATE_DIR):
+                os.chmod(directory, 0o700)
+    except OSError as exc:
+        return f"cannot prepare runtime layout: {exc}"
+    return None
 
 
 def _ensure_initialized() -> dict[str, Any] | None:
     """Return an error dict if the inbox isn't initialized; None if ready."""
+    layout_error = _runtime_layout_error()
+    if layout_error:
+        return {"error": layout_error}
     if not CONFIG_PATH.exists():
         return {
             "error": "pod manager not initialized",
@@ -182,6 +274,20 @@ def _run_tmux(args: list[str]) -> dict[str, Any]:
     return {"stdout": proc.stdout.strip(), "stderr": proc.stderr.strip(), "returncode": proc.returncode}
 
 
+def _manager_window(session: str) -> str:
+    stamped = _run_tmux(["show-options", "-t", session, "-qv", "@pod_manager_win"])
+    if stamped["stdout"]:
+        return stamped["stdout"]
+    rows = _run_tmux(
+        ["list-windows", "-t", f"={session}", "-F", "#{window_id}|#{window_index}"]
+    )
+    for row in rows["stdout"].splitlines():
+        window, _, index = row.partition("|")
+        if index == "0":
+            return window
+    return ""
+
+
 def _tmux_group() -> dict[str, Any] | None:
     """Active tmux group {session, manager_window, tmux_bin, host, pod} or None.
 
@@ -202,11 +308,13 @@ def _tmux_group() -> dict[str, Any] | None:
     if pane:
         sess = _run_tmux(["display-message", "-p", "-t", pane, "#{session_name}"])
         if sess["returncode"] == 0 and sess["stdout"]:
-            win = _run_tmux(["display-message", "-p", "-t", pane, "#{window_id}"])
+            is_pod = _run_tmux(["show-options", "-t", sess["stdout"], "-qv", "@is_pod"])
+            if is_pod["stdout"] != "1":
+                return None
             return {
                 "session": sess["stdout"],
                 "pod": sess["stdout"],
-                "manager_window": win["stdout"] or "@0",
+                "manager_window": _manager_window(sess["stdout"]),
                 "tmux_bin": _tmux_bin(),
                 "host": _host_short(),
             }
@@ -214,14 +322,53 @@ def _tmux_group() -> dict[str, Any] | None:
     if not isinstance(grp, dict) or not grp.get("session"):
         return None
     res = _run_tmux(["has-session", "-t", f"={grp['session']}"])
-    return grp if res["returncode"] == 0 else None
+    if res["returncode"] != 0:
+        return None
+    is_pod = _run_tmux(["show-options", "-t", grp["session"], "-qv", "@is_pod"])
+    if is_pod["stdout"] != "1":
+        return None
+    return {
+        **grp,
+        "pod": grp["session"],
+        "manager_window": _manager_window(grp["session"]) or grp.get("manager_window") or "",
+    }
 
 
-def _find_worker(window_id: int | None = None, tmux_window: str | None = None,
-                 label: str | None = None) -> dict[str, Any] | None:
+def _current_pod_component() -> str:
+    """Return the same safe queue namespace the mgr-* helpers resolve."""
+    grp = _tmux_group()
+    candidate = (
+        (grp or {}).get("pod")
+        or os.environ.get("POD_SESSION")
+        or os.environ.get("POD_SESSION_PREFIX")
+        or "pod"
+    )
+    if not _valid_component(candidate):
+        raise ValueError(f"invalid pod name for queue namespace: {candidate!r}")
+    return candidate
+
+
+def _scoped_queue_dir() -> Path:
+    return QUEUE_DIR / _current_pod_component()
+
+
+def _scoped_dispatched_dir() -> Path:
+    return DISPATCHED_DIR / _current_pod_component()
+
+
+def _find_worker(
+    window_id: int | None = None,
+    tmux_window: str | None = None,
+    label: str | None = None,
+    session: str | None = None,
+) -> dict[str, Any] | None:
     data = _read_json(WORKERS_PATH, {"workers": []})
-    workers = data.get("workers", []) if isinstance(data, dict) else []
+    workers = data.get("workers", []) if isinstance(data, dict) and "_error" not in data else []
     for w in workers:
+        if not isinstance(w, dict):
+            continue
+        if session is not None and w.get("tmux_session") != session:
+            continue
         if tmux_window is not None and w.get("tmux_window") == tmux_window:
             return w
         if window_id is not None and w.get("window_id") == window_id:
@@ -293,10 +440,15 @@ def _adapter_field(agent_id: str, key: str, default: str = "") -> str:
     return default
 
 
-def _adapter_card(agent_id: str) -> str:
+def _adapter_card(agent_id: str, model: str = "", effort: str = "") -> str:
     try:
-        r = subprocess.run([POD_ADAPTER, "card", agent_id],
-                           capture_output=True, text=True, timeout=5)
+        args = [POD_ADAPTER, "card", agent_id]
+        if model:
+            args += ["--model", model]
+        if effort:
+            args += ["--effort", effort]
+        r = subprocess.run(args,
+                           capture_output=True, text=True, timeout=40)
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout.strip()
     except Exception:
@@ -304,7 +456,26 @@ def _adapter_card(agent_id: str) -> str:
     return ""
 
 
-def _spawn_tmux_window(label: str, cd_to: str, register: bool) -> dict[str, Any]:
+def _detect_window_agent(tmux_window: str) -> str:
+    """Ask the adapter catalog to identify a live pane without trusting the caller."""
+    pane_cmd = _run_tmux(
+        ["display-message", "-p", "-t", tmux_window, "#{pane_current_command}"]
+    )["stdout"]
+    content = _run_tmux(
+        ["capture-pane", "-p", "-t", tmux_window, "-S", "-80"]
+    )["stdout"]
+    try:
+        detected = subprocess.run(
+            [POD_ADAPTER, "detect", pane_cmd, content], capture_output=True,
+            text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return detected.stdout.strip() if detected.returncode == 0 else ""
+
+
+def _spawn_tmux_window(label: str, cd_to: str, register: bool, agent_id: str,
+                       model: str, effort: str) -> dict[str, Any]:
     """Spawn a worker as a colored tmux window in the active pod session.
 
     The TAB shows a random human name (via pod-name); the real identity (the agent's
@@ -312,10 +483,9 @@ def _spawn_tmux_window(label: str, cd_to: str, register: bool) -> dict[str, Any]
     when that window is selected. The descriptive `label` is returned to the caller but
     no longer used as the tab name.
 
-    A manager-spawned worker is a generic shell (the universal floor — works with no AI
-    agent installed). Point an MCP-capable manager's own config at a richer agent if you
-    want a different default; the "+" button / pod-add-worker is the path for choosing a
-    specific agent + model + effort.
+    Agent workers launch through the adapter catalog. A generic-shell seat remains
+    available for interactive terminal work, but queue dispatch deliberately excludes
+    it because a shell cannot consume a natural-language task trigger.
     """
     grp = _tmux_group()
     if not grp:
@@ -334,10 +504,52 @@ def _spawn_tmux_window(label: str, cd_to: str, register: bool) -> dict[str, Any]
     if not name:
         name = label.replace('"', "'").replace("'", "")[:40] or "worker"
 
-    # A generic-shell worker: the universal floor. Body command is the user's shell.
-    agent_id = "generic-shell"
+    target = Path(cd_to).expanduser().resolve()
+    if not target.is_dir():
+        return {"error": f"working directory does not exist or is not a directory: {target}"}
     shell = os.environ.get("SHELL") or "/bin/bash"
-    launch = f"cd {cd_to} && exec {shell}"
+    resolved_model = model
+    if agent_id != "generic-shell":
+        try:
+            resolved = subprocess.run(
+                [POD_ADAPTER, "resolve-model", agent_id, model], capture_output=True,
+                text=True, timeout=40,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"error": f"could not resolve local models for '{agent_id}': {exc}"}
+        if resolved.returncode == 0:
+            resolved_model = resolved.stdout.strip()
+        try:
+            resolved_effort_proc = subprocess.run(
+                [POD_ADAPTER, "resolve-effort", agent_id, resolved_model, effort],
+                capture_output=True, text=True, timeout=40,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"error": f"could not resolve effort for '{agent_id}': {exc}"}
+        resolved_effort = (
+            resolved_effort_proc.stdout.strip()
+            if resolved_effort_proc.returncode == 0 else ""
+        )
+        args = [POD_ADAPTER, "launch", agent_id]
+        if resolved_model:
+            args += ["--model", resolved_model]
+        if resolved_effort:
+            args += ["--effort", resolved_effort]
+        try:
+            launched = subprocess.run(args, capture_output=True, text=True, timeout=40)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"error": f"could not launch adapter '{agent_id}': {exc}"}
+        command = launched.stdout.strip() if launched.returncode == 0 else ""
+        if not command:
+            return {"error": f"adapter could not launch agent '{agent_id}'",
+                    "stderr": launched.stderr.strip()}
+        bootstrap = POD_BIN / "pod-worker-bootstrap"
+        body = "exec " + command
+        launch = (f"cd {shlex.quote(str(target))} && exec {shlex.quote(str(bootstrap))} "
+                  f"{shlex.quote(shell)} -lc {shlex.quote(body)}")
+    else:
+        resolved_effort = ""
+        launch = f"cd {shlex.quote(str(target))} && exec {shlex.quote(shell)}"
     res = _run_tmux(["new-window", "-d", "-t", session, "-n", name,
                      "-P", "-F", "#{window_id}", launch])
     if res["returncode"] != 0:
@@ -347,11 +559,12 @@ def _spawn_tmux_window(label: str, cd_to: str, register: bool) -> dict[str, Any]
     _apply_tmux_color(win, ccode)
 
     # Identity card from the catalog (matches a +-spawned generic-shell tab).
-    agent_label = _adapter_field(agent_id, "label", "Shell")
-    card = _adapter_card(agent_id) or agent_label
+    agent_label = _adapter_field(agent_id, "label", agent_id)
+    card = _adapter_card(agent_id, resolved_model, resolved_effort) or agent_label
     native = "1" if _adapter_field(agent_id, "native_delivery") == "true" else "0"
     for opt, val in (("@card", card), ("@agent", agent_label),
-                     ("@agent_id", agent_id), ("@pod_native_delivery", native)):
+                     ("@agent_id", agent_id), ("@model", resolved_model),
+                     ("@effort", resolved_effort), ("@pod_native_delivery", native)):
         _run_tmux(["set-option", "-w", "-t", win, opt, val])
     out: dict[str, Any] = {
         "status": "ok", "dispatch_mode": "tmux", "tmux_session": session,
@@ -359,11 +572,18 @@ def _spawn_tmux_window(label: str, cd_to: str, register: bool) -> dict[str, Any]
         "requested_label": label,
     }
     if register:
-        out["worker_registry"] = pod_register_worker(
+        registry = pod_register_worker(
             window_id=None, label=name, host=grp.get("host", "localhost"),
             dispatch_mode="tmux", tmux_session=session, tmux_window=win, color=cname,
-            agent_type=agent_label, model="", effort="", card=card,
+            agent_type=agent_label, agent_id=agent_id, model=resolved_model,
+            effort=resolved_effort, card=card,
         )
+        out["worker_registry"] = registry
+        if "error" in registry:
+            _run_tmux(["kill-window", "-t", win])
+            return {"error": "worker registration failed; new window was rolled back",
+                    "detail": registry}
+    _run_tmux(["set-option", "-w", "-t", win, "@pod_registered", "1"])
     return out
 
 
@@ -376,9 +596,10 @@ def _spawn_tmux_window(label: str, cd_to: str, register: bool) -> dict[str, Any]
 def pod_init(force: bool = False) -> dict[str, Any]:
     """Bootstrap the inbox + state trees with state files and default templates.
 
-    Creates the inbox root, state dir, _queue/, _templates/, dispatched/ directories.
+    Creates the inbox root, state dir, per-pod queue roots, templates, dispatched,
+    and completion directories.
     Writes inbox-config.json, workers.json (empty), log.jsonl (empty), and copies the
-    default templates (audit, execute, investigate, plan, ssh-execute) plus their
+    default templates (audit, execute, investigate, plan) plus their
     _registry.json sidecar from the queue module.
 
     Idempotent unless force=True (which overwrites existing config + templates).
@@ -386,24 +607,48 @@ def pod_init(force: bool = False) -> dict[str, Any]:
 
     Returns a summary of what was created vs. left alone.
     """
+    required = [POD_LAUNCHER, POD_BIN / "pod-worker-bootstrap",
+                MGR_BIN / "mgr-stage", MGR_BIN / "mgr-dispatch",
+                REPO_TEMPLATES / "_registry.json", REPO_TEMPLATES / "plan.tpl.txt"]
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        return {
+            "error": "pod-manager runtime resources are missing",
+            "missing": missing,
+            "hint": "run this module from an agent-pods clone or set POD_REPO/POD_BIN/POD_MODULES",
+        }
+    layout_error = _runtime_layout_error(create=True)
+    if layout_error:
+        return {"error": layout_error}
     created: list[str] = []
     skipped: list[str] = []
 
-    for d in (INBOX_ROOT, STATE_DIR, QUEUE_DIR, TEMPLATES_DIR, DISPATCHED_DIR):
+    for d in (
+        INBOX_ROOT,
+        STATE_DIR,
+        QUEUE_DIR,
+        TEMPLATES_DIR,
+        DISPATCHED_DIR,
+        COMPLETED_DIR,
+    ):
         if d.exists():
             skipped.append(f"dir: {d}")
         else:
             d.mkdir(parents=True, exist_ok=True)
             created.append(f"dir: {d}")
+        os.chmod(d, 0o700)
 
     config = {
         "inbox_root": str(INBOX_ROOT),
         "state_dir": str(STATE_DIR),
         "templates_dir": str(TEMPLATES_DIR),
-        "queue_dir": str(QUEUE_DIR),
+        "queue_dir": str(QUEUE_DIR),  # compatibility: now a root of per-pod dirs
+        "queue_root": str(QUEUE_DIR),
         "workers_path": str(WORKERS_PATH),
         "log_path": str(LOG_PATH),
-        "dispatched_archive": str(DISPATCHED_DIR),
+        "dispatched_archive": str(DISPATCHED_DIR),  # compatibility root
+        "dispatched_root": str(DISPATCHED_DIR),
+        "completed_root": str(COMPLETED_DIR),
         "trigger_template": (
             f"Read {INBOX_ROOT}/{{{{task_id}}}}/prompt.txt and execute the "
             "task it describes end-to-end. Write result.json, touch DONE as "
@@ -426,6 +671,7 @@ def pod_init(force: bool = False) -> dict[str, Any]:
     if not LOG_PATH.exists():
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         LOG_PATH.touch()
+        os.chmod(LOG_PATH, 0o600)
         created.append(f"file: {LOG_PATH}")
     else:
         skipped.append(f"file: {LOG_PATH}")
@@ -511,13 +757,20 @@ def pod_get_template(name: str) -> dict[str, Any]:
     err = _ensure_initialized()
     if err:
         return err
+    if not _valid_component(name):
+        return {"error": "template name must be one safe path component"}
     registry, rerr = _load_registry()
     if rerr:
         return rerr
     if name not in registry:
         return {"error": f"template '{name}' not in registry", "available": list(registry.keys())}
     meta = registry[name]
-    body_path = TEMPLATES_DIR / meta.get("body_file", f"{name}.tpl.txt")
+    if not isinstance(meta, dict):
+        return {"error": f"template metadata for '{name}' must be an object"}
+    body_file = meta.get("body_file", f"{name}.tpl.txt")
+    if not isinstance(body_file, str) or Path(body_file).name != body_file:
+        return {"error": f"template body_file for '{name}' must be one safe filename"}
+    body_path = TEMPLATES_DIR / body_file
     body = body_path.read_text() if body_path.exists() else None
     return {
         "status": "ok",
@@ -544,7 +797,15 @@ def pod_list_workers() -> dict[str, Any]:
     if err:
         return err
     data = _read_json(WORKERS_PATH, {"workers": []})
-    workers = data.get("workers", []) if isinstance(data, dict) else []
+    if not isinstance(data, dict) or "_error" in data:
+        detail = data.get("_error") if isinstance(data, dict) else "root is not an object"
+        return {"error": f"workers registry is unreadable: {detail}"}
+    workers = data.get("workers")
+    if not isinstance(workers, list) or any(not isinstance(w, dict) for w in workers):
+        return {"error": "workers registry must contain an array of objects"}
+    grp = _tmux_group()
+    if grp:
+        workers = [w for w in workers if w.get("tmux_session") == grp["session"]]
     enriched = []
     for w in workers:
         elapsed = _elapsed_seconds(w.get("started_at")) if w.get("status") == "busy" else None
@@ -562,20 +823,23 @@ def pod_spawn_window(
     label: str,
     cd_to: str | None = None,
     register: bool = True,
+    agent_id: str = "generic-shell",
+    model: str = "",
+    effort: str = "",
 ) -> dict[str, Any]:
     """Open a new colored worker window in the active pod and (by default) register it.
 
-    Spawns a generic-shell worker (the universal floor — works with no AI agent
-    installed) as a sibling tmux window in the manager's pod deck, assigns it a color
-    from lib/palette, stamps its identity card, and registers it in workers.json so
-    pod_dispatch can auto-pick it. To spawn a specific agent + model + effort instead,
-    use the "+" button in the pod status strip (pod-add-worker).
+    Spawns an adapter-backed agent, or a generic shell when agent_id is left at its
+    default. Generic shells are useful interactively but are not eligible for queue
+    dispatch because they cannot consume natural-language triggers.
 
     label: descriptive label for the worker; returned to the caller. The tab itself
         gets a random friendly name.
     cd_to: directory to cd into before launching. Default is $HOME.
     register: if True (default), also append the new window to workers.json so
         pod_dispatch can auto-pick it.
+    agent_id/model/effort: adapter selection. For dispatchable workers, pass an
+        installed agent_id such as "claude-code" or "codex".
 
     Returns the new window's id and the worker registry entry (if registered).
     """
@@ -588,7 +852,7 @@ def pod_spawn_window(
     if not POD_LAUNCHER.exists():
         return {"error": f"pod launcher not at {POD_LAUNCHER}"}
     target_dir = cd_to or os.environ.get("HOME") or os.getcwd()
-    return _spawn_tmux_window(label, target_dir, register)
+    return _spawn_tmux_window(label, target_dir, register, agent_id, model, effort)
 
 
 @mcp.tool()
@@ -601,6 +865,7 @@ def pod_register_worker(
     tmux_window: str | None = None,
     color: str | None = None,
     agent_type: str | None = None,
+    agent_id: str | None = None,
     model: str | None = None,
     effort: str | None = None,
     card: str | None = None,
@@ -618,19 +883,36 @@ def pod_register_worker(
     err = _ensure_initialized()
     if err:
         return err
-    data = _read_json(WORKERS_PATH, {"workers": []})
-    workers = data.get("workers", []) if isinstance(data, dict) else []
-    if tmux_window is not None and any(w.get("tmux_window") == tmux_window for w in workers):
-        return {"status": "noop", "reason": f"tmux window {tmux_window} already registered"}
-    if window_id is not None and any(w.get("window_id") == window_id for w in workers):
-        return {"status": "noop", "reason": f"window {window_id} already registered"}
+    grp = _tmux_group()
+    if not grp:
+        return {"error": "tmux pod not active"}
+    if dispatch_mode != "tmux" or not tmux_window:
+        return {"error": "only live tmux workers can be registered"}
+    session = tmux_session or grp["session"]
+    if session != grp["session"]:
+        return {"error": f"refusing cross-pod registration: caller={grp['session']}, target={session}"}
+    live = _run_tmux(["display-message", "-p", "-t", tmux_window, "#{session_name}"])
+    if live["returncode"] != 0 or live["stdout"] != session:
+        return {"error": f"tmux window {tmux_window} is not live in pod {session}"}
+    if tmux_window == grp.get("manager_window"):
+        return {"error": "refusing to register the manager as a worker"}
+    stamped = _run_tmux(["show-options", "-w", "-t", tmux_window,
+                         "-qv", "@agent_id"])["stdout"]
+    detected = _detect_window_agent(tmux_window)
+    observed = stamped or detected or "generic-shell"
+    if agent_id and observed != "generic-shell" and agent_id != observed:
+        return {"error": f"agent identity mismatch: requested={agent_id}, observed={observed}"}
+    if agent_id and observed == "generic-shell" and agent_id != "generic-shell":
+        return {"error": f"could not verify requested agent '{agent_id}' in {tmux_window}"}
+    agent_id = agent_id or observed
     entry = {
         "window_id": window_id,
         "dispatch_mode": dispatch_mode,
-        "tmux_session": tmux_session,
+        "tmux_session": session,
         "tmux_window": tmux_window,
         "color": color,
         "agent_type": agent_type,
+        "agent_id": agent_id,
         "model": model,
         "effort": effort,
         "card": card,
@@ -641,9 +923,36 @@ def pod_register_worker(
         "started_at": None,
         "registered_at": _now_iso(),
     }
-    workers.append(entry)
-    _write_json(WORKERS_PATH, {"workers": workers})
-    return {"status": "ok", "worker": entry}
+    def register(workers: list[dict[str, Any]]) -> dict[str, Any]:
+        workers[:] = [w for w in workers if not (
+            w.get("tmux_window") == tmux_window and w.get("tmux_session") != session
+        )]
+        existing = next((w for w in workers if w.get("tmux_session") == session
+                         and w.get("tmux_window") == tmux_window), None)
+        if window_id is not None and any(w is not existing and w.get("window_id") == window_id
+                                         for w in workers):
+            return {"status": "noop", "reason": f"window {window_id} already registered"}
+        if existing is not None:
+            assignment = {key: existing.get(key) for key in
+                          ("status", "current_task_id", "started_at", "registered_at")
+                          if key in existing}
+            existing.update(entry)
+            existing.update(assignment)
+            return {"status": "ok", "worker": existing, "updated": True}
+        workers.append(entry)
+        return {"status": "ok", "worker": entry}
+    result = _mutate_workers(register)
+    if isinstance(result, dict) and "error" not in result:
+        for opt, value in (("@agent_id", agent_id), ("@agent", agent_type or agent_id),
+                           ("@model", model or ""), ("@effort", effort or ""),
+                           ("@card", card or agent_type or agent_id)):
+            _run_tmux(["set-option", "-w", "-t", tmux_window, opt, value])
+        native = "1" if _adapter_field(agent_id, "native_delivery") == "true" else "0"
+        _run_tmux(["set-option", "-w", "-t", tmux_window,
+                   "@pod_native_delivery", native])
+        _run_tmux(["set-option", "-w", "-t", tmux_window,
+                   "@pod_registered", "1"])
+    return result
 
 
 @mcp.tool()
@@ -659,10 +968,20 @@ def pod_window_contents(window_id: int | None = None, last_n_lines: int | None =
     err = _ensure_initialized()
     if err:
         return err
-    rec = _find_worker(window_id=window_id, tmux_window=tmux_window)
-    tw = tmux_window or (rec.get("tmux_window") if rec else None)
+    grp = _tmux_group()
+    if not grp:
+        return {"error": "tmux pod not active"}
+    rec = _find_worker(
+        window_id=window_id, tmux_window=tmux_window, session=grp["session"]
+    )
+    tw = rec.get("tmux_window") if rec else None
     if not tw:
-        return {"error": "provide tmux_window (e.g. \"@7\"), or a window_id that is in the roster"}
+        return {"error": "target must be a registered worker in this pod"}
+    if rec.get("tmux_session") != grp["session"]:
+        return {"error": "refusing cross-pod or inactive worker target"}
+    live = _run_tmux(["display-message", "-p", "-t", tw, "#{session_name}"])
+    if live["returncode"] != 0 or live["stdout"] != grp["session"]:
+        return {"error": "registered worker is not live in this pod", "tmux_window": tw}
     n = last_n_lines if (last_n_lines and last_n_lines > 0) else 200
     res = _run_tmux(["capture-pane", "-p", "-t", tw, "-S", f"-{n}"])
     if res["returncode"] != 0:
@@ -691,7 +1010,7 @@ def pod_stage(
     Validates required_vars against the template registry before calling
     mgr-stage. Returns the resolved task_id and the path to the staged prompt.
 
-    template: name from pod_list_templates() (audit, execute, investigate, plan, ssh-execute)
+    template: name from pod_list_templates() (audit, execute, investigate, plan)
     vars: dict of {{key}} -> value substitutions. All required_vars for the
         template must be present.
     task_id: optional override. If omitted, mgr-stage auto-allocates
@@ -700,6 +1019,10 @@ def pod_stage(
     err = _ensure_initialized()
     if err:
         return err
+    if not _valid_component(template):
+        return {"error": "template must be one safe path component"}
+    if task_id is not None and not _valid_component(task_id):
+        return {"error": "task_id must use only letters, digits, dot, underscore and hyphen"}
     registry, rerr = _load_registry()
     if rerr:
         return rerr
@@ -753,6 +1076,12 @@ def pod_queue(
     err = _ensure_initialized()
     if err:
         return err
+    if not _valid_component(task_id):
+        return {"error": "task_id must use only letters, digits, dot, underscore and hyphen"}
+    if template and not _valid_component(template):
+        return {"error": "template must be one safe path component"}
+    if deps and any(not _valid_component(dep) for dep in deps):
+        return {"error": "every dependency id must be one safe path component"}
     args = [task_id, "--priority", str(priority)]
     if description:
         args += ["--description", description]
@@ -788,9 +1117,11 @@ def pod_dispatch(
         return err
     args: list[str] = []
     if task_id:
+        if not _valid_component(task_id):
+            return {"error": "task_id must use only letters, digits, dot, underscore and hyphen"}
         args += ["--task", task_id]
     if tmux_window is not None:
-        args += ["--window", str(tmux_window)]
+        args += ["--tmux-window", str(tmux_window)]
     if print_only:
         args.append("--print-only")
     res = _run_mgr("mgr-dispatch", args)
@@ -872,6 +1203,8 @@ def pod_read_result(task_id: str) -> dict[str, Any]:
     err = _ensure_initialized()
     if err:
         return err
+    if not _valid_component(task_id):
+        return {"error": "invalid task_id"}
     task_dir = INBOX_ROOT / task_id
     if not task_dir.exists():
         return {"error": f"no inbox dir for {task_id}", "expected": str(task_dir)}
@@ -895,6 +1228,8 @@ def pod_read_prompt(task_id: str) -> dict[str, Any]:
     err = _ensure_initialized()
     if err:
         return err
+    if not _valid_component(task_id):
+        return {"error": "invalid task_id"}
     prompt_path = INBOX_ROOT / task_id / "prompt.txt"
     if not prompt_path.exists():
         return {"error": f"no prompt.txt for {task_id}", "expected": str(prompt_path)}
@@ -921,9 +1256,13 @@ def pod_list_inbox(state: str = "all") -> dict[str, Any]:
     if not INBOX_ROOT.exists():
         return {"error": f"inbox root missing: {INBOX_ROOT}"}
 
+    try:
+        queue_dir = _scoped_queue_dir()
+    except ValueError as exc:
+        return {"error": str(exc)}
     queued_ids: set[str] = set()
-    if QUEUE_DIR.exists():
-        for f in QUEUE_DIR.iterdir():
+    if queue_dir.exists():
+        for f in queue_dir.iterdir():
             if f.suffix == ".json":
                 qdata = _read_json(f, {})
                 if isinstance(qdata, dict) and qdata.get("task_id"):
@@ -973,11 +1312,20 @@ def pod_send_input(
     err = _ensure_initialized()
     if err:
         return err
-    rec = _find_worker(window_id=window_id, tmux_window=tmux_window)
-    tw = tmux_window or (rec.get("tmux_window") if rec else None)
+    grp = _tmux_group()
+    if not grp:
+        return {"error": "tmux pod not active"}
+    rec = _find_worker(
+        window_id=window_id, tmux_window=tmux_window, session=grp["session"]
+    )
+    tw = rec.get("tmux_window") if rec else None
     if not tw:
-        return {"error": "provide tmux_window (e.g. \"@7\"), or a window_id that is in the roster"}
-    grp = _tmux_group() or {}
+        return {"error": "target must be a registered worker in this pod"}
+    if rec.get("tmux_session") != grp.get("session"):
+        return {"error": "refusing cross-pod worker target"}
+    live = _run_tmux(["display-message", "-p", "-t", tw, "#{session_name}"])
+    if live["returncode"] != 0 or live["stdout"] != grp.get("session"):
+        return {"error": "registered worker is not live in this pod", "tmux_window": tw}
     if tw == grp.get("manager_window"):
         return {"error": "refusing to send into the manager window"}
     r1 = _run_tmux(["send-keys", "-t", tw, "-l", text])
@@ -990,7 +1338,11 @@ def pod_send_input(
         # and closes the latent race a back-to-back submit could hit under load.
         time.sleep(0.1)
         r2 = _run_tmux(["send-keys", "-t", tw, "Enter"])
-        submitted = r2["returncode"] == 0
+        if r2["returncode"] != 0:
+            _run_tmux(["send-keys", "-t", tw, "C-u"])
+            return {"error": f"submit failed: {r2['stderr']}", "tmux_window": tw,
+                    "text_length": len(text), "submitted": False}
+        submitted = True
     return {"status": "ok", "tmux_window": tw, "text_length": len(text), "submitted": submitted}
 
 

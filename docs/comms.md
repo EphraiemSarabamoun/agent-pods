@@ -36,7 +36,7 @@ is renamed aside before reading) so a `pod-tell` arriving mid-read can't be lost
 [architecture.md](architecture.md)) shows the roster on top and a rolling Slack-style chat
 feed of every `pod-tell` below, newest-first, refreshed every couple of seconds.
 
-All comms state is per-pod, under `/tmp/pod/comms/<pod>/`: one `channel.log`, one
+All comms state is per-pod, under `$POD_COMMS/<pod>/` in the private runtime tree: one `channel.log`, one
 `<window_id>.mbox` per recipient, a `.read` archive, and a high-water file. The whole
 subtree is deleted when the pod closes, so a dead pod's chat can never bleed into a new
 one with the same name. (A pod *rename* moves the subtree with it — see
@@ -114,7 +114,7 @@ it settles.
 - **`submit`**: type the line **and** press Enter, giving an idle AI agent a turn to act
   on its mail. This is the default for AI poll-agents.
 
-### Never auto-submit by default, and the safety gates
+### Auto-submit only to eligible idle AI agents, with hard safety gates
 
 Typing into someone else's pane is a loaded gun, so submit is gated hard. Every one of
 these must hold before a submit:
@@ -185,7 +185,8 @@ digests; without any hook agents it simply stays a hand-fed notebook.
 ## The operator primer + memory (pod-primer / pod-remember)
 
 The journal carries what's happening *now*; the **operator primer** carries how to *run*
-the pod at all. At each seat's session start, `pod-primer` injects (as `additionalContext`,
+the pod at all. At each hook-enabled Claude Code or Codex seat's session start,
+`pod-primer` injects (as `additionalContext`,
 like the journal) a concise **role primer** — a manager seat gets "how to run the pod"
 (`pod`, `pod-tell`, the `mgr-*` fire-and-poll loop), a worker seat gets the lighter
 "how to participate" contract (do the task, write `result.json`, `touch DONE`, never loop
@@ -201,7 +202,7 @@ pod-remember                         # print the current memory
 ```
 
 Unlike `pod-note` (one pod's ephemeral journal, gone when the pod closes), operator memory
-outlives every pod and reaches every seat you spawn afterward. Set `POD_PRIMER=0` to silence
+outlives every pod and reaches every hooked seat you spawn afterward. Set `POD_PRIMER=0` to silence
 the whole injection.
 
 ### The sandbox notice

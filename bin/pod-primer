@@ -17,7 +17,7 @@ set -u
 POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || exit 0
 
 [ "${POD_PRIMER:-1}" = "0" ] && exit 0
-command -v tmux >/dev/null 2>&1 || exit 0
+[ -x "$POD_TMUX" ] || command -v "$POD_TMUX" >/dev/null 2>&1 || exit 0
 [ -n "${TMUX:-}" ] || exit 0
 T="$POD_TMUX"
 
@@ -36,10 +36,19 @@ else
   { [ -n "$me" ] && [ -n "$sess" ]; } || exit 0
 fi
 
-# --- role: manager iff my window is the pod's manager window (tmux_group.json) -----
-mgrwin="$(pod_json_get "$GRP" manager_window)"
-role="worker"
-[ -n "$mgrwin" ] && [ "$me" = "$mgrwin" ] && role="manager"
+# --- role: manager iff my window is THIS pod's manager ---------------------------
+# The global group file intentionally describes only the primary pod. Socket-capable
+# seats read the per-session option; sandboxed seats use the role exported at pane
+# bootstrap. The group file is only a legacy fallback for the recorded primary.
+role="${POD_ROLE:-worker}"
+if pod_socket_ok; then
+  mgrwin="$("$T" show-options -t "$sess" -qv @pod_manager_win 2>/dev/null || true)"
+  role="worker"
+  [ -n "$mgrwin" ] && [ "$me" = "$mgrwin" ] && role="manager"
+elif [ -z "${POD_ROLE:-}" ] && [ "$(pod_json_get "$GRP" session)" = "$sess" ]; then
+  mgrwin="$(pod_json_get "$GRP" manager_window)"
+  [ -n "$mgrwin" ] && [ "$me" = "$mgrwin" ] && role="manager"
+fi
 
 # --- assemble the injection -------------------------------------------------------
 primer_file="$POD_PRIMER_DIR/$role.md"

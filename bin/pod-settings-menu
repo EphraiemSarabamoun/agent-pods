@@ -26,7 +26,14 @@
 # So unlike the one-shot "+" menu (which omits -c), the settings chain keeps the client.
 #
 # Set POD_MENU_PRINT=1 to print the tmux argv instead of opening a menu.
-import argparse, json, os, subprocess, sys, tempfile
+import argparse
+import fcntl
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
 
 SELF = os.path.realpath(__file__)
 HERE = os.path.dirname(SELF)
@@ -38,7 +45,11 @@ SLOTS = os.environ.get("POD_SLOTS") or os.path.join(
     os.environ.get("POD_CONFIG_DIR", os.path.expanduser("~/.config/pod")), "slots.json"
 )
 STATE = os.environ.get("POD_STATE") or os.path.join(
-    os.environ.get("POD_TMP", "/tmp/pod"), "state"
+    os.environ.get(
+        "POD_TMP",
+        os.path.join(os.environ.get("TMPDIR", "/tmp"), f"agent-pods-{os.getuid()}"),
+    ),
+    "state",
 )
 # $POD_TMUX is exported by _pod-paths.sh (the launcher/status-action set it); fall back
 # to bare "tmux" on PATH if this is somehow run without that env.
@@ -126,9 +137,7 @@ def run_menu(title, items):
 
 
 def self_cmd(**kw):
-    """Build the `run-shell -b '<self> --step ...'` command for a menu item.
-    All values (step names, ints, slugs, agent ids) are space-free, so they sit
-    unquoted inside the single-quoted run-shell argument."""
+    """Build a literal, shell-safe run-shell command for the next menu step."""
     parts = [SELF]
     for k, v in kw.items():
         if v is None or v == "":
@@ -137,7 +146,7 @@ def self_cmd(**kw):
         parts.append(str(v))
     if CLIENT and "client" not in kw:
         parts += ["--client", CLIENT]   # keep the client alive across the chain
-    return "run-shell -b '" + " ".join(parts) + "'"
+    return "run-shell -b " + shlex.quote(shlex.join(parts))
 
 
 def step_slot(slots):
@@ -202,25 +211,37 @@ def step_save(slot, agent_id, model_slug, effort_slug):
         print(f"[dry-run] slot {slot}: {label} :: {cmd}")
         return 0
 
-    data = load_json(SLOTS)
-    slots = data.setdefault("slots", [])
-    while len(slots) <= slot:
-        slots.append({})
-    slots[slot] = {
-        "agent": agent_id,
-        "model": model_slug,
-        "effort": effort_slug,
-        "label": label,
-        "cmd": cmd,
-    }
-    # Atomic write (temp + os.replace) so a reader never sees a half-written slots file.
     d = os.path.dirname(SLOTS) or "."
     os.makedirs(d, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".slots.", suffix=".tmp")
-    with os.fdopen(fd, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-    os.replace(tmp, SLOTS)
+    # Serialize the whole read-modify-write. os.replace protects readers from partial
+    # JSON, while the lock prevents two simultaneous settings menus from losing one
+    # another's slot edits.
+    with open(SLOTS + ".lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = load_json(SLOTS)
+        slots = data.setdefault("slots", [])
+        while len(slots) <= slot:
+            slots.append({})
+        slots[slot] = {
+            "agent": agent_id,
+            "model": model_slug,
+            "effort": effort_slug,
+            "label": label,
+        }
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".slots.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, SLOTS)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     msg = [TMUX, "display-message"]
     if CLIENT:

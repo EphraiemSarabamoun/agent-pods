@@ -21,6 +21,13 @@ arg="${1:-}"
 win="${arg#kill_}"                       # accept the click range form "kill_@7" or a bare id/name
 [ -n "$win" ] || { echo "usage: pod-kill-worker <window_id|name>"; exit 1; }
 
+# Prefer the calling pane's live session over an inherited POD_SESSION, which becomes
+# stale after a pod rename.
+if [ -n "${TMUX_PANE:-}" ]; then
+  live_session="$("$T" display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null || true)"
+  [ -n "$live_session" ] && S="$live_session"
+fi
+
 # resolve a window NAME to its id (so `pod-kill-worker Steve` works)
 case "$win" in
   @*) : ;;
@@ -34,6 +41,13 @@ esac
 widx="$("$T" display-message -p -t "$win" '#{window_index}' 2>/dev/null || echo '')"
 [ -n "$widx" ] || { echo "pod-kill-worker: no such window '$win' in pod '$S'"; exit 1; }
 
+# Window ids are server-global. Never let a raw @id reach a sibling pod.
+wsess="$("$T" display-message -p -t "$win" '#{session_name}' 2>/dev/null || true)"
+if [ "$wsess" != "$S" ]; then
+  echo "pod-kill-worker: refusing cross-pod target '$win' (caller=$S, target=${wsess:-unknown})" >&2
+  exit 1
+fi
+
 # never kill the manager (window index 0)
 if [ "$widx" = "0" ]; then
   echo "pod-kill-worker: refusing to terminate the manager (window 0)"
@@ -42,42 +56,32 @@ fi
 
 wname="$("$T" display-message -p -t "$win" '#{window_name}' 2>/dev/null || echo "$win")"
 
-# deregister from workers.json (idempotent; matches pod-add-worker's inline-python pattern)
+# An assigned worker is part of the queue's durable task state. Removing its row
+# before mgr-poll can restore/complete the task strands the dispatched archive with
+# no owner. Refuse the destructive click while an assignment exists; completion or
+# dead-worker recovery clears it through the queue protocol first.
 if [ -f "$WORKERS" ]; then
-  python3 - "$win" "$WORKERS" <<'PY'
-import json, sys, os, fcntl, tempfile
-wid, path = sys.argv[1], sys.argv[2]
-# Lock the SHARED workers.json.lock — the same file pod-add-worker and
-# pod-sync-label lock. flock only excludes processes locking the same file, so a
-# lock on a different fd (e.g. the json itself) wouldn't serialize against them.
-lf = open(path + ".lock", "w")
-fcntl.flock(lf, fcntl.LOCK_EX)
-try:
-    try:
-        d = json.load(open(path))
-        if not isinstance(d, dict):
-            sys.exit(0)
-    except Exception:
-        sys.exit(0)
-    ws = d.get("workers", [])
-    keep = [w for w in ws if w.get("tmux_window") != wid]
-    if len(keep) != len(ws):
-        d["workers"] = keep
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".workers.", suffix=".tmp")
-        with os.fdopen(fd, "w") as tf:
-            json.dump(d, tf, indent=2)
-        os.replace(tmp, path)            # atomic
-finally:
-    fcntl.flock(lf, fcntl.LOCK_UN)
-    lf.close()
-PY
+  assigned_tid="$(jq -r --arg tw "$win" --arg pod "$S" \
+    'first(.workers[] | select(.tmux_window==$tw and .tmux_session==$pod)
+      | .current_task_id) // empty' "$WORKERS" 2>/dev/null || true)"
+  if [ -n "$assigned_tid" ]; then
+    echo "pod-kill-worker: refusing to terminate assigned worker $S/$win (task $assigned_tid); run mgr-poll after completion or let dead-worker recovery requeue it" >&2
+    exit 1
+  fi
+fi
+
+# Deregister through the shared locked/atomic registry mutator.
+if [ -f "$WORKERS" ]; then
+  "$POD_BIN/pod-workers-json" --path "$WORKERS" drop "$win" "$S" || {
+    echo "pod-kill-worker: registry update failed; refusing to orphan $S/$win" >&2
+    exit 1
+  }
 fi
 
 # log the termination to the KILLED window's pod channel so it shows in that pod's
 # summary-pane feed. Resolve the pod from the window itself — POD_SESSION isn't set in
 # the tmux run-shell context the ✕ button fires from, and the message belongs to the
 # target's pod, not whatever pod happened to invoke this.
-wsess="$("$T" display-message -p -t "$win" '#{session_name}' 2>/dev/null || echo "$S")"
 CHAN="$(pod_chan_for "$wsess")"; mkdir -p "$(dirname "$CHAN")"
 echo "[$(date +%H:%M)] (system): terminated pod agent $wname ($win)" >> "$CHAN" 2>/dev/null || true
 

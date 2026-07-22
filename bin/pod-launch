@@ -32,17 +32,17 @@ if [ -z "$MANAGER_CMD" ]; then
   for cand in ${POD_MANAGER_PREFER:-claude-code codex cursor openclaw}; do
     printf '%s\n' "$avail" | grep -qx "$cand" || continue
     dm="$("$ADAPTER" field "$cand" model 2>/dev/null)"
-    # provider-backend policy (Bedrock/Vertex inherit, POD_CLAUDE_MODEL pin) — the
-    # adapter applies it inside `launch`/`card` too; resolving here keeps the
-    # stamped @model honest ("" = seat inherits the environment's model).
+    # Resolve against the local agent's current catalog. Removed/stale defaults fall
+    # back to "inherit", which injects no model flag.
     dm="$("$ADAPTER" resolve-model "$cand" "$dm" 2>/dev/null)"
     de="$("$ADAPTER" field "$cand" effort 2>/dev/null)"
-    margs=""
-    [ -n "$dm" ] && margs="--model $dm"
-    [ -n "$de" ] && margs="$margs --effort $de"
-    MANAGER_CMD="$("$ADAPTER" launch "$cand" $margs 2>/dev/null)"
+    de="$("$ADAPTER" resolve-effort "$cand" "$dm" "$de" 2>/dev/null || printf '')"
+    margs=()
+    [ -n "$dm" ] && margs+=(--model "$dm")
+    [ -n "$de" ] && margs+=(--effort "$de")
+    MANAGER_CMD="$("$ADAPTER" launch "$cand" "${margs[@]}" 2>/dev/null)"
     [ -n "$MANAGER_CMD" ] || continue
-    MGRCARD="$("$ADAPTER" card "$cand" $margs --suffix manager 2>/dev/null)"
+    MGRCARD="$("$ADAPTER" card "$cand" "${margs[@]}" --suffix manager 2>/dev/null)"
     [ -n "$MGRCARD" ] || MGRCARD="$POD_MANAGER_CARD"
     MGRAGENT="$cand"; MGRMODEL="$dm"; MGREFFORT="$de"
     break
@@ -58,14 +58,10 @@ mkdir -p "$POD_STATE" 2>/dev/null || true
 # AFTER a pod exists so it can't start then immediately exit on an empty server.
 start_foreign_poller() { ( nohup "$POD_BIN/pod-foreign-state" >/dev/null 2>&1 </dev/null & ); }
 
-# Reap ABANDONED pods so their names free up for reuse. Closing a terminal only
-# DETACHES a tmux session — the pod keeps running headless — so without reaping, dead-
-# to-the-eye pods linger and hold their (city) name. A pod is abandoned (safe to reap)
-# when NO client is attached AND it has ZERO worker windows (only the manager window).
-# A pod still holding even ONE worker is PRESERVED — this can
-# never kill a running worker. Pods are identified by their @is_pod stamp (not a name
-# regex, since pods are city-named now). Only the no-arg launch reaps, every kill is
-# announced.
+# Legacy opt-in cleanup for detached one-window pods. Detachment and worker count do
+# NOT prove that the manager is idle: it may be running a long task. Automatic reaping
+# therefore defaults off; set POD_REAP_ABANDONED=1 only if that destructive policy is
+# explicitly desired.
 reap_abandoned_pods() {
   local s attached nworkers
   for s in $("$T" list-sessions -F '#{session_name}' 2>/dev/null); do
@@ -89,12 +85,16 @@ reap_abandoned_pods() {
 # not a concern in this bash script.)
 if [ -n "${1:-}" ]; then
   S="$1"
+  pod_valid_component "$S" || {
+    echo "pod-launch: invalid pod name '$S' (use letters, digits, dot, underscore or hyphen)" >&2
+    exit 2
+  }
   if "$T" has-session -t "=$S" 2>/dev/null; then
     start_foreign_poller
     exec "$T" attach -t "=$S"
   fi
 else
-  reap_abandoned_pods
+  [ "${POD_REAP_ABANDONED:-0}" = "1" ] && reap_abandoned_pods
   # name a NEW pod after a random free city (Rome, Kyoto, ...); fall back to the
   # legacy numeric <prefix>-N series only when the city pool is exhausted.
   S="$("$POD_BIN/pod-city" 2>/dev/null || true)"
@@ -124,7 +124,7 @@ fi
 # workers: the manager seat too gets its identity as ENVIRONMENT, resolved by the
 # pane's own (unsandboxed) shell, so hooks running under a command sandbox —
 # where the tmux socket is connect-blocked — can still identify themselves.
-MGRENV="POD_WINDOW=\"\$(\"$T\" display-message -p -t \"\$TMUX_PANE\" '#{window_id}' 2>/dev/null)\"; POD_AGENT_ID=\"$MGRAGENT\"; export POD_WINDOW POD_AGENT_ID; "
+MGRENV="POD_WINDOW=\"\$(\"$T\" display-message -p -t \"\$TMUX_PANE\" '#{window_id}' 2>/dev/null)\"; POD_AGENT_ID=\"$MGRAGENT\"; POD_ROLE=manager; export POD_WINDOW POD_AGENT_ID POD_ROLE; "
 "$T" new-session -d -s "$S" -n "$MGRNAME" -e "POD_SESSION=$S" "${MGRENV}$MANAGER_CMD; $T kill-session"
 
 # server-level rendering (harmless on a fresh tmux server)
@@ -286,16 +286,40 @@ MGRWIN="$("$T" display-message -p -t "${S}:0" '#{window_id}' 2>/dev/null || echo
 # every window in the pod learns its pod name
 "$T" set-environment -t "$S" POD_SESSION "$S"
 
+# A tmux server restart reuses numeric @window ids. Remove registry rows whose live
+# window no longer belongs to their recorded session before any new worker registers,
+# otherwise a stale @id can shadow the fresh seat.
+[ -f "$POD_STATE/workers.json" ] && \
+  "$POD_BIN/pod-workers-json" --path "$POD_STATE/workers.json" prune "$T" >/dev/null 2>&1 || true
+
 # Record group state so the optional queue/MCP modules know which pod is PRIMARY. Only
 # the primary writes this; extra pods must NOT clobber it. A pod becomes primary when
 # no live primary is recorded (first launch, or the recorded one's session has died).
-prev_sess="$(jq -r '.session // empty' "${POD_STATE}/tmux_group.json" 2>/dev/null || true)"
-if [ -z "$prev_sess" ] || ! "$T" has-session -t "=$prev_sess" 2>/dev/null; then
-  HOSTSHORT="$(hostname -s 2>/dev/null || echo localhost)"
-  cat > "${POD_STATE}/tmux_group.json" <<JSON
-{ "session": "${S}", "pod": "${S}", "manager_window": "${MGRWIN}", "tmux_bin": "${T}", "host": "${HOSTSHORT}" }
-JSON
-fi
+HOSTSHORT="$(hostname -s 2>/dev/null || echo localhost)"
+python3 - "${POD_STATE}/tmux_group.json" "$S" "$MGRWIN" "$T" "$HOSTSHORT" <<'PY'
+import fcntl, json, os, subprocess, sys, tempfile
+path, session, manager, tmux_bin, host = sys.argv[1:]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path + ".lock", "w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        current = json.load(open(path))
+    except Exception:
+        current = {}
+    prior = current.get("session") if isinstance(current, dict) else None
+    alive = bool(prior) and subprocess.run(
+        [tmux_bin, "has-session", "-t", "=" + prior],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+    if not alive:
+        data = {"session": session, "pod": session, "manager_window": manager,
+                "tmux_bin": tmux_bin, "host": host}
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmux-group.", suffix=".tmp")
+        with os.fdopen(fd, "w") as out:
+            json.dump(data, out)
+            out.write("\n")
+        os.replace(tmp, path)
+PY
 
 # Mission control is the docked summary pane, not a window: it auto-docks on first
 # client attach (the client-attached hook above) and rides along as you switch windows.

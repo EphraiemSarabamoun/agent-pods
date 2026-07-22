@@ -74,12 +74,11 @@ This is how `pod-detect` figures out which agent is running in a window it didn'
 detection authority: `pod`, `pod-tell`, `pod-deliver`, and the foreign-state poller all
 read the cached `@agent_id` that detection wrote, never re-test the pane themselves.
 
-**Detection priority.** `pod-adapter detect` walks adapters in ascending `priority`. For
-each, it first checks `reject_content` (any match vetoes the claim), then tries
-`pane_cmd_patterns` against the pane's current command, then `content_patterns` against
-the captured pane text. The first adapter that matches wins. `generic-shell` sits at
-priority 9999 with `pane_cmd_patterns = ['.*']`, so it is the last-resort claim that
-catches every otherwise-unclaimed pane.
+**Detection priority.** `pod-adapter detect` walks adapters in ascending `priority` in
+four global phases: unique command-only matches, content matches, weak command matches
+for agents that also define content patterns, then the catch-all. `reject_content` is a
+veto in every phase. `generic-shell` sits at priority 9999 with
+`pane_cmd_patterns = ['.*']`, so it catches every otherwise-unclaimed pane.
 
 The split between the two pattern lists matters for cost. A command like `claude` reports
 a unique foreground command, so a `pane_cmd_patterns` match is enough and no pane capture
@@ -92,7 +91,7 @@ those adapters list `node` in `pane_cmd_patterns` *and* a `content_patterns` reg
 
 ```toml
 [defaults]
-model             = "default"   # used when the manager seat / a bare spawn picks this agent
+model             = "inherit"   # used when the manager seat / a bare spawn picks this agent
 effort            = ""
 card_scrape_regex = ''          # optional: read live model/effort from the pane footer
 ```
@@ -151,44 +150,25 @@ When `false` (every poll agent), `pod-deliver` is the only delivery path and it 
 send-keys. The detector caches this as `@pod_native_delivery` on the window; a
 hook-capable agent's own hook re-stamps it authoritatively once it's live.
 
-### `[[models]]`
+### `[discover]`: authoritative local models
 
-Zero or more model tables. Each has a `slug` (the short key the menu and CLI use), a
-`label` (what's shown), the `model` value substituted into `{model}`, and an inline array
-of `efforts` (which may be empty).
-
-```toml
-[[models]]
-slug   = "opus"
-label  = "Opus 4.8"
-model  = "claude-opus-4-8"
-efforts = [
-  { slug = "high",   label = "high",   value = "high" },
-  { slug = "low",    label = "low",    value = "low" },
-]
-```
-
-An agent with no model/effort to pick (a shell) simply omits `[[models]]`.
-
-### `[discover]` (optional) — live models
-
-Hand-typed `[[models]]` lists drift the moment an agent ships a new model. If the
-agent's CLI can enumerate what it serves, add a `[discover]` block and the picker
-reads reality instead. When the command succeeds, its parsed models **replace**
-`[[models]]` (which then serves only as the offline fallback, and as a source of
-prettier labels / effort ladders matched by slug).
+Model availability is derived from the agent/provider on the current device. A
+`[discover]` command is the authority for selectable models. If it is absent, times
+out, or returns nothing, agent-pods offers only **Agent default (inherited)** and adds
+no model flag. It never promotes a repository-maintained fallback list as available.
 
 ```toml
 [discover]
 models_cmd   = "cursor-agent --list-models"          # any shell command
 models_regex = '^(\S+)\s+-\s+(.+?)(?:\s+\(current\))?$'  # grp1 = id, grp2 = label
 timeout_s    = 8                                      # kill discovery after N seconds
-ttl_s        = 21600                                  # cache the result for 6h
+ttl_s        = 300                                    # short cache; refresh on demand
 efforts      = []                                     # ladder applied to every model
 ```
 
-`models_cmd` runs through the shell, so it can reach a remote backend
-(`"ssh gpu-box ollama list"`). Each stdout line is matched by `models_regex`: group 1
+`models_cmd` runs through the shell, so it can invoke the same agent wrapper on another
+machine if that wrapper is the seat's real provider surface. Each stdout line is
+matched by `models_regex`: group 1
 is the model id (used as both the `{model}` value and the slug), an optional group 2
 is the pretty label, and non-matching lines (headers, blanks) are skipped. Only models
 are discovered — effort ladders aren't enumerable from any CLI, so `[discover].efforts`
@@ -197,11 +177,22 @@ for instance, bakes effort into the model slug). Results cache under
 `$POD_STATE/discover/<id>.json`; `pod-adapter refresh [id]` busts the cache and
 re-queries.
 
-#### Discovery via an authenticated API (`auth` + `pod-login`)
+Commands can also emit explicit tab-separated rows by setting
+`models_format = "tsv"`; each row is `slug<TAB>label<TAB>launch-value`. The bundled
+Claude Code and Codex adapters use that form with `pod-discover-local-agent`, which
+opens the installed CLI in a disposable tmux server, captures `/model`, presses Escape,
+and tears the server down without changing the active/default model.
 
-Some agents — Claude Code, Codex — have no `--list-models` command at all, but the
-*provider's* REST API does (`GET /v1/models`). For those, point `models_cmd` at the
-bundled `pod-discover-api` helper and name the provider with `auth`:
+Optional `[[models]]` entries are annotations only. A matching discovered slug may
+borrow a prettier label or effort ladder from one, but a static row never makes a model
+available. This is useful for a private adapter that wants presentation metadata without
+claiming entitlement.
+
+#### Optional authenticated API discovery for custom adapters
+
+The bundled account-facing agents do not use public REST model indexes because those
+indexes often differ from subscription, enterprise, or managed-provider availability.
+Custom adapters may still deliberately query an API with `pod-discover-api`:
 
 ```toml
 [discover]
@@ -214,17 +205,15 @@ efforts = [ { slug = "high", label = "high", value = "high" }, ... ]
 `pod-discover-api` resolves a key without bothering the user when it can — the
 provider env var (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`), a key the CLI itself stored
 (`~/.codex/auth.json`, or a Claude Code API-key login), or one captured by `pod-login`.
-A plain **subscription** login (Claude Pro/Max, ChatGPT) stores a short-lived OAuth
-token that does *not* authenticate against `/v1/models`, so for those users discovery
-fails and the curated `[[models]]` is used instead — which is the right model list for
-a subscription anyway.
+A plain subscription login may not authenticate against `/v1/models`; in that case the
+adapter safely falls back to its inherited default, not a guessed list.
 
 `pod-login [agent]` is the front door: it reads `auth` to know which provider to ask
 for, reuses an existing key if one is resolvable, otherwise points you at the provider's
 key page, reads a key without echoing it, **validates it with a live call**, and stores
 it at `~/.config/pod/keys/<provider>` (chmod 600). `install.sh` offers this during
-setup (skippable; `--with-logins` / `--no-logins` to answer non-interactively). Effort
-levels still aren't served by any API, so they stay declared in `[discover].efforts`.
+setup for custom API-backed adapters (skippable; `--with-logins` / `--no-logins`).
+Effort levels still stay declared in `[discover].efforts` when an agent has that axis.
 
 ## Three worked examples
 
@@ -336,55 +325,34 @@ state_source    = "poll"
 
 This is the catch-all: priority 9999 and a `.*` command pattern, so any pane no other
 adapter claims is still a first-class podmate with a roster entry, a color, a poll-based
-state dot, and pod-mail. It's also the default manager seat and the default bare worker.
+state dot, and pod-mail. It's the manager fallback when no preferred AI agent is
+installed, and it is the default bare worker.
 This is what makes agent-pods work with no AI agent installed at all.
 
 ## User overrides
 
 Anything you put in `~/.config/pod/adapters/` is loaded after the repo defaults. To
-adjust a bundled agent (different models, a different binary path), copy its file there
-and edit your copy, keeping the same `id` so your version wins. To add an agent the repo
+adjust a bundled agent (a different local discovery command or binary path), copy its
+file there and edit your copy, keeping the same `id` so your version wins. To add an agent the repo
 doesn't know, drop a new `*.toml` with a new `id`. Either way it appears in the `+` menu
 on the next spawn, because the menu is built from `pod-adapter list`. No reinstall, no
 code change.
 
-Confirm what the catalog resolved to:
+Confirm what local discovery resolved to:
 
 ```sh
 pod-adapter list                          # every known agent id
 pod-adapter list --available              # only those whose base_cmd is on PATH
-pod-adapter card claude-code --model opus --effort high
-pod-adapter launch codex --model gpt-5.5 --effort high
+pod-adapter models claude-code            # local Claude /model choices
+pod-adapter refresh codex                 # re-query local Codex immediately
 pod-adapter dump --json                   # the whole resolved catalog (debug)
 ```
 
-## Claude Code behind Bedrock, Vertex, or an enterprise gateway
+## Claude Code behind Bedrock, Vertex, Foundry, or an enterprise gateway
 
-The claude-code catalog ships Anthropic's first-party model IDs (`claude-opus-4-8`,
-`claude-sonnet-5`, ...). Provider backends reject those: Amazon Bedrock wants
-provider-prefixed IDs (`us.anthropic.claude-...` inference profiles), and enterprise
-gateways serve whatever IDs they serve. Forcing a first-party ID onto `--model` there
-fails every spawn with `400 invalid_request_error` through the provider's SDK.
-
-So the deck inherits instead of asserting. Whenever a provider backend is configured
-(`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, or `CLAUDE_CODE_USE_FOUNDRY` is
-set — the same environment that already makes bare `claude` work on that machine),
-`pod-adapter` skips the `--model` flag entirely and every Claude Code seat comes up on
-the environment's own model (`ANTHROPIC_MODEL` or the gateway default). Nothing to
-configure: clone, `./install.sh`, `pod-launch`.
-
-To pin a specific model anyway, set one line in `~/.config/pod/config.sh`:
-
-```sh
-POD_CLAUDE_MODEL="us.anthropic.claude-sonnet-5-v1:0"   # passed to --model verbatim
-```
-
-The value bypasses the catalog, so any provider's ID format works. It also overrides
-the picker slugs — under a provider backend the first-party catalog entries are
-meaningless, so the pin (or inheritance) always wins. First-party setups with none of
-those env vars set are untouched: catalog defaults and picker slugs behave exactly as
-before. Note the seat's `--effort` flag is CLI-side and passes through unchanged in
-every case.
-
-The one prerequisite the deck can't fix: bare `claude` must already work on the
-machine. If it 400s on its own, the provider config (not the pod) needs fixing first.
+No provider special case is necessary. `pod-discover-local-agent claude-code` reads the
+same local `/model` menu the user sees, after Claude Code has applied admin-managed
+policy, provider configuration, account entitlements, and CLI feature gates. Choosing
+**Agent default (inherited)** adds no `--model` flag. Choosing a discovered row passes
+the alias Claude Code itself displayed. If the menu cannot be queried, only inheritance
+is offered, so a first-party ID can never leak in from a stale repository catalog.

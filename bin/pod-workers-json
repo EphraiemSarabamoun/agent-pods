@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Locked, atomic workers.json mutations shared by runtime and queue writers."""
+
+import argparse
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+
+parser = argparse.ArgumentParser(prog="pod-workers-json")
+parser.add_argument("--path", required=True)
+parser.add_argument(
+    "command",
+    choices=("claim", "drop", "free", "prune", "register", "release", "rename-session"),
+)
+parser.add_argument("args", nargs="*")
+ns = parser.parse_args()
+path = os.path.abspath(ns.path)
+os.makedirs(os.path.dirname(path), exist_ok=True)
+
+
+def fail(message: str) -> None:
+    print(f"pod-workers-json: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+with open(path + ".lock", "a+") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        try:
+            with open(path) as source:
+                data = json.load(source)
+        except FileNotFoundError:
+            data = {"workers": []}
+        except (OSError, json.JSONDecodeError) as exc:
+            fail(f"cannot read {path}: {exc}")
+        if not isinstance(data, dict) or not isinstance(data.get("workers"), list):
+            fail(f"invalid registry shape in {path}")
+        workers = data["workers"]
+        if any(not isinstance(worker, dict) for worker in workers):
+            fail(f"invalid worker row in {path}")
+
+        if ns.command == "claim":
+            if len(ns.args) != 4:
+                fail("claim needs <window> <session> <task-id> <timestamp>")
+            window, session, task_id, timestamp = ns.args
+            matches = [w for w in workers if w.get("tmux_window") == window
+                       and w.get("tmux_session") == session]
+            if len(matches) != 1:
+                fail(f"worker {session}/{window} is not registered exactly once")
+            worker = matches[0]
+            if worker.get("status") != "idle" or worker.get("current_task_id"):
+                fail(f"worker {session}/{window} is no longer idle")
+            worker.update(status="busy", current_task_id=task_id, started_at=timestamp)
+        elif ns.command == "drop":
+            if len(ns.args) != 2:
+                fail("drop needs <window> <session>")
+            window, session = ns.args
+            data["workers"] = [w for w in workers if not (
+                w.get("tmux_window") == window and w.get("tmux_session") == session
+            )]
+        elif ns.command == "free":
+            if len(ns.args) < 2:
+                fail("free needs <session> <task-id> [task-id ...]")
+            session, *task_ids = ns.args
+            task_ids = set(task_ids)
+            for worker in workers:
+                if worker.get("tmux_session") == session and worker.get("current_task_id") in task_ids:
+                    worker.update(status="idle", current_task_id=None, started_at=None)
+        elif ns.command == "prune":
+            if len(ns.args) != 1:
+                fail("prune needs <tmux-binary>")
+            tmux = ns.args[0]
+            live = []
+            for worker in workers:
+                window = worker.get("tmux_window")
+                session = worker.get("tmux_session")
+                if not window or not session:
+                    continue
+                probe = subprocess.run(
+                    [tmux, "display-message", "-p", "-t", window, "#{session_name}"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if probe.returncode == 0 and probe.stdout.strip() == session:
+                    live.append(worker)
+            data["workers"] = live
+        elif ns.command == "release":
+            if len(ns.args) != 3:
+                fail("release needs <window> <session> <task-id>")
+            window, session, task_id = ns.args
+            for worker in workers:
+                if (
+                    worker.get("tmux_window") == window
+                    and worker.get("tmux_session") == session
+                    and worker.get("current_task_id") == task_id
+                ):
+                    worker.update(status="idle", current_task_id=None, started_at=None)
+        elif ns.command == "rename-session":
+            if len(ns.args) != 2:
+                fail("rename-session needs <old> <new>")
+            old, new = ns.args
+            for worker in workers:
+                if worker.get("tmux_session") == old:
+                    worker["tmux_session"] = new
+        elif ns.command == "register":
+            if len(ns.args) != 1:
+                fail("register needs one JSON worker object")
+            try:
+                entry = json.loads(ns.args[0])
+            except json.JSONDecodeError as exc:
+                fail(f"invalid register payload: {exc}")
+            if not isinstance(entry, dict):
+                fail("register payload must be an object")
+            window, session = entry.get("tmux_window"), entry.get("tmux_session")
+            if not window or not session:
+                fail("register payload needs tmux_window and tmux_session")
+            # tmux window ids are server-global. A different session for the same id
+            # is necessarily a stale row from an earlier server generation.
+            workers[:] = [w for w in workers if not (
+                w.get("tmux_window") == window and w.get("tmux_session") != session
+            )]
+            existing = next((w for w in workers if w.get("tmux_window") == window and
+                             w.get("tmux_session") == session), None)
+            if existing is None:
+                workers.append(entry)
+            else:
+                # Refresh identity metadata when an existing pane is re-adopted, but
+                # never erase an in-flight queue assignment.
+                assignment = {
+                    key: existing.get(key)
+                    for key in ("status", "current_task_id", "started_at", "registered_at")
+                    if key in existing
+                }
+                existing.update(entry)
+                existing.update(assignment)
+
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(path), prefix=".workers.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w") as output:
+                json.dump(data, output, indent=2)
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)

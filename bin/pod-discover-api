@@ -15,8 +15,8 @@
 #
 # IMPORTANT: subscription (OAuth) logins — Claude Max, ChatGPT — store a short-lived
 # OAuth token that does NOT authenticate against /v1/models (it 401s). So for a pure
-# subscription user this script exits non-zero and the adapter falls back to its
-# curated [[models]]. `pod-login <agent>` walks them through adding an API key.
+# subscription user this script exits non-zero and the adapter falls back to the
+# agent's inherited default. `pod-login <agent>` can add a key for custom adapters.
 #
 # Keys are handed to curl via a stdin config (-K -), never on the argv, so they don't
 # leak into `ps`. Requires curl + jq (both already hard deps of agent-pods).

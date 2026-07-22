@@ -21,6 +21,7 @@
 #   ./install.sh --no-claude-hooks     non-interactively skip them
 #   ./install.sh --with-codex-hooks    non-interactively wire the Codex hooks
 #   ./install.sh --no-codex-hooks      non-interactively skip them
+#   ./install.sh --no-logins           compatibility flag; bundled discovery needs no API key
 set -u
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
@@ -49,7 +50,7 @@ for arg in "$@"; do
     -h|--help)
       echo "usage: install.sh [--with-claude-hooks|--no-claude-hooks] [--with-codex-hooks|--no-codex-hooks] [--with-logins|--no-logins]"
       echo "  Installs agent-pods: preflight deps, seed slots, symlink bin/* onto PATH."
-      echo "  --with-logins   set up live Claude/Codex model discovery (prompts for an API key)"
+      echo "  --with-logins   set up any custom API-backed adapters (bundled agents need no key)"
       exit 0 ;;
     *) echo "install.sh: unknown argument '$arg' (try --help)" >&2; exit 2 ;;
   esac
@@ -129,9 +130,9 @@ mkdir -p "$CONFIG_DIR" 2>/dev/null || die "cannot create config dir $CONFIG_DIR"
 if [ -f "$SLOTS" ]; then
   ok "slots.json already exists — leaving it untouched ($SLOTS)"
 else
-  # Generate the slots via python so we can call pod-adapter for each agent's default
-  # model/effort -> launch cmd + pretty card, and emit the exact {agent,model,effort,
-  # label,cmd} shape that pod-spawn-menu-build / pod-settings-menu read.
+  # Generate slots via python so we can validate each adapter and render its default
+  # card. Agent slots store only semantic selections; the quick picker derives the
+  # current command and label from local discovery when it opens/clicks.
   POD_REPO="$REPO" POD_BIN="$POD_BIN" "$PY_BIN" - "$ADAPTER" "$SLOTS" $AVAILABLE <<'PY'
 import json, os, subprocess, sys
 
@@ -155,10 +156,7 @@ for aid in available:
     if aid == "generic-shell":
         # a plain shell window: no model/effort, the floor that always works.
         label = adapter_call("card", aid) or "Shell"
-        # launch returns a literal "${SHELL:-/bin/bash}" expansion; pod-add-worker's
-        # --cmd path runs it through `exec`, so the expansion resolves at spawn time.
-        cmd = adapter_call("launch", aid) or "${SHELL:-/bin/bash}"
-        slots.append({"agent": aid, "model": "", "effort": "", "label": label, "cmd": cmd})
+        slots.append({"agent": aid, "model": "", "effort": "", "label": label})
         continue
     model = adapter_call("field", aid, "model")
     effort = adapter_call("field", aid, "effort")
@@ -168,13 +166,13 @@ for aid in available:
         continue
     slots.append({
         "agent": aid, "model": model, "effort": effort,
-        "label": label or aid, "cmd": cmd,
+        "label": label or aid,
     })
 
 # Ensure at least one usable slot even if everything above came up empty.
 if not slots:
     slots.append({"agent": "generic-shell", "model": "", "effort": "",
-                  "label": "Shell", "cmd": "${SHELL:-/bin/bash}"})
+                  "label": "Shell"})
 
 data = {"title": "Spawn agent (0-9)", "slots": slots}
 os.makedirs(os.path.dirname(slots_path), exist_ok=True)
@@ -312,12 +310,12 @@ else
   fi
 fi
 
-# --- 6. optional: log in for live model discovery --------------------------------
-# Some agents (claude-code, codex) can't list their models from the CLI, but the
-# provider REST API can — given an API key. Offer to set that up. Agents whose login
-# is a subscription (no API key) just keep their curated list; nothing breaks.
+# --- 6. optional: log in for custom API-backed discovery -------------------------
+# Bundled agents discover from their local CLI/provider and never need an extra key.
+# Preserve pod-login support only for a user-supplied adapter that explicitly declares
+# [discover].auth.
 say ""
-say "Live model discovery (Claude / Codex)"
+say "Custom API-backed model discovery"
 login_agents=""
 for aid in $AVAILABLE; do
   prov="$("$ADAPTER" field "$aid" auth 2>/dev/null)"
@@ -334,11 +332,11 @@ else
   do_login="no"
   case "$LOGINS_CHOICE" in
     yes) do_login="yes" ;;
-    no)  ok "skipping (--no-logins); these keep their curated lists:$login_agents" ;;
+    no)  ok "skipping custom API logins (--no-logins):$login_agents" ;;
     ask)
       if [ -t 0 ]; then
-        printf '  These agents can show your LIVE models with an API key:%s\n' "$login_agents"
-        printf '  Set that up now? (a plain subscription login keeps the curated list) [y/N] '
+        printf '  These custom adapters declare API-key discovery:%s\n' "$login_agents"
+        printf '  Set that up now? [y/N] '
         read -r reply
         case "$reply" in [Yy]*) do_login="yes" ;; *) do_login="no" ;; esac
       else

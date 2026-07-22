@@ -8,8 +8,8 @@
 # provider's key page, reads your key WITHOUT echoing it, VALIDATES it with a live
 # /v1/models call, and only then stores it at ~/.config/pod/keys/<provider> (chmod 600).
 #
-# With no agent-id it walks every installed agent that supports API discovery.
-# Nothing here is destructive: skip any agent and it keeps its curated model list.
+# With no agent-id it walks every installed adapter that explicitly opts into API
+# discovery. Bundled Claude/Codex adapters use their local /model menus instead.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -48,7 +48,7 @@ already_live() { "$DISCOVER" "$1" >/dev/null 2>&1; }
 login_one() {
   local agent="$1" prov; prov="$(provider_of "$agent")"
   if [ -z "$prov" ]; then
-    echo "  $agent: no API discovery (curated model list) — nothing to log in to."
+    echo "  $agent: no API discovery — local discovery/inheritance needs no extra login."
     return 0
   fi
 
@@ -67,10 +67,10 @@ login_one() {
     echo "  (non-interactive shell — re-run 'pod-login $agent' in a terminal to paste a key.)"
     return 0
   fi
-  printf '  Paste your %s API key (or press Enter to skip and keep the curated list): ' "$(provider_name "$prov")"
+  printf '  Paste your %s API key (or press Enter to skip): ' "$(provider_name "$prov")"
   local key; IFS= read -rs key; echo
   if [ -z "$key" ]; then
-    echo "  skipped — $agent keeps its curated models."
+    echo "  skipped — $agent will inherit its local default if discovery is unavailable."
     return 0
   fi
 
@@ -116,7 +116,7 @@ main() {
     [ -z "$a" ] && continue
     if [ -n "$(provider_of "$a")" ]; then any=1; login_one "$a"; fi
   done < <("$ADAPTER" list --available 2>/dev/null)
-  [ "$any" = 0 ] && echo "  no installed agent uses API discovery (cursor/ollama discover with no login)."
+  [ "$any" = 0 ] && echo "  no installed adapter requires an API login."
   return 0
 }
 

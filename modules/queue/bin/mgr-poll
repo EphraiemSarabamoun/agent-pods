@@ -30,13 +30,18 @@
 
 set -euo pipefail
 POD_BIN="$(cd "$(dirname "$0")/../../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+. "$POD_BIN/_mgr-runtime.sh"
 T="$POD_TMUX"
 
 INBOX_ROOT="$POD_INBOX"
-QUEUE_DIR="$POD_INBOX/_queue"
 WORKERS_PATH="$POD_STATE/workers.json"
 LOG_PATH="$POD_STATE/log.jsonl"
-DISPATCHED="$POD_STATE/dispatched"
+CURRENT_POD="$(mgr_current_pod)"
+CURRENT_POD="$(mgr_pod_component "$CURRENT_POD")" || exit 2
+QUEUE_DIR="$(mgr_queue_dir "$CURRENT_POD")"
+DISPATCHED="$(mgr_dispatched_dir "$CURRENT_POD")"
+COMPLETED="$(mgr_completed_dir "$CURRENT_POD")"
+WORKERS_UPDATE="$POD_BIN/pod-workers-json"
 
 QUIET=0
 EMIT_JSON=0
@@ -49,13 +54,71 @@ for arg in "$@"; do
 done
 
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+NOW_EPOCH=$(date +%s)
+mkdir -p "$QUEUE_DIR" "$DISPATCHED" "$COMPLETED"
+
+# ---- interrupted-dispatch recovery -------------------------------------------
+# mgr-dispatch archives a task as status=dispatching before it types anything and
+# flips it to dispatched immediately after Enter. A killed dispatcher therefore
+# leaves an explicit transaction to heal. After a grace period: a live busy/wait
+# worker means delivery happened (commit the archive); an idle/dead worker means it
+# did not (atomically restore the queue record and release only that exact claim).
+RECOVERY_AFTER="${MGR_DISPATCH_RECOVERY_SECONDS:-30}"
+case "$RECOVERY_AFTER" in ''|*[!0-9]*) RECOVERY_AFTER=30 ;; esac
+for archive in "$DISPATCHED"/*.json; do
+  [ -e "$archive" ] || continue
+  [ "$(jq -r '.status // empty' "$archive" 2>/dev/null)" = "dispatching" ] || continue
+  started_epoch="$(jq -r '.dispatch_started_epoch // 0' "$archive" 2>/dev/null || echo 0)"
+  case "$started_epoch" in ''|*[!0-9]*) started_epoch=0 ;; esac
+  [ $((NOW_EPOCH - started_epoch)) -ge "$RECOVERY_AFTER" ] || continue
+  tid="$(jq -r '.task_id // empty' "$archive" 2>/dev/null || true)"
+  wid="$(jq -r '.target // empty' "$archive" 2>/dev/null || true)"
+  pod_valid_component "$tid" || continue
+  if [ -f "$INBOX_ROOT/$tid/DONE" ] || [ -f "$INBOX_ROOT/$tid/EXECUTED" ]; then
+    continue
+  fi
+  live_session="$("$T" display-message -p -t "$wid" '#{session_name}' 2>/dev/null || true)"
+  live_state="$("$T" show-options -w -t "$wid" -qv @cc_state 2>/dev/null || true)"
+  live_work="$("$T" show-options -w -t "$wid" -qv @work 2>/dev/null || true)"
+  if [ "$live_session" = "$CURRENT_POD" ] && { [ "$live_state" = busy ] || [ "$live_state" = wait ] || [ -n "$live_work" ]; }; then
+    tmp="${archive}.tmp.$$"
+    if jq --arg healed "$NOW" '. + {status:"dispatched", dispatch_recovered_at:$healed}' \
+        "$archive" > "$tmp"; then
+      mv "$tmp" "$archive"
+    else
+      rm -f "$tmp" 2>/dev/null || true
+    fi
+    continue
+  fi
+  priority="$(jq -r '.priority // 100' "$archive" 2>/dev/null || echo 100)"
+  case "$priority" in ''|*[!0-9]*) priority=100 ;; esac
+  queued_at="$(jq -r '.queued_at // empty' "$archive" 2>/dev/null || true)"
+  [ -n "$queued_at" ] || queued_at="$NOW"
+  stamp="$(printf '%s' "$queued_at" | tr ':+' '--')"
+  restored="${QUEUE_DIR}/$(printf '%03d' "$priority")-${stamp}-${tid}.json"
+  if mv "$archive" "$restored" 2>/dev/null; then
+    tmp="${restored}.tmp.$$"
+    if jq '. + {status:"queued"} | del(.target, .dispatch_started_at,
+      .dispatch_started_epoch, .dispatched_at)' "$restored" > "$tmp"; then
+      mv "$tmp" "$restored"
+    else
+      rm -f "$tmp" 2>/dev/null || true
+    fi
+    "$WORKERS_UPDATE" --path "$WORKERS_PATH" release \
+      "$wid" "$CURRENT_POD" "$tid" >/dev/null 2>&1 || true
+    jq -nc --arg ts "$NOW" --arg tid "$tid" --arg tgt "$wid" --arg pod "$CURRENT_POD" \
+      '{ts:$ts,event:"dispatch_recovered",task_id:$tid,target:$tgt,pod:$pod,
+        reason:"stale pre-delivery transaction"}' >> "$LOG_PATH"
+  fi
+done
 
 # ---- dead-worker reclaim -----------------------------------------------------
 # A worker row still holding a task whose window died cannot complete it. Put
 # the archived queue record back FIRST (mv is the atomic task-state transition),
 # then drop the dead row. Completed tasks are skipped here — the DONE sweep
 # below frees them dead-window or not.
-assigned=$(jq -r '.workers[]
+assigned=$(jq -r --arg pod "$CURRENT_POD" '.workers[]
+  | select(.tmux_session == $pod)
   | select(.status=="busy" or ((.current_task_id // "") != ""))
   | (.tmux_window // "") + "|" + (.current_task_id // "")' "$WORKERS_PATH" 2>/dev/null || true)
 requeued=()
@@ -63,12 +126,13 @@ if [ -n "$assigned" ]; then
   while IFS='|' read -r wid tid; do
     [ -n "$wid" ] || continue
     [ -n "$tid" ] || continue
+    pod_valid_component "$tid" || continue
     if [ -f "${INBOX_ROOT}/${tid}/DONE" ] || [ -f "${INBOX_ROOT}/${tid}/EXECUTED" ]; then continue; fi
     # Window still alive? then the assignment is still in flight. Liveness MUST be
     # judged on the probe's OUTPUT, never its exit code: display-message on a dead
     # window id exits 0 with EMPTY output (tmux resolves the bad target leniently),
     # so an exit-code test sees every corpse as alive and the reclaim never fires.
-    if [ "$("$T" display-message -p -t "$wid" '#{window_id}' 2>/dev/null)" = "$wid" ]; then continue; fi
+    if [ "$("$T" display-message -p -t "$wid" '#{session_name}' 2>/dev/null)" = "$CURRENT_POD" ]; then continue; fi
     # already back in the queue? (an earlier sweep may have requeued it)
     existing=""
     for qf in "$QUEUE_DIR"/*-"${tid}".json; do
@@ -89,17 +153,16 @@ if [ -n "$assigned" ]; then
       else
         # No durable task record to restore. Leave the row in place so the
         # assignment never disappears from both the queue and the registry.
-        jq -nc --arg ts "$NOW" --arg tid "$tid" --arg tgt "$wid" \
-          '{ts: $ts, event: "reclaim_failed", task_id: $tid, target: $tgt, reason: "dispatched archive missing"}' \
+        jq -nc --arg ts "$NOW" --arg tid "$tid" --arg tgt "$wid" --arg pod "$CURRENT_POD" \
+          '{ts: $ts, event: "reclaim_failed", task_id: $tid, target: $tgt, pod:$pod, reason: "dispatched archive missing"}' \
           >> "$LOG_PATH"
         continue
       fi
     fi
     # drop the dead row only after the task is safely back in the queue
-    TMP=$(mktemp)
-    jq --arg tw "$wid" '.workers |= map(select(.tmux_window != $tw))' "$WORKERS_PATH" > "$TMP" && mv "$TMP" "$WORKERS_PATH"
-    jq -nc --arg ts "$NOW" --arg tid "$tid" --arg tgt "$wid" \
-      '{ts: $ts, event: "reclaimed", task_id: $tid, target: $tgt, reason: "worker window died"}' \
+    "$WORKERS_UPDATE" --path "$WORKERS_PATH" drop "$wid" "$CURRENT_POD"
+    jq -nc --arg ts "$NOW" --arg tid "$tid" --arg tgt "$wid" --arg pod "$CURRENT_POD" \
+      '{ts: $ts, event: "reclaimed", task_id: $tid, target: $tgt, pod:$pod, reason: "worker window died"}' \
       >> "$LOG_PATH"
     requeued+=("$tid")
   done <<< "$assigned"
@@ -108,7 +171,7 @@ fi
 # ---- DONE sweep ---------------------------------------------------------------
 # Read currently-busy rows from workers.json, keeping the window handle per task
 # so the freed loop below can clear the board and the reaper can find it.
-busy_rows=$(jq -r '.workers[] | select(.status=="busy")
+busy_rows=$(jq -r --arg pod "$CURRENT_POD" '.workers[] | select(.tmux_session == $pod and .status=="busy")
   | (.tmux_window // "") + "|" + (.current_task_id // "")' "$WORKERS_PATH" 2>/dev/null || true)
 
 freed=()
@@ -116,6 +179,7 @@ freed_wins=()
 if [ -n "$busy_rows" ]; then
   while IFS='|' read -r wid tid; do
     [ -z "$tid" ] && continue
+    pod_valid_component "$tid" || continue
     if [ -f "${INBOX_ROOT}/${tid}/DONE" ] || [ -f "${INBOX_ROOT}/${tid}/EXECUTED" ]; then
       freed+=("$tid")
       freed_wins+=("$wid")
@@ -130,17 +194,7 @@ if [ "${#freed[@]}" -eq 0 ] && [ "${#requeued[@]}" -eq 0 ]; then
 fi
 
 if [ "${#freed[@]}" -gt 0 ]; then
-  # Build a jq filter that flips every freed task's worker to idle.
-  TMP=$(mktemp)
-  freed_json=$(printf '%s\n' "${freed[@]}" | jq -R . | jq -s .)
-  jq --argjson freed "$freed_json" --arg now "$NOW" '
-    .workers |= map(
-      if (.current_task_id as $t | $freed | index($t))
-      then .status = "idle" | .current_task_id = null | .started_at = null
-      else .
-      end
-    )
-  ' "$WORKERS_PATH" > "$TMP" && mv "$TMP" "$WORKERS_PATH"
+  "$WORKERS_UPDATE" --path "$WORKERS_PATH" free "$CURRENT_POD" "${freed[@]}"
 fi
 
 # Append completion events, clear the board headline, and remove the now-stale
@@ -154,8 +208,14 @@ while [ "$i" -lt "${#freed[@]}" ]; do
     "$T" set-option -w -t "$wid" @work "" 2>/dev/null || true
     "$T" set-option -w -t "$wid" @work_at "" 2>/dev/null || true
   fi
-  jq -nc --arg ts "$NOW" --arg tid "$tid" --arg tgt "$wid" \
-    '{ts: $ts, event: "completed", task_id: $tid, target: $tgt}' \
+  # Durable per-pod completion markers let pod-task-wait observe the transition
+  # even if another poller frees the registry row before its next sample.
+  marker_tmp="${COMPLETED}/.${tid}.tmp.$$"
+  jq -nc --arg ts "$NOW" --arg tid "$tid" --arg tgt "$wid" --arg pod "$CURRENT_POD" \
+    '{ts:$ts,task_id:$tid,target:$tgt,pod:$pod}' > "$marker_tmp"
+  mv "$marker_tmp" "${COMPLETED}/${tid}.json"
+  jq -nc --arg ts "$NOW" --arg tid "$tid" --arg tgt "$wid" --arg pod "$CURRENT_POD" \
+    '{ts: $ts, event: "completed", task_id: $tid, target: $tgt, pod:$pod}' \
     >> "$LOG_PATH"
   rm -f "${DISPATCHED}/${tid}.json" 2>/dev/null || true
 done
@@ -178,7 +238,7 @@ if [ "${MGR_REAP_FINISHED_WORKERS:-1}" = "1" ] && [ "${#freed[@]}" -gt 0 ]; then
       [ -n "$wid" ] || continue
       # window must still exist — judged on OUTPUT, not exit code (see the reclaim
       # probe above: display-message on a dead id exits 0 with empty output)
-      [ "$("$T" display-message -p -t "$wid" '#{window_id}' 2>/dev/null)" = "$wid" ] || continue
+      [ "$("$T" display-message -p -t "$wid" '#{session_name}' 2>/dev/null)" = "$CURRENT_POD" ] || continue
       # never the manager/home window (index 0)
       [ "$("$T" display-message -p -t "$wid" '#{window_index}' 2>/dev/null || echo -1)" = "0" ] && continue
       # the registry must agree the worker is idle (not re-dispatched mid-sweep)
@@ -189,8 +249,8 @@ if [ "${MGR_REAP_FINISHED_WORKERS:-1}" = "1" ] && [ "${#freed[@]}" -gt 0 ]; then
         busy|wait) continue ;;
       esac
       "$POD_BIN/pod-kill-worker" "$wid" >/dev/null 2>&1 || continue
-      jq -nc --arg ts "$NOW" --arg tgt "$wid" \
-        '{ts: $ts, event: "worker_reaped_on_completion", target: $tgt}' >> "$LOG_PATH"
+      jq -nc --arg ts "$NOW" --arg tgt "$wid" --arg pod "$CURRENT_POD" \
+        '{ts: $ts, event: "worker_reaped_on_completion", target: $tgt, pod:$pod}' >> "$LOG_PATH"
     done
   fi
 fi

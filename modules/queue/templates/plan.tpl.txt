@@ -22,7 +22,7 @@ PLAN SHAPE:
 5. Risk assessment — what could break that isn't in the manifest.
 
 COMPLETION PROTOCOL:
-- Write your structured result to your task directory: $POD_INBOX/{{task_id}}/result.json (default $POD_INBOX is /tmp/pod/inbox) with this shape:
+- Write your structured result to your task directory: $POD_INBOX/{{task_id}}/result.json with this shape:
 {{output_schema}}
 - Embed the full execution script as a string in the JSON (don't write it to a separate file).
 - As your ABSOLUTE LAST action: `touch $POD_INBOX/{{task_id}}/DONE`.

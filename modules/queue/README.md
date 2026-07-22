@@ -13,8 +13,8 @@ cleared. It is a convenience over the raw inbox protocol, not a database.
 
 ## The inbox protocol
 
-Each task gets a directory `$POD_INBOX/<task-id>/` (default `$POD_INBOX` is
-`/tmp/pod/inbox`):
+Each task gets a directory `$POD_INBOX/<task-id>/` (by default under the private
+per-user `$POD_TMP` runtime tree):
 
 - `prompt.txt` — the full task prompt the worker reads (staged by `mgr-stage`).
 - `result.json` — the worker's structured result:
@@ -22,18 +22,23 @@ Each task gets a directory `$POD_INBOX/<task-id>/` (default `$POD_INBOX` is
 - `DONE` — an empty sentinel the worker `touch`es as its **last** action, so the
   manager only reads `result.json` after it is complete.
 
-Supporting state lives under `$POD_STATE` (default `/tmp/pod/state`):
+Supporting state lives under `$POD_STATE` (also under `$POD_TMP` by default):
 
 - `workers.json` — the worker registry (written by `pod-add-worker`; this module
   reads it to find idle workers and flips them busy/idle).
 - `tmux_group.json` — records which pod is primary + which window is the manager
   (so dispatch never fires into the manager seat).
 - `log.jsonl` — append-only dispatch/completion audit trail.
-- `dispatched/` — archived queue files for in-flight tasks.
+- `dispatched/<pod>/` — archived queue files for that pod's in-flight tasks.
+- `completed/<pod>/` — durable completion markers used by `pod-task-wait` so a
+  concurrent poll cannot hide a just-finished task.
 
-Queue files live under `$POD_INBOX/_queue/`; templates under
+Queue files live under `$POD_INBOX/_queue/<pod>/`; templates under
 `$POD_INBOX/_templates/`. Copy or symlink this module's `templates/*.tpl.txt`
 into `$POD_INBOX/_templates/` at setup so `mgr-stage` can find them.
+Task ids remain globally unique because their prompt/result directories retain the
+stable `$POD_INBOX/<task-id>/` contract, but schedulable queue and archive records are
+strictly pod-scoped. One pod therefore cannot consume another pod's queue head.
 
 Ghost queue entries (a queue file whose staged `prompt.txt` has vanished) are
 quarantined to `$POD_INBOX/_state/dead/` at auto-pick time, so a broken entry
@@ -56,7 +61,9 @@ All live in `modules/queue/bin/`; add that dir to your PATH (or call by path).
   qualifies when its LIVE window agrees (alive, in the calling pod, `@cc_state`
   idle); busy/wait windows are never interrupted, and cross-pod targets are
   refused. Marks the worker busy, stamps the board (`@work`/`@cc_state`), and
-  logs the assignment to the pod's channel feed.
+  logs the assignment to the pod's channel feed. A durable `dispatching` record
+  plus signal rollback lets `mgr-poll` recover an interrupted dispatcher without
+  silently losing or blindly duplicating the task.
 - `mgr-poll [--quiet] [--json]` — sweep for `DONE` sentinels and flip completed
   workers back to idle (clearing their `@work` headline). Requeues the task of
   any worker whose window died mid-assignment, and — once the queue is fully
@@ -74,10 +81,12 @@ All live in `modules/queue/bin/`; add that dir to your PATH (or call by path).
   queue fully drained, close each worker window whose task just completed
   (guarded: window alive, not the manager, registry idle, live state not
   busy/wait). Set to `0` to keep finished workers open for reuse.
+- `MGR_DISPATCH_RECOVERY_SECONDS` (default `30`) — grace period before `mgr-poll`
+  heals a stale pre-delivery `dispatching` transaction.
 
 ## Templates
 
-Five canonical shapes ship here, four of which are wired in `_registry.json`
+Four canonical shapes ship here and are wired in `_registry.json`
 (`audit`, `execute`, `investigate`, `plan`). Each is a plain text file with
 `{{var}}` placeholders and a COMPLETION PROTOCOL footer that tells the worker to
 write `result.json` then `touch DONE`. Drop a new `.tpl.txt` in `templates/`

@@ -33,7 +33,7 @@ fi
 # socket probe fails. Explicit per seat, so a seat spawned from inside another
 # agent's pane can never inherit the parent's identity and mis-identify.
 if [ -n "$win" ]; then
-  POD_WINDOW="$win"; export POD_WINDOW
+  POD_WINDOW="$win"; POD_ROLE=worker; export POD_WINDOW POD_ROLE
   baid="$("$T" show-options -w -t "$win" -qv @agent_id 2>/dev/null)"
   if [ -n "$baid" ]; then POD_AGENT_ID="$baid"; export POD_AGENT_ID; fi
 fi

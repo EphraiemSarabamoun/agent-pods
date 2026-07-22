@@ -2,7 +2,7 @@
 # install.sh — wire agent-pods' Claude Code lifecycle hooks into the user's Claude
 # Code settings.json WITHOUT clobbering any existing hooks.
 #
-# Claude Code is the one adapter with full lifecycle integration: these hooks give it
+# Claude Code is one of the hook-integrated adapters: these hooks give it
 # instant state dots on the pod strip, work-headline capture, startup pod-awareness,
 # and pod-mail surfaced as additionalContext. The wiring:
 #
@@ -37,13 +37,15 @@ AWARENESS="$HOOK_DIR/pod-awareness.sh"
 SETTINGS=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --settings) SETTINGS="${2:-}"; shift 2 ;;
+    --settings)
+      [ "$#" -ge 2 ] || { echo "install.sh: --settings requires a value" >&2; exit 2; }
+      SETTINGS="$2"; shift 2 ;;
     -h|--help)
       echo "usage: install.sh [--settings <path>]"
       echo "  Wires agent-pods Claude Code hooks into settings.json."
       echo "  Default: \$CLAUDE_CONFIG_DIR/settings.json else ~/.claude/settings.json"
       exit 0 ;;
-    *) shift ;;
+    *) echo "install.sh: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
 if [ -z "$SETTINGS" ]; then
@@ -58,7 +60,7 @@ command -v python3 >/dev/null 2>&1 || { echo "install.sh: python3 required" >&2;
 
 # --- merge via python: back up, add only missing pod entries, atomic write --------
 python3 - "$SETTINGS" "$POD_BIN" "$AWARENESS" <<'PY'
-import json, os, sys, tempfile, datetime
+import json, os, shutil, sys, tempfile, datetime
 
 settings_path, pod_bin, awareness = sys.argv[1], sys.argv[2], sys.argv[3]
 
@@ -158,11 +160,10 @@ if not added:
 
 # --- back up the existing file ---
 if existed:
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     backup = "%s.pod-bak.%s" % (settings_path, stamp)
     try:
-        with open(settings_path) as src, open(backup, "w") as dst:
-            dst.write(src.read())
+        shutil.copy2(settings_path, backup)
         print("install.sh: backed up %s -> %s" % (settings_path, backup))
     except Exception as e:
         print("install.sh: backup failed (%s); aborting" % e, file=sys.stderr)
@@ -172,6 +173,7 @@ if existed:
 os.makedirs(os.path.dirname(os.path.abspath(settings_path)), exist_ok=True)
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(settings_path)), prefix=".settings.", suffix=".tmp")
 try:
+    os.fchmod(fd, (os.stat(settings_path).st_mode & 0o777) if existed else 0o600)
     with os.fdopen(fd, "w") as tf:
         json.dump(data, tf, indent=2)
         tf.write("\n")

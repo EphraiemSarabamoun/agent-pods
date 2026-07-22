@@ -18,15 +18,38 @@ T="$POD_TMUX"
 INTERVAL="$POD_FOREIGN_INTERVAL"
 TRIM="$POD_FOREIGN_TRIM"
 PIDFILE="$POD_STATE/pod-foreign-state.pid"
+LOCKDIR="$PIDFILE.lock"
 mkdir -p "$POD_STATE" 2>/dev/null || true
 
-# Singleton (kill -0 liveness; portable, no flock). Small launch race is acceptable.
-if [ -f "$PIDFILE" ]; then
+# Atomic singleton lock. Verify both PID liveness and command identity so PID reuse
+# cannot make an unrelated process suppress the poller forever.
+is_live_poller() {
+  case "${1:-}" in ""|*[!0-9]*) return 1 ;; esac
+  kill -0 "$1" 2>/dev/null || return 1
+  case "$(ps -p "$1" -o command= 2>/dev/null)" in *pod-foreign-state*) return 0 ;; esac
+  return 1
+}
+if mkdir "$LOCKDIR" 2>/dev/null; then
+  # Compatibility with a poller launched by an older version that only wrote PIDFILE.
   oldpid="$(cat "$PIDFILE" 2>/dev/null)"
-  if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then exit 0; fi
+  if is_live_poller "$oldpid"; then rmdir "$LOCKDIR" 2>/dev/null; exit 0; fi
+else
+  oldpid="$(cat "$LOCKDIR/pid" 2>/dev/null)"
+  is_live_poller "$oldpid" && exit 0
+  stale="$LOCKDIR.stale.$$"
+  mv "$LOCKDIR" "$stale" 2>/dev/null || exit 0
+  rm -f "$stale/pid" 2>/dev/null
+  rmdir "$stale" 2>/dev/null || exit 0
+  mkdir "$LOCKDIR" 2>/dev/null || exit 0
 fi
-echo $$ > "$PIDFILE" 2>/dev/null || true
-cleanup() { rm -f "$PIDFILE" 2>/dev/null; }
+printf '%s\n' $$ > "$LOCKDIR/pid" 2>/dev/null || { rmdir "$LOCKDIR" 2>/dev/null; exit 0; }
+printf '%s\n' $$ > "$PIDFILE" 2>/dev/null || true
+cleanup() {
+  [ "$(cat "$LOCKDIR/pid" 2>/dev/null)" != "$$" ] || {
+    rm -f "$LOCKDIR/pid" "$PIDFILE" 2>/dev/null
+    rmdir "$LOCKDIR" 2>/dev/null || true
+  }
+}
 trap cleanup EXIT
 trap 'exit 0' INT TERM HUP
 
@@ -40,7 +63,7 @@ while :; do
 
   touched=0
   for s in $pods; do
-    while IFS='|' read -r wid wname cmd; do
+    while IFS='|' read -r wid wname _cmd; do
       [ -n "$wid" ] || continue
 
       # ---- mirror reconciliation (sandboxed hook agents) --------------------------

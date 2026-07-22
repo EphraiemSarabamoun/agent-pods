@@ -6,8 +6,9 @@
 # whenever an agent is idle" trigger. The manager then polls (mgr-pick-next),
 # dispatches the next queued chunk to the freed worker(s), and re-arms this watcher.
 #
-# "Idle" signal: a change in the set of $POD_INBOX/*/DONE sentinels (a worker finished
-# its dispatched task and touched DONE). This is the clean, protocol-native signal.
+# "Idle" signal: a change in this pod's DONE-backed dispatch/completion markers (a
+# worker finished its dispatched task and touched DONE). This is the clean,
+# protocol-native signal and cannot be erased by a concurrent mgr-poll.
 # Workers that go idle WITHOUT a DONE (errored, never-tasked, stuck at a REPL prompt)
 # are NOT caught here — the safety timeout heartbeat exists so the manager wakes anyway
 # and can sweep for those.
@@ -26,7 +27,6 @@ set -u
 POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
 . "$POD_BIN/_mgr-runtime.sh" 2>/dev/null || true
 
-STATE="$POD_STATE/pod-task.json"
 TIMEOUT="${1:-1200}"
 POLL="${POD_TASK_WAIT_POLL:-3}"
 
@@ -35,38 +35,68 @@ POLL="${POD_TASK_WAIT_POLL:-3}"
 # tool; POD_SESSION is the creation-time fallback baked into window 0's environment.
 POD=""
 command -v mgr_current_pod >/dev/null 2>&1 && POD="$(mgr_current_pod)"
+STATE="$POD_STATE/pod-tasks/$(pod_path_component "${POD:-$POD_SESSION_PREFIX}").json"
+POD_COMPONENT="$(pod_path_component "${POD:-$POD_SESSION_PREFIX}")"
+DISPATCHED="$POD_STATE/dispatched/$POD_COMPONENT"
+COMPLETED="$POD_STATE/completed/$POD_COMPONENT"
+WAIT_CURSOR="$POD_STATE/pod-tasks/${POD_COMPONENT}.wait-completions"
 auto_on() {
   [ -n "$POD" ] || return 0
   command -v mgr_full_auto >/dev/null 2>&1 || return 0
   mgr_full_auto "$POD"
 }
 
-# Honor a done/paused state file ONLY when it's THIS pod's loop. pod-task.json is a
-# host-global singleton any pod's loop can write, so a foreign pod's "done" must not
-# self-terminate our watcher. An unscoped file (no .pod) is still honored; a pod we
-# can't resolve ($POD empty) degrades to the old honor-regardless behavior.
+# The state path is scoped to this pod, so sibling loops cannot terminate this one.
 state_terminal_for_me() {
   [ -f "$STATE" ] || return 1
   command -v jq >/dev/null 2>&1 || return 1
-  local spod sst
-  spod="$(jq -r '.pod // empty' "$STATE" 2>/dev/null)"
-  if [ -n "$spod" ] && [ -n "$POD" ] && [ "$spod" != "$POD" ]; then
-    return 1
-  fi
+  local sst
   sst="$(jq -r '.status // "running"' "$STATE" 2>/dev/null)"
   case "$sst" in done|paused) return 0 ;; esac
   return 1
 }
 
-# the set of DONE sentinels as a stable string (portable — no shasum/cksum dependency)
-snapshot() { ls "$POD_INBOX"/*/DONE 2>/dev/null | sort | tr '\n' ' '; }
+# The set of completed task ids as a stable string. In-flight archives let the
+# watcher see DONE before mgr-poll runs; durable completion markers preserve the
+# same id after a concurrent poll frees the worker and removes that archive.
+snapshot() {
+  [ -n "$POD" ] || { ls "$POD_INBOX"/*/DONE 2>/dev/null | sort | tr '\n' ' '; return; }
+  {
+    for archive in "$DISPATCHED"/*.json; do
+      [ -e "$archive" ] || continue
+      tid="$(jq -r '.task_id // empty' "$archive" 2>/dev/null || true)"
+      pod_valid_component "$tid" || continue
+      if [ -f "$POD_INBOX/$tid/DONE" ] || [ -f "$POD_INBOX/$tid/EXECUTED" ]; then
+        printf '%s\n' "$tid"
+      fi
+    done
+    for marker in "$COMPLETED"/*.json; do
+      [ -e "$marker" ] || continue
+      tid="${marker##*/}"; tid="${tid%.json}"
+      pod_valid_component "$tid" && printf '%s\n' "$tid"
+    done
+  } | sort -u | tr '\n' ' '
+}
+
+save_cursor() {
+  mkdir -p "$(dirname "$WAIT_CURSOR")" 2>/dev/null || true
+  tmp="${WAIT_CURSOR}.tmp.$$"
+  printf '%s' "$1" > "$tmp" && mv "$tmp" "$WAIT_CURSOR"
+}
 
 # Refuse to arm while the switch is off — a manual pod has no business waking the loop.
 auto_on || { echo "auto-off"; exit 0; }
 # If THIS pod's state file already says done/paused, don't even arm.
 state_terminal_for_me && { echo "stopped"; exit 0; }
 
-baseline="$(snapshot)"
+baseline="$(cat "$WAIT_CURSOR" 2>/dev/null || true)"
+current="$(snapshot)"
+if [ "$current" != "$baseline" ]; then
+  save_cursor "$current"
+  echo "idle-change"
+  exit 0
+fi
+baseline="$current"
 end=$(( $(date +%s) + TIMEOUT ))
 
 while [ "$(date +%s)" -lt "$end" ]; do
@@ -75,6 +105,7 @@ while [ "$(date +%s)" -lt "$end" ]; do
   auto_on || { echo "auto-off"; exit 0; }
   cur="$(snapshot)"
   if [ "$cur" != "$baseline" ]; then
+    save_cursor "$cur"
     echo "idle-change"
     exit 0
   fi

@@ -29,8 +29,8 @@ idempotent unless `force=True`).
 
 **Discovery** — `pod_list_templates`, `pod_get_template`.
 
-**Workers** — `pod_list_workers`, `pod_spawn_window` (spawn a colored generic-shell
-worker window in the active pod and register it), `pod_register_worker` (track an
+**Workers** — `pod_list_workers`, `pod_spawn_window` (spawn a colored adapter-backed
+agent or generic-shell window in the active pod and register it), `pod_register_worker` (track an
 existing window), `pod_window_contents` (peek a worker's pane via `capture-pane`).
 
 **Dispatch** (wraps `mgr-*`) — `pod_stage`, `pod_queue`, `pod_dispatch`, `pod_poll`,
@@ -40,6 +40,8 @@ existing window), `pod_window_contents` (peek a worker's pane via `capture-pane`
 
 **Intervention** (experimental) — `pod_send_input` (type into a running worker;
 refuses the manager window).
+
+**Group** — `pod_group_status` (active pod/session and live deck windows).
 
 The first call should be `pod_init()`.
 
@@ -55,23 +57,31 @@ The first call should be `pod_init()`.
 
 ## Install / run
 
-From this directory:
+The MCP server is intentionally **checkout-bound**. It wraps `bin/`, the queue
+helpers, adapter catalog, templates, and palette from the same repository, so it is
+not published as a standalone wheel that would duplicate and eventually drift from
+those assets.
+
+From the repository root, let `uv` create an isolated environment, install the MCP
+SDK, and run the checkout-bound file. `--no-project` intentionally avoids writing a
+lockfile or virtual environment into this repository:
 
 ```sh
-pip install -e .          # or: pip install -e .[dev]
-pod-manager-mcp           # runs the stdio MCP server
+uv run --isolated --no-project --with 'mcp>=1.5.0' \
+  python modules/mcp/pod_manager_server.py
 ```
 
-Or run the file directly:
+If the MCP SDK is already installed in your environment, direct execution is also
+fine:
 
 ```sh
-python3 pod_manager_server.py
+python3 modules/mcp/pod_manager_server.py
 ```
 
 ## Register with an MCP client
 
-The server speaks MCP over **stdio**. Point your client at the console entry point (or
-the file) and pass the `POD_*` env so it resolves the same paths as the rest of the pod.
+The server speaks MCP over **stdio**. Point your client at `uv` plus this checkout and
+pass the `POD_*` env so it resolves the same paths as the rest of the pod.
 
 Example (Claude Code's `~/.claude.json` / a project `.mcp.json`; the shape is the same
 for any client that takes a `command` + `args` + `env`):
@@ -80,7 +90,11 @@ for any client that takes a `command` + `args` + `env`):
 {
   "mcpServers": {
     "pod-manager": {
-      "command": "pod-manager-mcp",
+      "command": "uv",
+      "args": [
+        "run", "--isolated", "--no-project", "--with", "mcp>=1.5.0",
+        "python", "/path/to/agent-pods/modules/mcp/pod_manager_server.py"
+      ],
       "env": {
         "POD_REPO": "/path/to/agent-pods",
         "POD_BIN": "/path/to/agent-pods/bin",
@@ -91,7 +105,8 @@ for any client that takes a `command` + `args` + `env`):
 }
 ```
 
-If `pod-manager-mcp` isn't on `PATH`, use the interpreter form instead:
+If the MCP SDK is already installed for a particular interpreter, use the shorter
+interpreter form instead:
 
 ```json
 {
@@ -111,8 +126,8 @@ env so the server resolves the same tree.
 | `POD_REPO` | Repo root (for repo-relative path resolution) | this file's `../..` |
 | `POD_BIN` | The `bin/` dir (pod-launch, pod-name, pod-adapter) | `$POD_REPO/bin` |
 | `POD_MODULES` | Modules root (mgr-* + templates live under `queue/`) | `$POD_REPO/modules` |
-| `POD_INBOX` | Inbox tree (`<task-id>/{prompt.txt,result.json,DONE}`, `_queue/`, `_templates/`) | `/tmp/pod/inbox` |
-| `POD_STATE` | State dir (`workers.json`, `tmux_group.json`, `log.jsonl`, `dispatched/`) | `/tmp/pod/state` |
+| `POD_INBOX` | Inbox tree (`<task-id>/{prompt.txt,result.json,DONE}`, `_queue/<pod>/`, `_templates/`) | `$POD_TMP/inbox` |
+| `POD_STATE` | State dir (`workers.json`, `tmux_group.json`, `log.jsonl`, `dispatched/<pod>/`, `completed/<pod>/`) | `$POD_TMP/state` |
 | `POD_PALETTE` | Worker color palette (shared with `pod-add-worker`) | `$POD_REPO/lib/palette` |
 | `POD_ADAPTER` | Path to the catalog reader | `$POD_BIN/pod-adapter` |
 | `POD_TMUX` | tmux binary | resolved on `PATH` / `tmux_group.json` |
@@ -123,5 +138,6 @@ env so the server resolves the same tree.
 
 - **Tmux-only.** Workers are sibling windows in the manager's tmux pod, addressed by
   stable tmux window id (`@N`).
-- `pod_spawn_window` spawns a **generic-shell** worker (the universal floor). To spawn a
-  specific agent + model + effort, use the pod's `+` button (`pod-add-worker`).
+- `pod_spawn_window` accepts `agent_id`, `model`, and `effort`. A default
+  **generic-shell** worker is interactive only and is deliberately ineligible for queue
+  dispatch; pass an installed agent id for a dispatchable worker.

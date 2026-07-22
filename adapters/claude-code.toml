@@ -1,4 +1,4 @@
-# Claude Code (Anthropic's CLI). The one adapter with full lifecycle integration:
+# Claude Code (Anthropic's CLI). One of the hook-integrated adapters:
 # its hooks drive instant state dots, work-headline capture, startup awareness, and
 # pod-mail surfaced as additionalContext — so pod-deliver skips send-keys for it.
 [agent]
@@ -17,15 +17,9 @@ pane_cmd_patterns = ['^[0-9]+\.[0-9]+']
 content_patterns  = []
 reject_content    = []
 
-# NOTE: this default (and the [[models]] catalog below) uses Anthropic's first-party
-# model IDs. Behind a provider backend (Amazon Bedrock, Vertex AI, an enterprise
-# gateway) those IDs are rejected with a 400 — so when CLAUDE_CODE_USE_BEDROCK /
-# CLAUDE_CODE_USE_VERTEX is set, pod-adapter skips the --model flag entirely and the
-# seat inherits the environment's own model (ANTHROPIC_MODEL or the gateway default).
-# Pin an explicit provider ID instead with POD_CLAUDE_MODEL in ~/.config/pod/config.sh.
 [defaults]
-model             = "opus"
-effort            = "high"
+model             = "inherit"
+effort            = ""
 card_scrape_regex = ''   # not needed: the statusLine hook stamps @card directly
 
 [lifecycle]
@@ -34,52 +28,17 @@ installer       = "hooks/claude-code/install.sh"
 native_delivery = true
 state_source    = "hooks"
 
-# Live discovery via the Anthropic REST API. The Claude CLI itself has no list-models
-# command, but GET /v1/models does — pod-discover-api calls it with whatever key the
-# user has (env, a key Claude Code stored, or one captured by `pod-login`). A pure
-# Claude-Max *subscription* login has no API key and can't list models, so discovery
-# exits non-zero and the curated [[models]] below is used instead. Run `pod-login
-# claude-code` to add a key and go live. Effort levels aren't served by any API
-# (they're a CLI-side budget knob), so the ladder is declared here, not discovered.
+# Query the locally installed Claude Code /model menu in a disposable tmux session.
+# That menu incorporates admin policy, provider configuration, account entitlements,
+# and the installed CLI version. The adapter does not assert any model name.
 [discover]
-auth         = "anthropic"
-models_cmd   = "pod-discover-api anthropic"
-models_regex = '^(\S+)\s+-\s+(.+)$'
-timeout_s    = 12
+models_cmd    = "pod-discover-local-agent claude-code"
+models_format = "tsv"
+timeout_s     = 35
+ttl_s         = 300
 efforts = [
   { slug = "max",    label = "max",    value = "max" },
   { slug = "xhigh",  label = "xhigh",  value = "xhigh" },
-  { slug = "high",   label = "high",   value = "high" },
-  { slug = "medium", label = "medium", value = "medium" },
-  { slug = "low",    label = "low",    value = "low" },
-]
-
-# Fallback / offline list (also the right answer for subscription-only users).
-[[models]]
-slug  = "opus"
-label = "Opus 4.8"
-model = "claude-opus-4-8"
-efforts = [
-  { slug = "max",    label = "max",    value = "max" },
-  { slug = "xhigh",  label = "xhigh",  value = "xhigh" },
-  { slug = "high",   label = "high",   value = "high" },
-  { slug = "medium", label = "medium", value = "medium" },
-  { slug = "low",    label = "low",    value = "low" },
-]
-[[models]]
-slug  = "sonnet"
-label = "Sonnet 5"
-model = "claude-sonnet-5"
-efforts = [
-  { slug = "high",   label = "high",   value = "high" },
-  { slug = "medium", label = "medium", value = "medium" },
-  { slug = "low",    label = "low",    value = "low" },
-]
-[[models]]
-slug  = "haiku"
-label = "Haiku 4.5"
-model = "claude-haiku-4-5-20251001"
-efforts = [
   { slug = "high",   label = "high",   value = "high" },
   { slug = "medium", label = "medium", value = "medium" },
   { slug = "low",    label = "low",    value = "low" },

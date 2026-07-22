@@ -30,6 +30,37 @@ mgr_current_pod() {
   printf '%s' "${sess:-$POD_SESSION_PREFIX}"
 }
 
+# Queue state is scoped to the calling pod. Task directories remain globally unique
+# under $POD_INBOX for backwards compatibility, while every schedulable record lives
+# below a validated pod component so sibling pods can never consume one another's
+# work. Callers treat an invalid live/session name as a hard error.
+mgr_pod_component() {
+  local sess="${1:-$(mgr_current_pod)}"
+  pod_valid_component "$sess" || {
+    printf 'mgr: invalid pod name for queue namespace: %s\n' "$sess" >&2
+    return 1
+  }
+  printf '%s' "$sess"
+}
+
+mgr_queue_dir() {
+  local sess
+  sess="$(mgr_pod_component "${1:-$(mgr_current_pod)}")" || return 1
+  printf '%s/_queue/%s' "$POD_INBOX" "$sess"
+}
+
+mgr_dispatched_dir() {
+  local sess
+  sess="$(mgr_pod_component "${1:-$(mgr_current_pod)}")" || return 1
+  printf '%s/dispatched/%s' "$POD_STATE" "$sess"
+}
+
+mgr_completed_dir() {
+  local sess
+  sess="$(mgr_pod_component "${1:-$(mgr_current_pod)}")" || return 1
+  printf '%s/completed/%s' "$POD_STATE" "$sess"
+}
+
 # Window id of a pod's manager (window 0). Prefer the @pod_manager_win stamp; fall
 # back to the index-0 window. Note the "=${sess}:" target form: show-options errors
 # "no such session" on the bare "=name" form on tmux 3.6b (list-windows accepts it).

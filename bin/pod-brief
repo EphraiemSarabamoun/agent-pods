@@ -156,8 +156,22 @@ $delta"
     # map (wid<TAB>sig rows) dedupes so concurrent refreshes (every agent runs this
     # hook) log it once.
     lock="$BRIEF/lock"; got=0
-    for i in 1 2 3 4 5 6; do mkdir "$lock" 2>/dev/null && { got=1; break; }; sleep 0.05; done
+    for _ in 1 2 3 4 5 6; do
+      if mkdir "$lock" 2>/dev/null; then got=1; break; fi
+      # A killed hook can leave the mkdir lock behind forever. Steal only an old
+      # lock, and do so by atomic rename so concurrent stealers cannot remove a
+      # freshly-acquired replacement.
+      lock_mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
+      lock_age=$(( $(date +%s) - lock_mtime ))
+      if [ "$lock_age" -gt 30 ] 2>/dev/null; then
+        stale="$lock.stale.$$"
+        if mv "$lock" "$stale" 2>/dev/null; then rmdir "$stale" 2>/dev/null || true; fi
+      fi
+      sleep 0.05
+    done
     if [ "$got" = 1 ]; then
+      trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+      trap 'exit 0' INT TERM
       tmpj="$BRIEF/.journaled.tmp.$$"; : > "$tmpj"
       printf '%s\n' "$wins" | while IFS='|' read -r wid wname state work_at last_at card; do
         [ -n "$wid" ] || continue
@@ -185,6 +199,7 @@ $delta"
         tail -n 400 "$JOURNAL" > "$JOURNAL.tmp" 2>/dev/null && mv "$JOURNAL.tmp" "$JOURNAL"
       fi
       rmdir "$lock" 2>/dev/null
+      trap - EXIT INT TERM
     fi
 
     # ---------- per-reader injection: OTHER agents only, delta vs my cursor ----------

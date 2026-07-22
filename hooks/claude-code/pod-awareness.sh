@@ -19,7 +19,6 @@ set -u
 
 AGENT_ID="${1:-${POD_AWARENESS_AGENT_ID:-claude-code}}"
 
-command -v tmux >/dev/null 2>&1 || exit 0
 [ -n "${TMUX:-}" ] || exit 0
 
 # --- resolve POD_BIN (env wins; else derive from this file's location) -----------
@@ -32,7 +31,9 @@ else
 fi
 [ -n "${POD_BIN:-}" ] && [ -x "$POD_BIN/pod" ] || exit 0
 
-T="$(command -v tmux 2>/dev/null || echo tmux)"
+. "$POD_BIN/_pod-paths.sh" 2>/dev/null || exit 0
+T="$POD_TMUX"
+[ -x "$T" ] || command -v "$T" >/dev/null 2>&1 || exit 0
 
 # --- stamp this window as the hook-parity agent (authoritative) ------------------
 # The pane this hook runs in is the agent's window; @state_source=hooks keeps the

@@ -43,13 +43,15 @@ PRIMER="$POD_BIN/pod-primer"
 HOOKS_FILE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --hooks-file) HOOKS_FILE="${2:-}"; shift 2 ;;
+    --hooks-file)
+      [ "$#" -ge 2 ] || { echo "install.sh: --hooks-file requires a value" >&2; exit 2; }
+      HOOKS_FILE="$2"; shift 2 ;;
     -h|--help)
       echo "usage: install.sh [--hooks-file <path>]"
       echo "  Wires agent-pods Codex hooks into hooks.json."
       echo "  Default: \$CODEX_HOME/hooks.json else ~/.codex/hooks.json"
       exit 0 ;;
-    *) shift ;;
+    *) echo "install.sh: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
 if [ -z "$HOOKS_FILE" ]; then
@@ -64,7 +66,7 @@ command -v python3 >/dev/null 2>&1 || { echo "install.sh: python3 required" >&2;
 
 # --- merge via python: back up, add only missing pod entries, atomic write ---------
 python3 - "$HOOKS_FILE" "$POD_BIN" "$AWARENESS" "$BRIEF" "$PRIMER" <<'PY'
-import json, os, sys, tempfile, datetime
+import json, os, shutil, sys, tempfile, datetime
 
 hooks_path, pod_bin, awareness, brief, primer = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 
@@ -152,11 +154,10 @@ if not added:
 
 # --- back up the existing file ---
 if existed:
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     backup = "%s.pod-bak.%s" % (hooks_path, stamp)
     try:
-        with open(hooks_path) as src, open(backup, "w") as dst:
-            dst.write(src.read())
+        shutil.copy2(hooks_path, backup)
         print("install.sh: backed up %s -> %s" % (hooks_path, backup))
     except Exception as e:
         print("install.sh: backup failed (%s); aborting" % e, file=sys.stderr)
@@ -166,6 +167,7 @@ if existed:
 os.makedirs(os.path.dirname(os.path.abspath(hooks_path)), exist_ok=True)
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(hooks_path)), prefix=".hooks.", suffix=".tmp")
 try:
+    os.fchmod(fd, (os.stat(hooks_path).st_mode & 0o777) if existed else 0o600)
     with os.fdopen(fd, "w") as tf:
         json.dump(data, tf, indent=2)
         tf.write("\n")
