@@ -46,6 +46,11 @@ Each agent you want to drive must be installed and on your `PATH` (`claude`, `co
 `aider`, and so on). agent-pods launches them; it doesn't bundle them. With none installed
 you still get a deck of plain shells.
 
+Running Claude Code through Amazon Bedrock, Vertex AI, or an enterprise gateway? That
+works out of the box — seats inherit your environment's configured model instead of the
+first-party catalog defaults. See
+[Claude Code behind Bedrock, Vertex, or an enterprise gateway](docs/adapters.md#claude-code-behind-bedrock-vertex-or-an-enterprise-gateway).
+
 ## Quickstart
 
 ```sh

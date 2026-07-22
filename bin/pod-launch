@@ -32,6 +32,10 @@ if [ -z "$MANAGER_CMD" ]; then
   for cand in ${POD_MANAGER_PREFER:-claude-code codex cursor openclaw}; do
     printf '%s\n' "$avail" | grep -qx "$cand" || continue
     dm="$("$ADAPTER" field "$cand" model 2>/dev/null)"
+    # provider-backend policy (Bedrock/Vertex inherit, POD_CLAUDE_MODEL pin) — the
+    # adapter applies it inside `launch`/`card` too; resolving here keeps the
+    # stamped @model honest ("" = seat inherits the environment's model).
+    dm="$("$ADAPTER" resolve-model "$cand" "$dm" 2>/dev/null)"
     de="$("$ADAPTER" field "$cand" effort 2>/dev/null)"
     margs=""
     [ -n "$dm" ] && margs="--model $dm"

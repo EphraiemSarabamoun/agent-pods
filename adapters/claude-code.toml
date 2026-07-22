@@ -17,6 +17,12 @@ pane_cmd_patterns = ['^[0-9]+\.[0-9]+']
 content_patterns  = []
 reject_content    = []
 
+# NOTE: this default (and the [[models]] catalog below) uses Anthropic's first-party
+# model IDs. Behind a provider backend (Amazon Bedrock, Vertex AI, an enterprise
+# gateway) those IDs are rejected with a 400 — so when CLAUDE_CODE_USE_BEDROCK /
+# CLAUDE_CODE_USE_VERTEX is set, pod-adapter skips the --model flag entirely and the
+# seat inherits the environment's own model (ANTHROPIC_MODEL or the gateway default).
+# Pin an explicit provider ID instead with POD_CLAUDE_MODEL in ~/.config/pod/config.sh.
 [defaults]
 model             = "opus"
 effort            = "high"

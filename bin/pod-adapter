@@ -243,6 +243,34 @@ def _effort(model, slug):
     return None
 
 
+# Claude Code behind a provider backend (Amazon Bedrock, Google Vertex AI, or an
+# enterprise gateway) rejects Anthropic's first-party model IDs — Bedrock wants
+# provider-prefixed IDs like "us.anthropic.claude-...". The claude-code catalog is
+# first-party, so injecting its IDs onto --model 400s every spawn the moment
+# CLAUDE_CODE_USE_BEDROCK / CLAUDE_CODE_USE_VERTEX is set. Resolution order:
+#   1. POD_CLAUDE_MODEL set -> that value, passed to --model verbatim (any
+#      provider's ID format works; it never goes through the catalog).
+#   2. provider env present -> NO model flag at all: the seat inherits the
+#      environment's own model (ANTHROPIC_MODEL or the gateway default) — the same
+#      config that already makes bare `claude` work on that machine.
+#   3. neither              -> the requested slug/value, exactly as before.
+_PROVIDER_ENV = ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                 "CLAUDE_CODE_USE_FOUNDRY")
+
+
+def _resolve_model_request(aid, requested):
+    """(verbatim, requested) — verbatim bypasses the catalog; requested == ""
+    means inject no model flag. Agents other than claude-code pass through."""
+    if aid != "claude-code":
+        return (None, requested)
+    pinned = os.environ.get("POD_CLAUDE_MODEL", "").strip()
+    if pinned:
+        return (pinned, None)
+    if any(os.environ.get(v, "").strip() for v in _PROVIDER_ENV):
+        return (None, "")
+    return (None, requested)
+
+
 def cmd_list(adapters, args):
     for aid in sorted(adapters, key=lambda i: adapters[i].get("agent", {}).get("priority", 1000)):
         if args.available:
@@ -311,11 +339,19 @@ def cmd_launch(adapters, args):
         sys.exit(1)
     launch = a.get("launch", {})
     tokens = [launch.get("base_cmd", "")]
-    m = _model(a, args.model) if args.model else None
-    if m and m.get("model"):
+    verbatim, requested = _resolve_model_request(args.id, args.model)
+    m = _model(a, requested) if requested else None
+    if verbatim:
+        for t in launch.get("model_arg", []) or []:
+            tokens.append(t.replace("{model}", verbatim))
+    elif m and m.get("model"):
         for t in launch.get("model_arg", []) or []:
             tokens.append(t.replace("{model}", m["model"]))
-    e = _effort(m, args.effort) if (m and args.effort) else None
+    # effort is a CLI-side knob independent of which backend serves the model —
+    # under a pin or inherit there's no catalog model, so borrow the default
+    # model's ladder rather than dropping --effort.
+    em = m or _model(a, a.get("defaults", {}).get("model", ""))
+    e = _effort(em, args.effort) if (em and args.effort) else None
     if e and e.get("value"):
         for t in launch.get("effort_arg", []) or []:
             tokens.append(t.replace("{effort}", e["value"]))
@@ -328,16 +364,20 @@ def cmd_card(adapters, args):
     model_label = ""
     effort_label = ""
     if a:
-        m = _model(a, args.model) if args.model else None
-        if m:
-            model_label = m.get("label", args.model or "")
-            e = _effort(m, args.effort) if args.effort else None
-            if e:
-                effort_label = e.get("label", args.effort or "")
-            elif args.effort:
-                effort_label = args.effort
-        elif args.model:
-            model_label = args.model
+        verbatim, requested = _resolve_model_request(args.id, args.model)
+        m = _model(a, requested) if requested else None
+        if verbatim:
+            model_label = verbatim
+        elif m:
+            model_label = m.get("label", requested or "")
+        elif requested:
+            model_label = requested
+        em = m or _model(a, a.get("defaults", {}).get("model", ""))
+        e = _effort(em, args.effort) if args.effort else None
+        if e:
+            effort_label = e.get("label", args.effort or "")
+        elif args.effort:
+            effort_label = args.effort
     else:
         model_label = args.model or ""
         effort_label = args.effort or ""
@@ -351,6 +391,14 @@ def cmd_models(adapters, args):
         sys.exit(1)
     for m in models_of(a):
         print("%s\t%s" % (m.get("slug", ""), m.get("label", "")))
+
+
+def cmd_resolve_model(adapters, args):
+    """Effective model for a spawn, after the provider-backend policy: prints the
+    pinned POD_CLAUDE_MODEL, nothing (inherit) under a provider backend, else the
+    requested value unchanged. Shell callers use this to stamp honest @model."""
+    verbatim, requested = _resolve_model_request(args.id, args.requested)
+    print(verbatim or requested or "")
 
 
 def cmd_refresh(adapters, args):
@@ -429,6 +477,7 @@ def main():
     s = sub.add_parser("launch"); s.add_argument("id"); s.add_argument("--model", default=""); s.add_argument("--effort", default="")
     s = sub.add_parser("card"); s.add_argument("id"); s.add_argument("--model", default=""); s.add_argument("--effort", default=""); s.add_argument("--suffix", default="")
     s = sub.add_parser("models"); s.add_argument("id")
+    s = sub.add_parser("resolve-model"); s.add_argument("id"); s.add_argument("requested", nargs="?", default="")
     s = sub.add_parser("efforts"); s.add_argument("id"); s.add_argument("model")
     s = sub.add_parser("refresh"); s.add_argument("id", nargs="?", default="")
     s = sub.add_parser("field"); s.add_argument("id"); s.add_argument("key")
@@ -439,7 +488,7 @@ def main():
     {
         "list": cmd_list, "detect": cmd_detect, "launch": cmd_launch, "card": cmd_card,
         "models": cmd_models, "efforts": cmd_efforts, "field": cmd_field, "dump": cmd_dump,
-        "refresh": cmd_refresh,
+        "refresh": cmd_refresh, "resolve-model": cmd_resolve_model,
     }[args.cmd](adapters, args)
 
 

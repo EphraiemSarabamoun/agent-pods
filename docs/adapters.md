@@ -357,3 +357,34 @@ pod-adapter card claude-code --model opus --effort high
 pod-adapter launch codex --model gpt-5.5 --effort high
 pod-adapter dump --json                   # the whole resolved catalog (debug)
 ```
+
+## Claude Code behind Bedrock, Vertex, or an enterprise gateway
+
+The claude-code catalog ships Anthropic's first-party model IDs (`claude-opus-4-8`,
+`claude-sonnet-5`, ...). Provider backends reject those: Amazon Bedrock wants
+provider-prefixed IDs (`us.anthropic.claude-...` inference profiles), and enterprise
+gateways serve whatever IDs they serve. Forcing a first-party ID onto `--model` there
+fails every spawn with `400 invalid_request_error` through the provider's SDK.
+
+So the deck inherits instead of asserting. Whenever a provider backend is configured
+(`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, or `CLAUDE_CODE_USE_FOUNDRY` is
+set — the same environment that already makes bare `claude` work on that machine),
+`pod-adapter` skips the `--model` flag entirely and every Claude Code seat comes up on
+the environment's own model (`ANTHROPIC_MODEL` or the gateway default). Nothing to
+configure: clone, `./install.sh`, `pod-launch`.
+
+To pin a specific model anyway, set one line in `~/.config/pod/config.sh`:
+
+```sh
+POD_CLAUDE_MODEL="us.anthropic.claude-sonnet-5-v1:0"   # passed to --model verbatim
+```
+
+The value bypasses the catalog, so any provider's ID format works. It also overrides
+the picker slugs — under a provider backend the first-party catalog entries are
+meaningless, so the pin (or inheritance) always wins. First-party setups with none of
+those env vars set are untouched: catalog defaults and picker slugs behave exactly as
+before. Note the seat's `--effort` flag is CLI-side and passes through unchanged in
+every case.
+
+The one prerequisite the deck can't fix: bare `claude` must already work on the
+machine. If it 400s on its own, the provider config (not the pod) needs fixing first.
