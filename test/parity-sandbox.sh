@@ -267,6 +267,7 @@ chk "no-private-leaks.sh" 'bash "$CLONE/test/no-private-leaks.sh"'
 chk "check-model-policy.sh" 'bash "$CLONE/test/check-model-policy.sh"'
 chk "check-context-emit.sh" 'bash "$CLONE/test/check-context-emit.sh"'
 chk "check-sandbox-fallback.sh" 'bash "$CLONE/test/check-sandbox-fallback.sh"'
+chk "check-install-modes.sh" 'bash "$CLONE/test/check-install-modes.sh"'
 
 # ── 12. MCP module ───────────────────────────────────────────────────────────
 sec "MCP module"

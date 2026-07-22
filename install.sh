@@ -215,8 +215,15 @@ for f in "$POD_BIN"/*; do
   # command dies at startup with `_pod-paths.sh: No such file or directory`.
   # The helpers carry their own symlink-following logic to resolve POD_REPO back to
   # the real tree, so linking them is correct and relocatable.
-  # make the real file executable so the symlink is runnable
-  chmod +x "$f" 2>/dev/null || true
+  # make the real file executable so the symlink is runnable — but NOT the _-prefixed
+  # helper libraries: they're SOURCED (`. "$POD_BIN/_pod-paths.sh"`), never executed,
+  # so they ship non-executable (644). chmod-ing them here rewrites the tracked mode
+  # in a git checkout, which dirties the working tree and makes the next `git pull`
+  # fail ("local changes would be overwritten"). Sourcing needs no +x, so skip them.
+  case "$base" in
+    _*) : ;;                                  # sourced helper: leave its mode alone
+    *)  chmod +x "$f" 2>/dev/null || true ;;
+  esac
   ln -sf "$f" "$LOCAL_BIN/$base"
   linked=$((linked + 1))
 done
