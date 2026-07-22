@@ -36,9 +36,7 @@ me_id="${meta%%|*}"; sess="${meta#*|}"
 [ "$me_id" = "$(mgr_manager_window "$sess")" ] || exit 0
 
 emit_ctx() {
-  command -v jq >/dev/null 2>&1 || exit 0
-  jq -n --arg c "$1" \
-    '{hookSpecificOutput:{hookEventName:"UserPromptSubmit", additionalContext:$c}}'
+  pod_emit_ctx "UserPromptSubmit" "$1"   # _pod-paths.sh: never jq-gated
   exit 0
 }
 
@@ -46,13 +44,12 @@ emit_ctx() {
 # pre-field files belong to the recorded primary — same rule as pod-auto)
 state_is_mine() {
   [ -f "$STATE" ] || return 1
-  command -v jq >/dev/null 2>&1 || return 1
   local tpod
-  tpod="$(jq -r '.pod // empty' "$STATE" 2>/dev/null)"
+  tpod="$(pod_json_get "$STATE" pod)"
   if [ -n "$tpod" ]; then
     [ "$tpod" = "$sess" ]
   else
-    [ "$(jq -r '.session // empty' "$GROUP" 2>/dev/null)" = "$sess" ]
+    [ "$(pod_json_get "$GROUP" session)" = "$sess" ]
   fi
 }
 
@@ -61,8 +58,8 @@ if [ "$("$T" show-options -t "=${sess}:" -qv @full_auto 2>/dev/null)" = "1" ]; t
 fi
 
 # switch is OFF — surface a paused loop so it isn't forgotten, else stay silent
-if state_is_mine && [ "$(jq -r '.status // empty' "$STATE" 2>/dev/null)" = "paused" ]; then
-  obj="$(jq -r '.objective // "?"' "$STATE" 2>/dev/null | cut -c1-120)"
+if state_is_mine && [ "$(pod_json_get "$STATE" status)" = "paused" ]; then
+  obj="$(pod_json_get "$STATE" objective | cut -c1-120)"; obj="${obj:-?}"
   emit_ctx "[full-auto] OFF (manual — the human runs the pod). A paused pod-task exists: \"${obj}\". Do not dispatch or re-arm; flipping the ⚡ pill (pod-auto on) resumes it."
 fi
 exit 0

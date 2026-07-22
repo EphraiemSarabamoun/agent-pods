@@ -26,7 +26,7 @@ if [ ! -s "$mbox" ]; then  # no mail: clear any stale badge (self-heal), stay si
   "$T" set-option -uw -t "$me_id" @unread 2>/dev/null || true
   exit 0
 fi
-command -v jq >/dev/null 2>&1 || exit 0   # can't emit -> leave the mail for pod-mail
+# (no jq gate: pod_emit_ctx below can always emit — jq, python3, or raw stdout)
 # Atomic drain (pod-mail's pattern): mv the mailbox aside FIRST; a concurrent
 # pod-tell append re-creates a fresh mbox, so nothing lands in a half-read box.
 snap="${mbox}.reading.$$"
@@ -46,6 +46,5 @@ rm -f "$snap"
 "$T" refresh-client -S 2>/dev/null || true
 msg="You have ${n} pod-mail message(s), delivered here and cleared (archived to your .read log):
 ${body}"
-jq -n --arg c "$msg" --arg e "$EVENT" \
-  '{hookSpecificOutput: {hookEventName: $e, additionalContext: $c}}'
+pod_emit_ctx "$EVENT" "$msg"
 exit 0

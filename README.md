@@ -38,7 +38,10 @@ non-modal pane you dock on the right edge with `☰`, not a separate window.
 ## Requirements
 
 - **tmux >= 3.3** (status-line mouse ranges plus the button regions)
-- **jq** (registry plus group-state reads)
+- **jq** (registry plus group-state reads; the model-facing context tier — roster,
+  journal, pod-mail — falls back to python3 if jq ever goes missing from the *agent
+  process's* PATH, so agents never go silently blind. `pod-doctor` diagnoses that
+  chain end to end)
 - **python3 >= 3.11** (the adapter catalog uses `tomllib`)
 - a POSIX shell. The scripts are bash 3.2 safe (works with the bash macOS ships).
 

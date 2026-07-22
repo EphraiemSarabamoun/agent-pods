@@ -100,7 +100,16 @@ rename_manager() {  # $1 = name to set, $2 = canonical name expected now
   mgrwin="$(mgr_manager_window "$POD")"
   [ -n "$mgrwin" ] || return 0
   cur="$("$T" display-message -p -t "$mgrwin" '#{window_name}' 2>/dev/null)"
-  [ "$cur" = "$expect" ] || return 0
+  # Rename whenever the tab still carries a POD-OWNED name: the expected canonical
+  # name, either configured mode name (heals a missed toggle), or the shipped default
+  # "manager" (a pod launched BEFORE the user configured persona names in config.sh —
+  # the old exact-match guard silently refused to rename those forever). Only a name a
+  # human set by hand is left alone.
+  case "$cur" in
+    "$expect"|"$MGR_NAME_MANUAL"|"$MGR_NAME_AUTO"|manager) ;;
+    *) return 0 ;;
+  esac
+  [ "$cur" = "$want" ] && return 0
   "$T" rename-window -t "$mgrwin" "$want" 2>/dev/null || true
 }
 
@@ -125,14 +134,13 @@ notify_manager() {  # direct mbox append in pod-tell's "[HH:MM] sender: msg" for
 # secondary pod's flip must never resume the primary's task.
 paused_task_for_pod() {
   [ -f "$STATE" ] || return 1
-  command -v jq >/dev/null 2>&1 || return 1
-  [ "$(jq -r '.status // empty' "$STATE" 2>/dev/null)" = "paused" ] || return 1
+  [ "$(pod_json_get "$STATE" status)" = "paused" ] || return 1
   local tpod
-  tpod="$(jq -r '.pod // empty' "$STATE" 2>/dev/null)"
+  tpod="$(pod_json_get "$STATE" pod)"
   if [ -n "$tpod" ]; then
     [ "$tpod" = "$POD" ]
   else
-    [ "$(jq -r '.session // empty' "$GROUP" 2>/dev/null)" = "$POD" ]
+    [ "$(pod_json_get "$GROUP" session)" = "$POD" ]
   fi
 }
 

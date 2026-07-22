@@ -264,6 +264,8 @@ chk "check-adapters.sh" 'bash "$CLONE/test/check-adapters.sh"'
 chk "lint-tmux-targets.sh" 'bash "$CLONE/test/lint-tmux-targets.sh"'
 chk "test-adapter-discovery-timeout.sh" 'bash "$CLONE/test/test-adapter-discovery-timeout.sh"'
 chk "no-private-leaks.sh" 'bash "$CLONE/test/no-private-leaks.sh"'
+chk "check-model-policy.sh" 'bash "$CLONE/test/check-model-policy.sh"'
+chk "check-context-emit.sh" 'bash "$CLONE/test/check-context-emit.sh"'
 
 # ── 12. MCP module ───────────────────────────────────────────────────────────
 sec "MCP module"

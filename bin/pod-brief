@@ -70,9 +70,7 @@ headline() {  # $1=state $2=summary $3=work $4=last
 }
 
 emit_ctx() {  # $1=event  $2=text  -> additionalContext JSON (the proven delivery path)
-  command -v jq >/dev/null 2>&1 || return 0
-  jq -n --arg c "$2" --arg e "$1" \
-    '{hookSpecificOutput:{hookEventName:$e, additionalContext:$c}}'
+  pod_emit_ctx "$1" "$2"   # _pod-paths.sh: jq -> python3 -> raw stdout, never jq-gated
 }
 
 # Every window is an agent. Structured fields carry no '|'; @card rides LAST so the

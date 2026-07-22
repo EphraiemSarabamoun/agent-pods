@@ -59,6 +59,10 @@ Run 'pod' anytime to refresh this roster. A POD is the live cluster of co-locate
 
 # SessionStart injects into the MODEL's context via hookSpecificOutput.additionalContext.
 # A top-level systemMessage only prints in the user's terminal and the model never sees it.
-command -v jq >/dev/null 2>&1 && jq -n --arg c "$MSG" \
-  '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $c}}'
+# Emission must NOT hard-require jq (the old `command -v jq && jq ...` made the whole
+# roster silently vanish on jq-less machines while the deck looked healthy) — use the
+# shared pod_emit_ctx fallback chain (jq -> python3 -> raw stdout). Sourced only now,
+# AFTER the window stamps above, so a broken paths lib can't cost us the stamps.
+. "$POD_BIN/_pod-paths.sh" 2>/dev/null || exit 0
+pod_emit_ctx "SessionStart" "$MSG"
 exit 0

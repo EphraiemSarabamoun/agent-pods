@@ -97,3 +97,44 @@ export POD_BIN POD_REPO POD_TMUX POD_TMP POD_STATE POD_INBOX POD_COMMS \
 # convenience: pod-adapter is the single TOML query tool; everything else calls it.
 POD_ADAPTER="${POD_ADAPTER:-$POD_BIN/pod-adapter}"
 export POD_ADAPTER
+
+# --- portability helpers (jq is OPTIONAL on every model-facing path) ---------------
+# pod_json_get <file> <key> — one top-level field from a small JSON file. jq when
+# present, else python3. Empty output + rc 0 on any failure, so callers keep their
+# existing `[ -n ... ]` guards.
+pod_json_get() {
+  [ -f "${1:-}" ] || return 0
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg k "${2:-}" '.[$k] // empty' "$1" 2>/dev/null
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$1" "${2:-}" <<'PY' 2>/dev/null
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get(sys.argv[2])
+except Exception:
+    v = None
+if v is not None and v is not False:
+    sys.stdout.write(str(v) + "\n")   # newline parity with `jq -r`
+PY
+  fi
+  return 0
+}
+
+# pod_emit_ctx <hookEventName> <text> — additionalContext JSON for a lifecycle hook.
+# This is why jq must stay optional here: on a machine without jq, every model-facing
+# injection (roster, journal, podmate deltas, pod-mail) would silently vanish while
+# the deck itself looks healthy — agents blind, state dots fine. Chain: jq -> python3
+# (a hard dep of hooks/*/install.sh) -> raw stdout (SessionStart and UserPromptSubmit
+# inject plain stdout as context too, so even the last resort lands).
+pod_emit_ctx() {
+  if command -v jq >/dev/null 2>&1; then
+    jq -n --arg e "${1:-}" --arg c "${2:-}" \
+      '{hookSpecificOutput:{hookEventName:$e, additionalContext:$c}}'
+  elif command -v python3 >/dev/null 2>&1; then
+    POD_CTX_E="${1:-}" POD_CTX_C="${2:-}" python3 -c \
+      'import json,os;print(json.dumps({"hookSpecificOutput":{"hookEventName":os.environ["POD_CTX_E"],"additionalContext":os.environ["POD_CTX_C"]}}))'
+  else
+    printf '%s\n' "${2:-}"
+  fi
+  return 0
+}

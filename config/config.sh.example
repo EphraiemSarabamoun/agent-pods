@@ -22,7 +22,13 @@
 # POD_MANAGER_PREFER="claude-code codex cursor openclaw"
 # POD_MANAGER_CMD=
 # When FULL AUTO is on, the manager window is renamed to signal the mode. Defaults to
-# POD_MANAGER_NAME (a visible no-op); set a distinct name to make the switch obvious:
+# POD_MANAGER_NAME (a visible no-op); set a distinct name to make the switch obvious.
+# Persona naming works well here — a plain name in manual mode, an escalated form of
+# it while the pod runs itself (the tab is the at-a-glance mode signal, alongside the
+# strip's ✋/⚡ pill). Flipping the switch renames the tab live, and it also heals a
+# tab still carrying the default "manager" from a pod launched before you set these:
+#   POD_MANAGER_NAME="Hermes"
+#   POD_MANAGER_NAME_AUTO="Hermes Prime"
 # POD_MANAGER_NAME_AUTO=
 
 # --- gold stars ----------------------------------------------------------------

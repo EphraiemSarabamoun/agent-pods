@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# pod-doctor — read-only diagnosis of the pod awareness/context chain.
+#
+# Answers ONE question empirically: "why don't my agents know they're in a pod?"
+# The failure is almost always silent — the deck looks healthy (windows, colors,
+# state dots) while every model-facing injection (roster, journal, pod-mail) dies
+# quietly at a broken link. This walks each link and names the broken one:
+#
+#   1. environment   tmux present, inside a pod session, @is_pod stamp
+#   2. json tooling  jq / python3 — which emitter path context injection will use
+#   3. this window   @agent_id / @card / @cc_state stamps
+#   4. roster        `pod` runs and prints the "instance(s):" shape hooks match on
+#   5. hook wiring   settings.json actually read by the agent CONTAINS the pod
+#                    hooks, and every absolute path they reference still EXISTS
+#                    (a moved/re-cloned repo strands dead paths there silently)
+#   6. live emit     run pod-awareness.sh exactly as the hook would; validate JSON
+#   7. manager name  POD_MANAGER_NAME / POD_MANAGER_NAME_AUTO vs the live tab
+#
+# Read-only: no state writes, no renames, no deliveries. (The live-emit probe
+# re-applies the same idempotent window stamps the real SessionStart hook applies —
+# that is the probe's point.) Exit 1 if any FAIL was found, else 0. bash 3.2 safe.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || {
+  echo "FAIL  cannot source $POD_BIN/_pod-paths.sh — broken checkout?" >&2; exit 1; }
+
+FAILS=0; WARNS=0
+pass() { printf 'PASS  %s\n' "$*"; }
+warn() { printf 'WARN  %s\n' "$*"; WARNS=$((WARNS + 1)); }
+fail() { printf 'FAIL  %s\n' "$*"; FAILS=$((FAILS + 1)); }
+say()  { printf '\n== %s ==\n' "$*"; }
+
+AGENT="${1:-}"
+case "$AGENT" in --agent) AGENT="${2:-}";; esac
+
+T="$POD_TMUX"
+
+# --- 1. environment ---------------------------------------------------------------
+say "environment"
+if command -v "$T" >/dev/null 2>&1; then
+  pass "tmux: $("$T" -V 2>/dev/null)"
+else
+  fail "tmux not found ($T) — no pod can exist without it"; T=""
+fi
+IN_TMUX=0; SESS=""; WIN=""
+if [ -n "${TMUX:-}" ] && [ -n "$T" ]; then
+  IN_TMUX=1
+  SESS="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{session_name}' 2>/dev/null)"
+  WIN="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null)"
+  pass "inside tmux: session '$SESS', window $WIN"
+  if [ "$("$T" show-options -t "=${SESS}:" -qv @is_pod 2>/dev/null)" = "1" ]; then
+    pass "session is a stamped pod (@is_pod=1)"
+  else
+    warn "session '$SESS' is NOT stamped @is_pod — was it created by pod-launch? Manager-gated hooks (pod-auto-brief) skip unstamped sessions."
+  fi
+else
+  fail "not inside tmux — run pod-doctor from a pane INSIDE the pod (every awareness hook exits silently outside tmux)"
+fi
+
+# --- 2. json tooling ---------------------------------------------------------------
+say "json tooling"
+HAVE_JQ=0; HAVE_PY=0
+command -v jq >/dev/null 2>&1 && HAVE_JQ=1
+command -v python3 >/dev/null 2>&1 && HAVE_PY=1
+[ "$HAVE_JQ" = 1 ] && pass "jq on PATH ($(command -v jq))" || warn "jq NOT on this PATH — note: your login shell having jq does not put it on the AGENT PROCESS's PATH, which is what hooks inherit"
+[ "$HAVE_PY" = 1 ] && pass "python3 on PATH ($(command -v python3))" || warn "python3 NOT on this PATH"
+if [ "$HAVE_JQ" = 1 ]; then echo "      context emission will use: jq"
+elif [ "$HAVE_PY" = 1 ]; then echo "      context emission will use: python3 fallback"
+else echo "      context emission will use: raw stdout (last resort — still injected on SessionStart/UserPromptSubmit)"; fi
+
+# --- 3. this window's stamps ---------------------------------------------------------
+if [ "$IN_TMUX" = 1 ]; then
+  say "this window's stamps"
+  aid="$("$T" show-options -w -t "$WIN" -qv @agent_id 2>/dev/null)"
+  card="$("$T" show-options -w -t "$WIN" -qv @card 2>/dev/null)"
+  st="$("$T" show-options -w -t "$WIN" -qv @cc_state 2>/dev/null)"
+  [ -n "$aid" ]  && pass "@agent_id=$aid" || warn "@agent_id unset — the SessionStart hook hasn't run in this window yet (or isn't wired)"
+  [ -n "$card" ] && pass "@card=$card"    || warn "@card unset — spawned outside pod-add-worker/pod-launch?"
+  [ -n "$st" ]   && pass "@cc_state=$st"  || warn "@cc_state unset — pod-state has never fired here (hooks not wired, or agent launched before install)"
+fi
+
+# --- 4. roster ------------------------------------------------------------------------
+say "roster"
+ROSTER="$(bash "$POD_BIN/pod" 2>&1)"
+case "$ROSTER" in
+  *"instance(s):"*)
+    pass "pod roster renders: $(printf '%s\n' "$ROSTER" | head -1)" ;;
+  *)
+    fail "pod roster does NOT render the 'instance(s):' shape the awareness hook matches on. Output was:"
+    printf '%s\n' "$ROSTER" | head -5 | sed 's/^/      /' ;;
+esac
+
+# --- 5. hook wiring (claude-code settings.json) ----------------------------------------
+say "hook wiring"
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  SETTINGS="$CLAUDE_CONFIG_DIR/settings.json"
+  echo "      CLAUDE_CONFIG_DIR is set -> $SETTINGS"
+else
+  SETTINGS="$HOME/.claude/settings.json"
+fi
+if [ ! -f "$SETTINGS" ]; then
+  fail "$SETTINGS does not exist — hooks were never installed here. If your agent uses a different CLAUDE_CONFIG_DIR at runtime, re-run hooks/claude-code/install.sh with that env var set (or --settings <path>)."
+else
+  wired=0
+  for probe in pod-awareness.sh pod-state pod-brief pod-mail-check; do
+    if grep -q "$probe" "$SETTINGS" 2>/dev/null; then
+      wired=$((wired + 1))
+    else
+      fail "settings.json has no '$probe' hook — run hooks/claude-code/install.sh --settings $SETTINGS"
+    fi
+  done
+  [ "$wired" = 4 ] && pass "all 4 pod hook families present in $SETTINGS"
+  # every absolute pod path referenced must still exist (repo moved = dead hooks)
+  dead=0
+  for p in $(grep -o '"[^"]*pod[^"]*"' "$SETTINGS" 2>/dev/null | tr -d '"' | grep '^/' | sort -u); do
+    if [ ! -e "$p" ]; then fail "hook references a DEAD path: $p (repo moved since install? re-run hooks/claude-code/install.sh)"; dead=$((dead + 1)); fi
+  done
+  [ "$dead" = 0 ] && pass "every pod path referenced by settings.json exists on disk"
+  if [ "$wired" = 4 ] && [ "$dead" = 0 ]; then
+    echo "      note: hooks load at agent START — a session launched before install stays blind until restarted."
+  fi
+fi
+
+# --- 6. live emit (run the awareness hook exactly as the harness would) -----------------
+say "live emit probe"
+AW="$POD_REPO/hooks/claude-code/pod-awareness.sh"
+if [ ! -f "$AW" ]; then
+  fail "missing $AW"
+else
+  aid_arg="${AGENT:-$("$T" show-options -w -t "${WIN:-}" -qv @agent_id 2>/dev/null)}"
+  OUT="$(bash "$AW" ${aid_arg:+"$aid_arg"} 2>&1)"
+  if [ -z "$OUT" ]; then
+    fail "pod-awareness.sh produced NO output — with the deck up, that means an upstream link above already failed (roster shape, tmux env)"
+  elif [ "$HAVE_PY" = 1 ] && printf '%s' "$OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["hookSpecificOutput"]["additionalContext"]' 2>/dev/null; then
+    pass "awareness hook emits valid additionalContext JSON ($(printf '%s' "$OUT" | wc -c | tr -d ' ') bytes)"
+  elif [ "$HAVE_PY" = 0 ] && [ -n "$OUT" ]; then
+    pass "awareness hook emits output (python3 absent here, skipping JSON validation)"
+  else
+    fail "awareness hook output is not the expected JSON. First lines:"
+    printf '%s\n' "$OUT" | head -3 | sed 's/^/      /'
+  fi
+fi
+
+# --- 7. manager naming -------------------------------------------------------------------
+say "manager naming"
+echo "      POD_MANAGER_NAME=$POD_MANAGER_NAME   POD_MANAGER_NAME_AUTO=$POD_MANAGER_NAME_AUTO"
+if [ "$POD_MANAGER_NAME" = "manager" ] && [ "$POD_MANAGER_NAME_AUTO" = "manager" ]; then
+  echo "      (defaults — set both in $POD_CONFIG to give the manager a persona name,"
+  echo "       with a distinct AUTO name so the tab itself signals manual vs full-auto)"
+fi
+if [ "$IN_TMUX" = 1 ] && [ -n "$T" ]; then
+  mgrwin="$("$T" show-options -t "=${SESS}:" -qv @pod_manager_win 2>/dev/null)"
+  if [ -n "$mgrwin" ]; then
+    curname="$("$T" display-message -p -t "$mgrwin" '#{window_name}' 2>/dev/null)"
+    echo "      live manager tab ($mgrwin): '$curname'"
+    if [ "$curname" != "$POD_MANAGER_NAME" ] && [ "$curname" != "$POD_MANAGER_NAME_AUTO" ]; then
+      warn "manager tab name matches neither configured name — launched before the config was set (the next pod-auto toggle heals a default 'manager' tab), or hand-renamed"
+    fi
+  fi
+fi
+
+# --- summary -------------------------------------------------------------------------------
+printf '\n'
+if [ "$FAILS" -gt 0 ]; then
+  echo "pod-doctor: $FAILS FAIL, $WARNS WARN — fix the first FAIL above; the chain breaks at its earliest broken link."
+  exit 1
+fi
+echo "pod-doctor: 0 FAIL, $WARNS WARN — the awareness chain is intact. If agents still seem blind, restart their sessions (hooks and stamps load at agent start)."
+exit 0

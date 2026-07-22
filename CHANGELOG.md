@@ -1,5 +1,27 @@
 # Changelog
 
+## Context injection hardening + pod-doctor
+
+- **jq is no longer a silent single point of failure for agent awareness.** Every
+  model-facing hook payload (SessionStart roster, journal boot, podmate deltas,
+  pod-mail delivery, the FULL AUTO stance) used to be gated on `command -v jq || exit`.
+  On a machine where the agent process's PATH lacked jq, the deck looked perfectly
+  healthy — windows, colors, state dots — while every agent stayed blind to its own
+  pod. New `pod_emit_ctx` / `pod_json_get` helpers (`bin/_pod-paths.sh`) fall back
+  jq → python3 (already a hard dep of `hooks/*/install.sh`) → raw stdout, and
+  `test/check-context-emit.sh` guards the regression on both tool paths.
+- **`pod-doctor`.** Read-only diagnosis of the awareness chain, for exactly the
+  "my agents don't know they're in a pod" report: environment, json tooling, window
+  stamps, roster shape, hook wiring in the settings.json the agent actually reads
+  (including dead absolute paths after a repo move), a live emit probe, and manager
+  naming. Run it from a pane inside the pod; it names the first broken link.
+- **Manager persona naming heals stale tabs.** `pod-auto`'s mode rename previously
+  refused to touch a manager tab still named `manager` from a pod launched before
+  `POD_MANAGER_NAME` / `POD_MANAGER_NAME_AUTO` were configured (exact-match guard).
+  It now renames any pod-owned name (either configured mode name or the shipped
+  default) and still leaves hand-renamed tabs alone. `config.sh.example` shows the
+  persona-pair pattern.
+
 ## Second parity sync
 
 - **The pod journal.** Every pod keeps a running `journal.md` — auto-fed from podmate
