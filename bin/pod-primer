@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# pod-primer — SessionStart hook. Injects, as additionalContext, the operator knowledge
+# a pod agent needs to help run the pod:
+#   1. a role primer (manager vs worker) shipped in lib/primer/ — generic, concise
+#   2. the user's own operator memory (~/.config/pod/operator-memory.md), if present,
+#      which pod-remember appends to (durable, cross-session — distinct from the
+#      ephemeral per-pod journal)
+#   3. a PROACTIVE sandbox notice when this seat's tmux socket is blocked, so the agent
+#      knows up front that deck-changing features (spawn/kill/send-keys/toggle) are
+#      unavailable from here while reads + comms still work.
+#
+# All of this rides the same additionalContext path the roster does, so it works
+# identically for a sandboxed seat (pod_emit_ctx falls back jq -> python3 -> stdout).
+# Silent outside a pod, and when POD_PRIMER=0. Never fails a hook -> always exits 0.
+# bash 3.2 safe.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || exit 0
+
+[ "${POD_PRIMER:-1}" = "0" ] && exit 0
+command -v tmux >/dev/null 2>&1 || exit 0
+[ -n "${TMUX:-}" ] || exit 0
+T="$POD_TMUX"
+
+# --- am I in a pod, and which window am I? (socket-first, env fallback) ------------
+GRP="$POD_STATE/tmux_group.json"
+me=""; sess="${POD_SESSION:-}"
+if pod_socket_ok; then
+  me="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null)"
+  [ -n "$sess" ] || sess="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{session_name}' 2>/dev/null)"
+  # only real pods (the awareness hook uses the same @is_pod gate)
+  [ "$("$T" show-options -t "=${sess}:" -qv @is_pod 2>/dev/null)" = "1" ] || exit 0
+else
+  # sandbox: no socket. Being spawned by pod-launch/bootstrap set POD_WINDOW +
+  # POD_SESSION in the env — their presence is our "we're in a pod" signal.
+  me="${POD_WINDOW:-}"
+  { [ -n "$me" ] && [ -n "$sess" ]; } || exit 0
+fi
+
+# --- role: manager iff my window is the pod's manager window (tmux_group.json) -----
+mgrwin="$(pod_json_get "$GRP" manager_window)"
+role="worker"
+[ -n "$mgrwin" ] && [ "$me" = "$mgrwin" ] && role="manager"
+
+# --- assemble the injection -------------------------------------------------------
+primer_file="$POD_PRIMER_DIR/$role.md"
+body=""
+if [ -f "$primer_file" ]; then
+  body="$(cat "$primer_file" 2>/dev/null)"
+fi
+[ -n "$body" ] || exit 0   # no primer shipped -> nothing to say
+
+msg="Pod operator primer (${role}):
+
+${body}"
+
+# user operator memory, if they've written any
+if [ -s "$POD_OPERATOR_MEMORY" ]; then
+  mem="$(cat "$POD_OPERATOR_MEMORY" 2>/dev/null)"
+  [ -n "$mem" ] && msg="${msg}
+
+Your operator memory (from \`pod-remember\`):
+${mem}"
+fi
+
+# proactive sandbox notice
+if ! pod_socket_ok; then
+  msg="${msg}
+
+⚠ This seat is in a command sandbox: the tmux socket is unreachable from here. Pod
+features that READ or EXCHANGE work normally via the filesystem — the roster (\`pod\`),
+the journal, sending and receiving pod-mail (\`pod-tell\` / \`pod-mail\`), and your own
+state dots. Features that CHANGE the deck are blocked from this seat: spawning or
+killing workers, sending keystrokes to another pane, reading another agent's screen,
+and toggling FULL AUTO. Run \`pod-doctor\` for the full breakdown."
+fi
+
+pod_emit_ctx "SessionStart" "$msg"
+exit 0

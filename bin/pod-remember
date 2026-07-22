@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# pod-remember <text> — append a durable operator lesson to your pod operator memory
+# (~/.config/pod/operator-memory.md by default; $POD_OPERATOR_MEMORY). pod-primer
+# injects this file at every pod seat's session start, so a note you save now reaches
+# every agent you spawn later.
+#
+# This is DURABLE and cross-session — distinct from `pod-note`, which appends to a
+# single pod's ephemeral journal that dies with the pod. Use pod-remember for "how I
+# run pods" that should outlive any one pod; pod-note for "what happened in this pod".
+#
+# `pod-remember` with no args prints the current memory. bash 3.2 safe.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || {
+  echo "pod-remember: cannot resolve config paths" >&2; exit 1; }
+
+MEM="$POD_OPERATOR_MEMORY"
+
+if [ "$#" -eq 0 ]; then
+  if [ -s "$MEM" ]; then cat "$MEM"; else echo "(operator memory empty — pod-remember \"<lesson>\" to add one · $MEM)"; fi
+  exit 0
+fi
+
+case "${1:-}" in
+  -h|--help)
+    echo "usage: pod-remember <text>     append a durable operator lesson"
+    echo "       pod-remember             print the current operator memory"
+    echo "file: $MEM"
+    exit 0 ;;
+esac
+
+text="$*"
+[ -n "$text" ] || { echo "pod-remember: nothing to remember" >&2; exit 1; }
+
+mkdir -p "$(dirname "$MEM")" 2>/dev/null || { echo "pod-remember: cannot create $(dirname "$MEM")" >&2; exit 1; }
+# one line per lesson, dated (a real date is fine here — this is a user command, not a
+# resumable workflow). Collapse internal newlines so one lesson stays one line.
+line="$(printf '%s' "$text" | tr '\n' ' ')"
+printf -- '- [%s] %s\n' "$(date +%Y-%m-%d)" "$line" >> "$MEM" \
+  && echo "remembered -> $MEM" \
+  || { echo "pod-remember: write failed" >&2; exit 1; }

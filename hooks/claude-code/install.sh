@@ -9,6 +9,7 @@
 #   SessionStart     -> pod-awareness.sh   (roster + stamp this window as claude-code)
 #                       pod-state idle      (back at the prompt)
 #                       pod-brief boot      (inject the pod journal tail)
+#                       pod-primer          (role primer + operator memory + sandbox notice)
 #   UserPromptSubmit -> pod-mail-check UserPromptSubmit   (surface unread pod-mail)
 #                       pod-state busy      (a turn started)
 #                       pod-work            (capture the turn's work headline)
@@ -68,6 +69,7 @@ WIRING = {
         'bash "%s"' % awareness,
         'bash "%s/pod-state" idle' % pod_bin,
         'bash "%s/pod-brief" boot' % pod_bin,
+        'bash "%s/pod-primer"' % pod_bin,
     ],
     "UserPromptSubmit": [
         'bash "%s/pod-mail-check" UserPromptSubmit' % pod_bin,
@@ -97,6 +99,7 @@ TIMEOUTS = {
     'bash "%s/pod-brief" boot' % pod_bin: 6,
     'bash "%s/pod-brief" refresh UserPromptSubmit' % pod_bin: 6,
     'bash "%s/pod-last"' % pod_bin: 5,
+    'bash "%s/pod-primer"' % pod_bin: 6,
 }
 def timeout_for(cmd):
     return TIMEOUTS.get(cmd, 3)

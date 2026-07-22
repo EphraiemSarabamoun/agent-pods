@@ -17,7 +17,8 @@
 #                                                                requires JSON on Stop stdout)
 #
 # If bin/pod-brief exists (an optional module), SessionStart/UserPromptSubmit also get
-# its boot/refresh entries; absent, they're simply not wired (re-run later to add them).
+# its boot/refresh entries; if bin/pod-primer exists, SessionStart also injects the role
+# primer + operator memory + sandbox notice. Absent, they're simply not wired (re-run to add).
 #
 # Idempotent: a pod hook is added only if an identical command isn't already present,
 # so re-running is safe. Existing non-pod hooks are left intact. hooks.json is backed
@@ -32,9 +33,11 @@ POD_BIN="$(cd "$(dirname "$0")/../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
 # the awareness hook is shared with the claude-code wiring; argv1 sets the stamped id.
 AWARENESS="$(cd "$(dirname "$0")/../claude-code" && pwd)/pod-awareness.sh"
 
-# optional module: only wire pod-brief if it exists right now (a re-run picks it up).
+# optional modules: only wire these if they exist right now (a re-run picks them up).
 BRIEF="$POD_BIN/pod-brief"
 [ -x "$BRIEF" ] || BRIEF=""
+PRIMER="$POD_BIN/pod-primer"
+[ -x "$PRIMER" ] || PRIMER=""
 
 # --- resolve target hooks.json -----------------------------------------------------
 HOOKS_FILE=""
@@ -60,10 +63,10 @@ fi
 command -v python3 >/dev/null 2>&1 || { echo "install.sh: python3 required" >&2; exit 1; }
 
 # --- merge via python: back up, add only missing pod entries, atomic write ---------
-python3 - "$HOOKS_FILE" "$POD_BIN" "$AWARENESS" "$BRIEF" <<'PY'
+python3 - "$HOOKS_FILE" "$POD_BIN" "$AWARENESS" "$BRIEF" "$PRIMER" <<'PY'
 import json, os, sys, tempfile, datetime
 
-hooks_path, pod_bin, awareness, brief = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+hooks_path, pod_bin, awareness, brief, primer = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 
 # The pod hooks, per event. Each command is an absolute path under this repo's bin
 # (or the shared awareness script). Order matters within an event group: state first,
@@ -92,6 +95,8 @@ WIRING = {
 if brief:
     WIRING["SessionStart"].append('bash "%s" boot' % brief)
     WIRING["UserPromptSubmit"].append('bash "%s" refresh UserPromptSubmit' % brief)
+if primer:
+    WIRING["SessionStart"].append('bash "%s"' % primer)
 
 # --- load (tolerate missing / empty / malformed-but-recoverable) ---
 data = {}

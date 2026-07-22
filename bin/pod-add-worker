@@ -15,6 +15,9 @@ POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
 T="$POD_TMUX"
 S="${POD_SESSION:-$POD_SESSION_PREFIX}"
 
+# spawning a worker is a deck change (new-window + coloring) — needs the socket.
+pod_require_socket "spawning a worker" || exit 1
+
 # WORKER palette — SINGLE SOURCE is lib/palette (read by the MCP too). code + name per line.
 COLORS=(); NAMES=()
 while read -r code name _; do

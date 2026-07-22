@@ -181,3 +181,37 @@ THIS agent's last turn, tracked by a per-reader cursor: a quiet pod costs zero c
 The journal needs no configuration; it degrades gracefully. Without `pod-summarize`
 stamps the headlines fall back to "task in flight…" placeholders and last-reply
 digests; without any hook agents it simply stays a hand-fed notebook.
+
+## The operator primer + memory (pod-primer / pod-remember)
+
+The journal carries what's happening *now*; the **operator primer** carries how to *run*
+the pod at all. At each seat's session start, `pod-primer` injects (as `additionalContext`,
+like the journal) a concise **role primer** — a manager seat gets "how to run the pod"
+(`pod`, `pod-tell`, the `mgr-*` fire-and-poll loop), a worker seat gets the lighter
+"how to participate" contract (do the task, write `result.json`, `touch DONE`, never loop
+silently). The generic primers ship in `lib/primer/{manager,worker}.md`; role is decided by
+whether this window is the pod's manager window.
+
+Below the primer, `pod-primer` injects your own **operator memory** — a durable,
+cross-session file (`~/.config/pod/operator-memory.md`) you grow with:
+
+```sh
+pod-remember "verify a worker's result with a different agent before accepting it"
+pod-remember                         # print the current memory
+```
+
+Unlike `pod-note` (one pod's ephemeral journal, gone when the pod closes), operator memory
+outlives every pod and reaches every seat you spawn afterward. Set `POD_PRIMER=0` to silence
+the whole injection.
+
+### The sandbox notice
+
+When a seat's tmux socket is blocked (a command sandbox — see
+[docs/gotchas.md](gotchas.md)), `pod-primer` also injects a **proactive notice** so the
+agent knows up front that deck-changing features (spawning/killing workers, sending keys to
+another pane, reading another agent's screen, toggling FULL AUTO) are unavailable from that
+seat, while reads and comms (roster, journal, pod-mail send + receive, its own state dots)
+work normally via the filesystem. And if the agent tries a deck-changing command anyway
+(`pod-add-worker`, `pod-kill-worker`, `pod-auto`), it fails with the same explanation
+instead of a cryptic tmux error — a **reactive** notice at the point of use. `pod-doctor`
+prints the full breakdown on demand.

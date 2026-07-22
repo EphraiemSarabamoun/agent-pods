@@ -86,13 +86,21 @@ POD_USER_ADAPTERS="${POD_USER_ADAPTERS:-$POD_CONFIG_DIR/adapters}"
 POD_SLOTS="${POD_SLOTS:-$POD_CONFIG_DIR/slots.json}"
 POD_MODULES="${POD_MODULES:-$POD_REPO/modules}"
 
+# operator memory: a user-local, appendable "how I run this pod" file (pod-remember
+# writes it, pod-primer injects it at session start). Ships nothing — created on first
+# `pod-remember`. Separate from the pod journal (ephemeral, per-pod) — this is durable
+# and cross-session. The generic role primers pod-primer injects live in the repo.
+POD_OPERATOR_MEMORY="${POD_OPERATOR_MEMORY:-$POD_CONFIG_DIR/operator-memory.md}"
+POD_PRIMER_DIR="${POD_PRIMER_DIR:-$POD_REPO/lib/primer}"
+
 # single source of the color palette (pod-add-worker + the MCP both read it)
 POD_PALETTE="${POD_PALETTE:-$POD_REPO/lib/palette}"
 
 export POD_BIN POD_REPO POD_TMUX POD_TMP POD_STATE POD_INBOX POD_COMMS \
   POD_SESSION_PREFIX POD_CITIES POD_MANAGER_NAME POD_MANAGER_NAME_AUTO POD_MANAGER_CARD POD_MANAGER_CMD POD_STAR_AWARDER \
   POD_FOREIGN_INTERVAL POD_FOREIGN_TRIM POD_CONFIG_DIR POD_CONFIG \
-  POD_ADAPTERS_DIR POD_USER_ADAPTERS POD_SLOTS POD_MODULES POD_PALETTE
+  POD_ADAPTERS_DIR POD_USER_ADAPTERS POD_SLOTS POD_MODULES POD_PALETTE \
+  POD_OPERATOR_MEMORY POD_PRIMER_DIR
 
 # convenience: pod-adapter is the single TOML query tool; everything else calls it.
 POD_ADAPTER="${POD_ADAPTER:-$POD_BIN/pod-adapter}"
@@ -118,6 +126,31 @@ pod_socket_ok() {
     fi
   fi
   [ "$__POD_SOCKET_OK" = 1 ]
+}
+
+# pod_require_socket [<action name>] — a REACTIVE sandbox notice for commands that
+# genuinely change the tmux deck (spawn/kill a worker, toggle FULL AUTO). When the
+# socket is reachable it's a silent pass; when it's blocked it explains, to stderr,
+# that this action needs the socket the sandbox denies and what still works instead,
+# then returns 1 so the caller can bail with a clear message rather than a cryptic
+# tmux error. Read/exchange commands (pod, pod-tell, pod-mail, pod-note) do NOT call
+# this — they work from files and must stay silent.
+pod_require_socket() {
+  # Probe SERVER reachability, pane-INDEPENDENTLY — deliberately NOT via pod_socket_ok
+  # (which is keyed to $TMUX_PANE, for in-pane hooks). External callers — a script, the
+  # MCP, the test harness — target a pod by session name from outside any pane, where
+  # $TMUX_PANE belongs to a different server or is unset; they must NOT trip this. A
+  # reachable server (list-sessions succeeds) means proceed, in every one of those cases.
+  "$POD_TMUX" list-sessions >/dev/null 2>&1 && return 0
+  # Unreachable AND we're inside a tmux pane -> a command sandbox is blocking connect().
+  # (Outside tmux with no reachable server isn't the sandbox case: let the command's own
+  # tmux call error naturally rather than blaming a sandbox.)
+  [ -n "${TMUX:-}" ] || return 0
+  printf 'pod: %s needs the tmux socket, which is blocked in this command sandbox.\n' "${1:-this action}" >&2
+  printf '     Deck-changing features (spawn/kill workers, send keys to a pane, toggle FULL AUTO)\n' >&2
+  printf '     are unavailable from a sandboxed seat. What DOES work here: pod (roster), pod-tell /\n' >&2
+  printf '     pod-mail, pod-note, and your own state dots. Run pod-doctor for the full picture.\n' >&2
+  return 1
 }
 
 # one safe path component (mirrors _pod-common.sh's pod_sanitize; duplicated here so

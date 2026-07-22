@@ -14,6 +14,9 @@ T="$POD_TMUX"
 S="${POD_SESSION:-$POD_SESSION_PREFIX}"
 WORKERS="$POD_STATE/workers.json"
 
+# killing a worker is a deck change (kill-window) — needs the socket.
+pod_require_socket "killing a worker" || exit 1
+
 arg="${1:-}"
 win="${arg#kill_}"                       # accept the click range form "kill_@7" or a bare id/name
 [ -n "$win" ] || { echo "usage: pod-kill-worker <window_id|name>"; exit 1; }

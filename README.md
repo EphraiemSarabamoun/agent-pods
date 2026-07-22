@@ -215,6 +215,19 @@ don't interleave:
 POD_TMP="/tmp/pod-$USER"
 ```
 
+### Operator primer & memory
+
+At each seat's session start, the deck injects a concise **role primer** — how to run the
+pod (manager) or participate in it (worker) — plus any **operator memory** you've saved.
+Grow that memory with `pod-remember "<lesson>"`; it's durable and cross-session (unlike the
+per-pod journal `pod-note` feeds) and reaches every seat you spawn afterward. `POD_PRIMER=0`
+turns the injection off; `POD_OPERATOR_MEMORY` relocates the file.
+
+If a seat runs in a command sandbox that can't reach the tmux socket, the primer also tells
+that agent up front which pod features work from there (roster, journal, pod-mail — anything
+that reads or exchanges) and which are blocked (spawning/killing workers, driving other
+panes — anything that changes the deck). See Troubleshooting.
+
 ### Claude Code behind Bedrock / Vertex / a gateway
 
 Seats inherit your environment's configured model automatically — no override needed. To

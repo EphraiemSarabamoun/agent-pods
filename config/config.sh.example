@@ -31,6 +31,15 @@
 #   POD_MANAGER_NAME_AUTO="Hermes Prime"
 # POD_MANAGER_NAME_AUTO=
 
+# --- operator primer + memory --------------------------------------------------
+# At each pod seat's session start, pod-primer injects a concise role primer (manager
+# vs worker — how to run/participate in the pod) plus your own operator memory, and a
+# proactive notice if the seat is in a command sandbox. Set POD_PRIMER=0 to silence it.
+# Your durable, cross-session operator memory (append with `pod-remember "<lesson>"`,
+# injected into every seat you spawn afterward) lives here by default:
+# POD_PRIMER=1
+# POD_OPERATOR_MEMORY="$HOME/.config/pod/operator-memory.md"
+
 # --- gold stars ----------------------------------------------------------------
 # Stars are HUMAN-only. This name is attributed in the award log + the delivered
 # prompt ("Gold star from <name>!"). Defaults to "the human".

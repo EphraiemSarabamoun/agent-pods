@@ -1,5 +1,26 @@
 # Changelog
 
+## Operator primer, memory, and sandbox notices
+
+- **Operator primer.** At each seat's session start, `pod-primer` injects a concise,
+  role-gated primer (as `additionalContext`, like the journal): a manager seat gets
+  "how to run the pod" (`pod` / `pod-tell` / the `mgr-*` fire-and-poll loop), a worker
+  gets the lighter completion contract. Generic primers ship in
+  `lib/primer/{manager,worker}.md`; role is the pod's manager window. `POD_PRIMER=0`
+  silences it. Wired into both the Claude Code and Codex hook installers.
+- **Operator memory.** `pod-remember "<lesson>"` appends to a durable, cross-session
+  file (`~/.config/pod/operator-memory.md`) that `pod-primer` injects into every seat
+  you spawn afterward — distinct from `pod-note`, which is one pod's ephemeral journal.
+- **Proactive sandbox notice.** When a seat's tmux socket is blocked (a command
+  sandbox), `pod-primer` tells the agent up front which pod features work from that
+  seat (reads + comms, via files) and which are blocked (deck changes).
+- **Reactive sandbox notice.** `pod_require_socket` makes the deck-changing commands
+  (`pod-add-worker`, `pod-kill-worker`, `pod-auto`) fail with a clear "blocked in this
+  command sandbox — here's what still works" message instead of a cryptic tmux error.
+  Read/exchange commands stay silent; the normal (socket-reachable) path is unchanged.
+- `test/check-primer.sh` covers role selection, memory injection, both notices, and
+  that the normal path stays silent.
+
 ## Sandboxed-seat support: the tmux socket is an upgrade, files are the truth
 
 Some environments run the agent's subprocesses in a command sandbox that denies

@@ -156,6 +156,10 @@ send_resume_trigger() {  # typed into the manager REPL; self-contained so a fres
   return 0
 }
 
+# every pod-auto action reads/writes tmux options (the @full_auto stamp, the pill,
+# the manager rename) — all need the socket. From a sandboxed seat, say so plainly.
+pod_require_socket "toggling FULL AUTO" || exit 1
+
 case "$ACTION" in
   status)
     st="$(mgr_pod_auto_state "$POD")"
