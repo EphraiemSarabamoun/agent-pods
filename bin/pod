@@ -40,7 +40,8 @@ fi
 # no live pane: the inherited POD_SESSION env, else the recorded primary pod
 [ -n "$SESS" ] || SESS="${POD_SESSION:-}"
 if [ -z "$SESS" ] && [ -f "$GRP" ]; then
-  SESS="$(jq -r '.pod // .session // empty' "$GRP" 2>/dev/null)"
+  SESS="$(pod_json_get "$GRP" pod)"
+  [ -n "$SESS" ] || SESS="$(pod_json_get "$GRP" session)"
 fi
 
 if [ -z "$SESS" ]; then
@@ -57,7 +58,61 @@ SEP=$'\x1f'
 roster="$("$T" list-windows -t "$SESS" \
   -F "#{window_id}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{window_active}${SEP}#{@agent_id}${SEP}#{@cc_state}${SEP}#{@state_source}${SEP}#{@stars}${SEP}#{@summary_at}${SEP}#{@work_at}${SEP}#{@card}${SEP}#{@summary}${SEP}#{@last}${SEP}#{@work}" 2>/dev/null)"
 if [ -z "$roster" ]; then
-  echo "POD '$SESS' — no windows found (session may have ended)"
+  # Gate STRICTLY on socket-connect failure: an empty list from a WORKING socket
+  # means a genuinely dead pod, and falling back there would resurrect ghosts.
+  if pod_socket_ok || ! command -v python3 >/dev/null 2>&1; then
+    echo "POD '$SESS' — no windows found (session may have ended)"
+    exit 0
+  fi
+  # ---- file-backed roster (command sandbox: tmux socket connect-blocked) ---------
+  # Everything needed is in sandbox-readable files: workers.json (the registry),
+  # tmux_group.json (manager window), and the per-window mirror files the sandboxed
+  # hooks write (state / work / last). Same header shape as the live path, so the
+  # awareness hook's "instance(s):" gate and every downstream matcher still hold.
+  MGRW="$(pod_json_get "$GRP" manager_window)"
+  python3 - "$POD_STATE/workers.json" "$SESS" \
+    "$POD_STATE/mirror/$(pod_path_component "$SESS")" \
+    "${ME:-${POD_WINDOW:-}}" "$MGRW" "$POD_MANAGER_NAME" <<'PY'
+import json, os, sys
+wpath, sess, mirror, me, mgrw, mgrname = sys.argv[1:7]
+try:
+    ws = json.load(open(wpath)).get("workers", [])
+except Exception:
+    ws = []
+ws = [w for w in ws if isinstance(w, dict)
+      and w.get("tmux_session") == sess and w.get("tmux_window")]
+def mfield(name):
+    try:
+        parts = open(os.path.join(mirror, name)).readline().rstrip("\n").split("\t")
+        return parts[1] if len(parts) > 1 else ""
+    except Exception:
+        return ""
+def mstate(wid):
+    try:
+        parts = open(os.path.join(mirror, wid)).readline().split()
+        return parts[0] if parts else ""
+    except Exception:
+        return ""
+n = len(ws) + (1 if mgrw else 0)
+print("POD '%s' — %d instance(s):" % (sess, n))
+print("  (file-backed roster — the tmux socket is unreachable from this process; live focus/index unavailable)")
+if mgrw:
+    you = "   <-- you" if me and mgrw == me else ""
+    print("  [0:%s] (manager) · runtime=%s%s" % (mgrname, mstate(mgrw) or "unknown", you))
+for w in ws:
+    wid = w["tmux_window"]
+    you = "   <-- you" if me and wid == me else ""
+    st = mstate(wid) or "unknown"
+    card = w.get("card") or w.get("agent_type") or "agent"
+    print("  [-:%s] · runtime=%s · %s%s" % (w.get("label") or wid, st, card, you))
+    work, last = mfield(wid + ".work"), mfield(wid + ".last")
+    if work:
+        if not last:
+            print("        ↳ on: 🐣 first task in flight…")
+        else:
+            verb = "on" if st in ("busy", "wait") else "last"
+            print("        ↳ %s: %s" % (verb, work))
+PY
   exit 0
 fi
 

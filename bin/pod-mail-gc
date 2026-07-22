@@ -33,6 +33,10 @@ remove_pod() {
   dir="$(pod_dir_for "$name")"
   case "$dir" in "$POD_COMMS"|"$POD_COMMS/"|/|"") return 0 ;; esac   # paranoia
   [ -d "$dir" ] && rm -rf "$dir"
+  # the dead pod's sandbox mirror files (same sanitized name) go with it
+  mdir="$POD_STATE/mirror/$name"
+  case "$mdir" in "$POD_STATE/mirror/"|/|"") return 0 ;; esac
+  [ -d "$mdir" ] && rm -rf "$mdir"
   return 0
 }
 

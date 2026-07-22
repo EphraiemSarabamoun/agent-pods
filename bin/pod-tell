@@ -46,6 +46,34 @@ ts="$(date +%H:%M)"
 # is a prefix can't leak in. ---
 TABLE="$("$T" list-windows -t "=$sess" -F '#{window_id}|#{window_name}' 2>/dev/null)"
 
+# Command sandbox: socket blocked -> sending is pure FILE work (mbox appends), only
+# the window table and self-identity came from the socket. Rebuild both from the
+# registry (workers.json + tmux_group.json). Badges/nudges degrade (the poller and
+# each recipient's own pod-mail-check are the backstop); delivery itself is intact.
+if [ -z "$TABLE" ] && ! pod_socket_ok && command -v python3 >/dev/null 2>&1; then
+  TABLE="$(python3 - "$POD_STATE/workers.json" "$POD_STATE/tmux_group.json" "$sess" "$POD_MANAGER_NAME" <<'PY' 2>/dev/null
+import json, sys
+wpath, gpath, sess, mgrname = sys.argv[1:5]
+def load(p):
+    try:
+        return json.load(open(p))
+    except Exception:
+        return {}
+g = load(gpath)
+if (g.get("pod") or g.get("session")) == sess and g.get("manager_window"):
+    print("%s|%s" % (g["manager_window"], mgrname))
+for w in load(wpath).get("workers", []) or []:
+    if isinstance(w, dict) and w.get("tmux_session") == sess and w.get("tmux_window"):
+        print("%s|%s" % (w["tmux_window"], w.get("label") or w["tmux_window"]))
+PY
+)"
+  if [ -z "$me_id" ] && [ -n "${POD_WINDOW:-}" ]; then
+    me_id="$POD_WINDOW"
+    n_me="$(printf '%s\n' "$TABLE" | awk -F'|' -v id="$me_id" '$1==id{print $2; exit}')"
+    [ -n "$n_me" ] && me="$n_me" || me="${POD_AGENT_ID:-$me}"
+  fi
+fi
+
 # --- resolve targets from the snapshot ---
 disp="$to"; targets=""
 case "$to" in

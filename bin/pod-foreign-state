@@ -43,6 +43,70 @@ while :; do
     while IFS='|' read -r wid wname cmd; do
       [ -n "$wid" ] || continue
 
+      # ---- mirror reconciliation (sandboxed hook agents) --------------------------
+      # A per-window mirror file exists ONLY when the seat's own hooks run with the
+      # tmux socket connect-blocked (command sandbox) — they write files instead of
+      # set-option, and THIS poller (unsandboxed, it lives outside the agent) applies
+      # them onto the real tmux options. Everything downstream (strip, roster,
+      # badges, pod-deliver's native-delivery gate) then behaves exactly as if the
+      # seat had stamped itself. A window with a mirror is by definition a
+      # hook-parity agent: apply + skip the content-hash inference entirely.
+      mf="$POD_STATE/mirror/$(pod_path_component "$s")/$wid"
+      if [ -f "$mf" ]; then
+        mstate=""; mts=""; maid=""
+        read -r mstate mts maid < "$mf" 2>/dev/null
+        if [ -n "$mstate" ]; then
+          cur="$("$T" show-options -w -t "$wid" -qv @cc_state 2>/dev/null)"
+          if [ "$cur" != "$mstate" ]; then
+            "$T" set-option -w -t "$wid" @cc_state    "$mstate"            2>/dev/null || true
+            "$T" set-option -w -t "$wid" @state_since "${mts:-$(date +%s)}" 2>/dev/null || true
+            touched=1
+            # journal the transition on the seat's behalf (its own pod-brief refresh
+            # can't list windows without the socket) — same line shape pod-brief uses.
+            jdir="$POD_COMMS/$(pod_path_component "$s")"
+            if mkdir -p "$jdir" 2>/dev/null; then
+              hl=""
+              [ -f "$mf.work" ] && hl="$(cut -f2 "$mf.work" 2>/dev/null | head -1)"
+              [ -z "$hl" ] && [ -f "$mf.last" ] && hl="$(cut -f2 "$mf.last" 2>/dev/null | head -1)"
+              printf '[%s] %s · %s · %s\n' "$(date +%H:%M)" "$wname" "$mstate" "${hl:-…}" \
+                >> "$jdir/journal.md" 2>/dev/null || true
+            fi
+          fi
+          # one-time identity stamps the sandboxed SessionStart hook couldn't apply
+          if [ "$("$T" show-options -w -t "$wid" -qv @state_source 2>/dev/null)" != "file" ]; then
+            "$T" set-option -w -t "$wid" @state_source        "file"                    2>/dev/null || true
+            "$T" set-option -w -t "$wid" @agent_id            "${maid:-claude-code}"    2>/dev/null || true
+            "$T" set-option -w -t "$wid" @pod_native_delivery 1                         2>/dev/null || true
+          fi
+          # work/last mirrors -> the roster's on:/last: lines and headline fallbacks
+          if [ -f "$mf.work" ]; then
+            wts="$(cut -f1 "$mf.work" 2>/dev/null | head -1)"
+            if [ "$wts" != "$("$T" show-options -w -t "$wid" -qv @work_at 2>/dev/null)" ]; then
+              "$T" set-option -w -t "$wid" @work    "$(cut -f2 "$mf.work" 2>/dev/null | head -1)" 2>/dev/null || true
+              "$T" set-option -w -t "$wid" @work_at "$wts" 2>/dev/null || true
+            fi
+          fi
+          if [ -f "$mf.last" ]; then
+            lts="$(cut -f1 "$mf.last" 2>/dev/null | head -1)"
+            if [ "$lts" != "$("$T" show-options -w -t "$wid" -qv @last_at 2>/dev/null)" ]; then
+              "$T" set-option -w -t "$wid" @last    "$(cut -f2 "$mf.last" 2>/dev/null | head -1)" 2>/dev/null || true
+              "$T" set-option -w -t "$wid" @last_at "$lts" 2>/dev/null || true
+              tpv="$(cut -f3 "$mf.last" 2>/dev/null | head -1)"
+              [ -n "$tpv" ] && "$T" set-option -w -t "$wid" @transcript "$tpv" 2>/dev/null || true
+            fi
+          fi
+          # badge self-heal: the sandboxed reader drained its mailbox but couldn't
+          # clear the pill (set-option needs the socket). Empty mailbox + lit badge
+          # -> clear it here.
+          if [ -n "$("$T" show-options -w -t "$wid" -qv @unread 2>/dev/null)" ] \
+             && [ ! -s "$POD_COMMS/$(pod_path_component "$s")/$wid.mbox" ]; then
+            "$T" set-option -uw -t "$wid" @unread 2>/dev/null || true
+            touched=1
+          fi
+          continue
+        fi
+      fi
+
       # identify (cached; cheap re-detect when the pane command is unchanged).
       "$POD_BIN/pod-detect" "$wid" >/dev/null 2>&1 || true
       ssrc="$("$T" show-options -w -t "$wid" -qv @state_source 2>/dev/null)"

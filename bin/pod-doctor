@@ -41,16 +41,33 @@ if command -v "$T" >/dev/null 2>&1; then
 else
   fail "tmux not found ($T) — no pod can exist without it"; T=""
 fi
-IN_TMUX=0; SESS=""; WIN=""
+IN_TMUX=0; SESS=""; WIN=""; SOCK=1
 if [ -n "${TMUX:-}" ] && [ -n "$T" ]; then
   IN_TMUX=1
-  SESS="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{session_name}' 2>/dev/null)"
-  WIN="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null)"
-  pass "inside tmux: session '$SESS', window $WIN"
-  if [ "$("$T" show-options -t "=${SESS}:" -qv @is_pod 2>/dev/null)" = "1" ]; then
-    pass "session is a stamped pod (@is_pod=1)"
+  if pod_socket_ok; then
+    pass "tmux socket reachable from this process"
+    SESS="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{session_name}' 2>/dev/null)"
+    WIN="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null)"
+    pass "inside tmux: session '$SESS', window $WIN"
+    if [ "$("$T" show-options -t "=${SESS}:" -qv @is_pod 2>/dev/null)" = "1" ]; then
+      pass "session is a stamped pod (@is_pod=1)"
+    else
+      warn "session '$SESS' is NOT stamped @is_pod — was it created by pod-launch? Manager-gated hooks (pod-auto-brief) skip unstamped sessions."
+    fi
   else
-    warn "session '$SESS' is NOT stamped @is_pod — was it created by pod-launch? Manager-gated hooks (pod-auto-brief) skip unstamped sessions."
+    SOCK=0
+    warn "tmux socket unreachable (connect denied) — this process runs in a command sandbox that blocks unix-socket connect. The FILE-FALLBACK tier applies: hooks self-identify from \$POD_WINDOW, mirror state to files, and the unsandboxed poller reconciles them onto tmux."
+    SESS="${POD_SESSION:-}"
+    WIN="${POD_WINDOW:-}"
+    [ -n "$SESS" ] && pass "POD_SESSION in env: '$SESS'" \
+      || fail "POD_SESSION not in env — the pod predates the fallback tier or wasn't spawned by pod-launch; relaunch the pod"
+    [ -n "$WIN" ] && pass "POD_WINDOW in env: $WIN" \
+      || fail "POD_WINDOW not in env — this seat was spawned before the fallback tier (pod-worker-bootstrap exports it); respawn the seat"
+    [ -f "$POD_STATE/workers.json" ] && pass "workers.json present (file-backed roster source)" \
+      || warn "no $POD_STATE/workers.json — the file-backed roster will show only the manager"
+    mdir="$(pod_mirror_dir "$SESS")"
+    [ -d "$mdir" ] && pass "mirror dir exists: $mdir" \
+      || echo "      (no mirror dir yet — appears after the first sandboxed pod-state fire)"
   fi
 else
   fail "not inside tmux — run pod-doctor from a pane INSIDE the pod (every awareness hook exits silently outside tmux)"
@@ -68,7 +85,7 @@ elif [ "$HAVE_PY" = 1 ]; then echo "      context emission will use: python3 fal
 else echo "      context emission will use: raw stdout (last resort — still injected on SessionStart/UserPromptSubmit)"; fi
 
 # --- 3. this window's stamps ---------------------------------------------------------
-if [ "$IN_TMUX" = 1 ]; then
+if [ "$IN_TMUX" = 1 ] && [ "$SOCK" = 1 ]; then
   say "this window's stamps"
   aid="$("$T" show-options -w -t "$WIN" -qv @agent_id 2>/dev/null)"
   card="$("$T" show-options -w -t "$WIN" -qv @card 2>/dev/null)"
@@ -76,6 +93,12 @@ if [ "$IN_TMUX" = 1 ]; then
   [ -n "$aid" ]  && pass "@agent_id=$aid" || warn "@agent_id unset — the SessionStart hook hasn't run in this window yet (or isn't wired)"
   [ -n "$card" ] && pass "@card=$card"    || warn "@card unset — spawned outside pod-add-worker/pod-launch?"
   [ -n "$st" ]   && pass "@cc_state=$st"  || warn "@cc_state unset — pod-state has never fired here (hooks not wired, or agent launched before install)"
+elif [ "$IN_TMUX" = 1 ]; then
+  say "this window's stamps"
+  echo "      (unreadable without the socket — the poller reconciles them from the mirror files)"
+  mf="$(pod_mirror_dir "$SESS")/$WIN"
+  [ -f "$mf" ] && pass "mirror state file exists: $(cat "$mf" 2>/dev/null | head -1)" \
+    || echo "      (no mirror state yet — appears after the first hook fire from this seat)"
 fi
 
 # --- 4. roster ------------------------------------------------------------------------

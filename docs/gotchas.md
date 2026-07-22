@@ -272,3 +272,37 @@ tmux 3.6b).
 `[ "$(tmux display-message -p -t "$wid" '#{window_id}' 2>/dev/null)" = "$wid" ]`.
 Same rule for any `#{session_name}` / `#{window_index}` probe — compare the value,
 don't trust the return.
+
+## Command sandboxes block the tmux socket entirely
+
+**Symptom.** When the agent's subprocesses run in a command sandbox that denies
+unix-socket connect (e.g. Claude Code's command sandbox, a CI runner, a container),
+the deck looks perfectly healthy — windows, colors, the strip — but every agent is
+blind: no roster at SessionStart, no journal, no pod-mail, no state dots from its own
+hooks. `tmux ls` from inside the agent says `connect() → EPERM`.
+
+**Cause.** The sandbox denies unix-socket connect from the agent's subprocesses (hooks,
+Bash tool). The tmux server is alive and the pane genuinely sits in a pod — but every
+`tmux` call the agent's side makes fails, so hooks that self-identify or read/write
+window options silently no-op.
+
+**Fix (built in).** Filesystem is the source of truth; the socket is a render/transport
+upgrade. Everything gates on one probe (`pod_socket_ok`): when connect fails, hooks
+self-identify from `$POD_WINDOW`/`$POD_AGENT_ID`/`$POD_SESSION` (exported by
+pod-worker-bootstrap / pod-launch in the unsandboxed pane), `bin/pod` builds a
+file-backed roster from `workers.json`, and state/work/last mirror to
+`$POD_STATE/mirror/<pod>/<win>` files that the unsandboxed pod-foreign-state poller
+reconciles onto the real tmux options. The normal path is byte-for-byte unchanged —
+the fallback triggers ONLY on socket connect failure, never on empty output (an empty
+list from a working socket is a genuinely dead pod; falling back there would resurrect
+ghosts).
+
+**Accepted degradation.** Under a blocked socket, hook-parity agents (Claude Code,
+Codex) are fully functional — awareness, journal, mail, and state all ride files.
+`send-keys` delivery to non-hook seats (Aider, plain shells) is unavailable — it
+genuinely needs the socket; don't try to fix it. Badges/dots lag up to one poller
+interval (~3s) instead of flipping instantly. Seats spawned before the upgrade lack
+`$POD_WINDOW` — respawn them once.
+
+**Diagnose.** `pod-doctor` from a pane inside the pod names the broken link, including
+this one (its section 1 probes the socket explicitly).

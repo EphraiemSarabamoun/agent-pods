@@ -85,6 +85,8 @@ list_wins() {
 
 me_id=""
 [ -n "$pane" ] && me_id="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
+# command sandbox: socket blocked -> identity from the spawn-time environment
+if [ -z "$me_id" ] && ! pod_socket_ok; then me_id="${POD_WINDOW:-}"; fi
 [ -n "$me_id" ] || me_id="self"
 
 case "$CMD" in
@@ -95,6 +97,7 @@ case "$CMD" in
     who=""
     [ "$in_tmux" = 1 ] && who="$(get_opt "$me_id" @card)"
     [ -z "$who" ] && who="${POD_BRIEF_WHO:-}"
+    [ -z "$who" ] && who="${POD_AGENT_ID:-}"   # sandbox: card read needs the socket
     [ -z "$who" ] && who="me"
     printf '[%s] NOTE (%s): %s\n' "$(now_hm)" "$who" "$text" >> "$JOURNAL"
     echo "noted -> $JOURNAL"
@@ -118,7 +121,30 @@ $tailtxt"
     [ "$in_tmux" = 1 ] || exit 0
     EVENT="${1:-UserPromptSubmit}"
     wins="$(list_wins)"
-    [ -n "$wins" ] || exit 0
+    if [ -z "$wins" ]; then
+      # Command sandbox: list-windows needs the socket. Podmate awareness rides the
+      # JOURNAL instead — the unsandboxed pod-foreign-state reconciler appends every
+      # mirror-observed transition there — so emit only the lines this reader hasn't
+      # seen (per-reader line-count high-water). A shrink (the 500->400 trim) resets
+      # the cursor silently.
+      pod_socket_ok && exit 0
+      [ -s "$JOURNAL" ] || exit 0
+      mkdir -p "$BRIEF" 2>/dev/null
+      hw="$BRIEF/jcursor.$(printf '%s' "$me_id" | tr -c 'A-Za-z0-9' '_')"
+      seen="$(cat "$hw" 2>/dev/null)"
+      case "$seen" in ''|*[!0-9]*) seen="" ;; esac
+      total="$(wc -l < "$JOURNAL" 2>/dev/null | tr -d ' ')"
+      case "$total" in ''|*[!0-9]*) exit 0 ;; esac
+      printf '%s\n' "$total" > "$hw" 2>/dev/null
+      # first sight (no cursor yet): boot already delivered the tail — just arm.
+      [ -n "$seen" ] || exit 0
+      [ "$total" -gt "$seen" ] || exit 0
+      delta="$(sed -n "$((seen + 1)),\$p" "$JOURNAL" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 20)"
+      [ -n "$delta" ] || exit 0
+      emit_ctx "$EVENT" "[pod] journal updates since your last turn:
+$delta"
+      exit 0
+    fi
     mkdir -p "$BRIEF" 2>/dev/null
     cursor="$BRIEF/cursor.$(printf '%s' "$me_id" | tr -c 'A-Za-z0-9' '_')"
     journaled="$BRIEF/journaled"

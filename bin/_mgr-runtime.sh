@@ -24,7 +24,8 @@ mgr_current_pod() {
   fi
   [ -n "$sess" ] || sess="${POD_SESSION:-}"
   if [ -z "$sess" ]; then
-    sess="$(jq -r '.pod // .session // empty' "$POD_STATE/tmux_group.json" 2>/dev/null)"
+    sess="$(pod_json_get "$POD_STATE/tmux_group.json" pod)"
+    [ -n "$sess" ] || sess="$(pod_json_get "$POD_STATE/tmux_group.json" session)"
   fi
   printf '%s' "${sess:-$POD_SESSION_PREFIX}"
 }

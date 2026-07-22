@@ -8,8 +8,9 @@
 # typed input. Silent if no mail or not in a pod. pod-mail remains the manual read
 # path (it mostly finds an empty box now).
 #
-# Ordering matters: emit-capability is checked BEFORE the drain (no jq -> no
-# drain), so messages can never vanish without reaching the model's context.
+# Emission can't fail for want of a tool (pod_emit_ctx falls back jq -> python3 ->
+# raw stdout), so the drain below is always safe: messages never vanish without
+# reaching the model's context.
 set -u
 EVENT="${1:-UserPromptSubmit}"
 command -v tmux >/dev/null 2>&1 || exit 0
@@ -20,7 +21,13 @@ pane="${TMUX_PANE:-}"; [ -n "$pane" ] || exit 0
 POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || exit 0
 . "$POD_BIN/_pod-common.sh" 2>/dev/null || exit 0
 T="$POD_TMUX"
-me_id="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)" || exit 0
+me_id="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
+# Command sandbox: socket blocked -> self-identify from the spawn-time environment.
+# The mailbox is already a FILE, so with identity restored the whole drain+deliver
+# path below works; only the badge-clear set-options no-op (the foreign-state
+# poller self-heals the stale pill when it sees the empty mailbox).
+if [ -z "$me_id" ] && ! pod_socket_ok; then me_id="${POD_WINDOW:-}"; fi
+[ -n "$me_id" ] || exit 0
 mbox="$(pod_mbox "$me_id")"
 if [ ! -s "$mbox" ]; then  # no mail: clear any stale badge (self-heal), stay silent
   "$T" set-option -uw -t "$me_id" @unread 2>/dev/null || true

@@ -98,6 +98,40 @@ export POD_BIN POD_REPO POD_TMUX POD_TMP POD_STATE POD_INBOX POD_COMMS \
 POD_ADAPTER="${POD_ADAPTER:-$POD_BIN/pod-adapter}"
 export POD_ADAPTER
 
+# --- sandbox portability: the tmux socket is an UPGRADE, files are the truth --------
+# Some environments run the agent's subprocesses in a command sandbox that denies
+# unix-socket connect (CI runners, containers, restricted shells). There the tmux
+# client->server socket is unreachable from hook subprocesses (connect() -> EPERM)
+# even though the server is alive and the pane is genuinely in a pod. Every fallback
+# below gates on this ONE probe: socket reachable -> behave exactly as always (zero
+# behavior change); socket unreachable -> the file paths take over.
+# Memoized per process so hot-path hooks probe at most once.
+pod_socket_ok() {
+  if [ -z "${__POD_SOCKET_OK:-}" ]; then
+    __POD_SOCKET_OK=0
+    if [ -n "${TMUX:-}" ]; then
+      if [ -n "${TMUX_PANE:-}" ]; then
+        "$POD_TMUX" display-message -p -t "$TMUX_PANE" ok >/dev/null 2>&1 && __POD_SOCKET_OK=1
+      else
+        "$POD_TMUX" display-message -p ok >/dev/null 2>&1 && __POD_SOCKET_OK=1
+      fi
+    fi
+  fi
+  [ "$__POD_SOCKET_OK" = 1 ]
+}
+
+# one safe path component (mirrors _pod-common.sh's pod_sanitize; duplicated here so
+# path-only consumers don't have to pull in the comms layer).
+pod_path_component() { LC_ALL=C printf '%s' "${1:-$POD_SESSION_PREFIX}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_'; }
+
+# where a sandboxed seat's hooks MIRROR the per-window state they cannot stamp onto
+# tmux ( <win> = "state ts agent_id" · <win>.work = "ts\ttext" · <win>.last =
+# "ts\tdigest\ttranscript" ). The unsandboxed pod-foreign-state poller reconciles
+# these files back onto the real tmux options, so the strip/roster/badge render
+# paths stay untouched. Data flows agent -> file -> poller -> tmux, never
+# sandboxed-agent -> socket.
+pod_mirror_dir() { printf '%s/mirror/%s' "$POD_STATE" "$(pod_path_component "${1:-${POD_SESSION:-}}")"; }
+
 # --- portability helpers (jq is OPTIONAL on every model-facing path) ---------------
 # pod_json_get <file> <key> — one top-level field from a small JSON file. jq when
 # present, else python3. Empty output + rc 0 on any failure, so callers keep their

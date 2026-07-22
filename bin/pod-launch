@@ -120,7 +120,12 @@ fi
 # The kill-session is deliberately BARE (no -t): it resolves the session from the
 # pane's own $TMUX at exit time, so it still kills the right pod after a RENAME —
 # a baked-in "-t =$S" targets the launch-time name and leaves a zombie session.
-"$T" new-session -d -s "$S" -n "$MGRNAME" -e "POD_SESSION=$S" "$MANAGER_CMD; $T kill-session"
+# The POD_WINDOW/POD_AGENT_ID prefix mirrors pod-worker-bootstrap's export for
+# workers: the manager seat too gets its identity as ENVIRONMENT, resolved by the
+# pane's own (unsandboxed) shell, so hooks running under a command sandbox —
+# where the tmux socket is connect-blocked — can still identify themselves.
+MGRENV="POD_WINDOW=\"\$(\"$T\" display-message -p -t \"\$TMUX_PANE\" '#{window_id}' 2>/dev/null)\"; POD_AGENT_ID=\"$MGRAGENT\"; export POD_WINDOW POD_AGENT_ID; "
+"$T" new-session -d -s "$S" -n "$MGRNAME" -e "POD_SESSION=$S" "${MGRENV}$MANAGER_CMD; $T kill-session"
 
 # server-level rendering (harmless on a fresh tmux server)
 "$T" set -g  default-terminal "tmux-256color" 2>/dev/null || true

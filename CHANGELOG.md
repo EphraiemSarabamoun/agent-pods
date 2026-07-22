@@ -1,5 +1,37 @@
 # Changelog
 
+## Sandboxed-seat support: the tmux socket is an upgrade, files are the truth
+
+Some environments run the agent's subprocesses in a command sandbox that denies
+unix-socket connect (Claude Code's command sandbox, CI runners, containers). There
+the tmux client→server socket is unreachable from hook subprocesses (`connect()` →
+EPERM) while the deck itself renders fine — agents sat blind and mute in a healthy-
+looking pod. Every fallback gates on ONE probe (`pod_socket_ok`, memoized per
+process): socket reachable → byte-for-byte today's behavior; socket blocked → files.
+
+- **Identity as environment.** `pod-worker-bootstrap` and `pod-launch` export
+  `POD_WINDOW` + `POD_AGENT_ID` into every seat from the (unsandboxed) pane shell.
+  `pod-state`, `pod-mail-check`, `pod-work`, `pod-last`, `pod-brief`, and `pod-tell`
+  resolve self-identity socket-first, env-fallback.
+- **File-backed roster.** `bin/pod` rebuilds the roster from `workers.json` +
+  `tmux_group.json` (+ mirror state) when — and only when — the socket connect
+  fails, same `instance(s):` shape, so the awareness hook injects a real roster.
+- **Mirror files + reconciler.** Sandboxed hooks write per-window state/work/last to
+  `$POD_STATE/mirror/<pod>/<win>*`; the unsandboxed `pod-foreign-state` poller
+  applies them onto the real tmux options (and journals transitions, heals stale
+  unread pills). The strip/roster/badge render paths are completely untouched —
+  data flows agent → file → poller → tmux, never sandboxed-agent → socket.
+- **Journal-delta awareness.** Under a blocked socket `pod-brief refresh` emits new
+  journal lines (per-reader cursor) instead of the live-window delta it can't take.
+- **Sending works too.** `pod-tell` from a sandboxed seat rebuilds the recipient
+  table from the registry; mbox deposits are pure file appends.
+- **Accepted degradation** (documented in docs/gotchas.md): `send-keys` delivery to
+  non-hook seats needs the socket and stays unavailable in sandboxes; dots/badges
+  lag up to one poller tick (~3s) instead of flipping instantly.
+- `pod-doctor` probes the socket first and names this state explicitly;
+  `test/check-sandbox-fallback.sh` runs the acceptance tests against a blocked-socket
+  stub and guards the normal path stays socket-driven.
+
 ## Context injection hardening + pod-doctor
 
 - **jq is no longer a silent single point of failure for agent awareness.** Every

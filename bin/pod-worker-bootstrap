@@ -25,6 +25,19 @@ if [ -n "$pane" ]; then
   fi
 fi
 
+# Hand the seat its own identity as ENVIRONMENT. Under a command sandbox the
+# tmux socket is unreachable from the agent's hook subprocesses (connect -> EPERM),
+# so they can't ask tmux "which window am I?". This bootstrap runs IN the pane
+# (spawned by the tmux server, outside any agent sandbox) where the socket works —
+# exporting here lets every hook fall back to $POD_WINDOW / $POD_AGENT_ID when the
+# socket probe fails. Explicit per seat, so a seat spawned from inside another
+# agent's pane can never inherit the parent's identity and mis-identify.
+if [ -n "$win" ]; then
+  POD_WINDOW="$win"; export POD_WINDOW
+  baid="$("$T" show-options -w -t "$win" -qv @agent_id 2>/dev/null)"
+  if [ -n "$baid" ]; then POD_AGENT_ID="$baid"; export POD_AGENT_ID; fi
+fi
+
 # Hook-driven agents whose session hooks are THREAD-scoped (Codex: nothing fires
 # until the first prompt is submitted) would sit dot-less between spawn and first
 # use. Seed the honest pre-first-hook state — a freshly launched agent is at its

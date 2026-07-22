@@ -38,6 +38,9 @@
 
 # --- state location ------------------------------------------------------------
 # All ephemeral state lives under one tmp tree. Override the base if /tmp is unusual.
+# On a MULTI-USER host, namespace it per user — the default is shared across users,
+# which is a collision risk (registry, comms, and mirror files would interleave):
+#   POD_TMP="/tmp/pod-$USER"
 # POD_TMP=/tmp/pod
 
 # --- tmux binary ---------------------------------------------------------------

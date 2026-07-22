@@ -39,6 +39,8 @@ sys.stdout.write(p)
 [ -n "$snip" ] || exit 0
 
 win="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
+# Command sandbox: socket blocked -> identity from the spawn-time environment.
+if [ -z "$win" ] && ! pod_socket_ok; then win="${POD_WINDOW:-}"; fi
 [ -n "$win" ] || exit 0
 
 # Don't let a bare confirmation/ack overwrite the real task HEADLINE (@work): if you
@@ -63,6 +65,16 @@ if [ "$is_ack" -eq 0 ]; then
   "$T" set-option -w -t "$win" @work    "$snip"       2>/dev/null || true
   "$T" set-option -w -t "$win" @work_at "$(date +%s)" 2>/dev/null || true
   "$T" refresh-client -S 2>/dev/null || true   # repaint now, not at the next status tick
+  # sandbox: the set-options above no-op'd -> mirror the headline to a file the
+  # unsandboxed pod-foreign-state poller applies as @work/@work_at.
+  if ! pod_socket_ok && [ -n "${POD_SESSION:-}" ]; then
+    mdir="$(pod_mirror_dir)"
+    if mkdir -p "$mdir" 2>/dev/null; then
+      printf '%s\t%s\n' "$(date +%s)" "$snip" > "$mdir/${win}.work.tmp.$$" 2>/dev/null \
+        && mv "$mdir/${win}.work.tmp.$$" "$mdir/${win}.work" 2>/dev/null
+      rm -f "$mdir/${win}.work.tmp.$$" 2>/dev/null
+    fi
+  fi
 fi
 
 # append to the per-pod, per-window work log (session-scoped; dies with the pod)

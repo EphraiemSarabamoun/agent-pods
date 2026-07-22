@@ -47,6 +47,29 @@ print("idle" if nt == "idle_prompt" or "waiting for your input" in msg else "wai
 fi
 
 win="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
+if [ -z "$win" ] && ! pod_socket_ok; then
+  # Command sandbox: the tmux socket is connect-blocked from this hook process.
+  # Identity comes from the spawn-time environment (pod-worker-bootstrap / pod-launch)
+  # and the state goes to a per-window MIRROR FILE that the unsandboxed
+  # pod-foreign-state poller reconciles onto the real tmux options — so the strip,
+  # roster, and badges render exactly as if this set-option had succeeded.
+  win="${POD_WINDOW:-}"
+  [ -n "$win" ] && [ -n "${POD_SESSION:-}" ] || exit 0
+  mdir="$(pod_mirror_dir)"
+  mkdir -p "$mdir" 2>/dev/null || exit 0
+  mf="$mdir/$win"
+  mprev=""; mts=""
+  [ -f "$mf" ] && read -r mprev mts _ < "$mf" 2>/dev/null
+  if [ "$source" = "posttool" ]; then
+    [ "$mprev" = "wait" ] || exit 0          # same stuck-wait-only contract as below
+  fi
+  [ "$mprev" = "$state" ] || mts="$(date +%s)"   # @state_since parity: ts = transition
+  [ -n "$mts" ] || mts="$(date +%s)"
+  printf '%s %s %s\n' "$state" "$mts" "${POD_AGENT_ID:-claude-code}" > "$mf.tmp.$$" 2>/dev/null \
+    && mv "$mf.tmp.$$" "$mf" 2>/dev/null
+  rm -f "$mf.tmp.$$" 2>/dev/null
+  exit 0
+fi
 [ -n "$win" ] || exit 0
 # Stamp @state_since (epoch) ONLY on a real transition, so the summary pane's activity
 # timer ("busy 12m") measures the current state, not the last hook fire.

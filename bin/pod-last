@@ -16,6 +16,8 @@ T="$POD_TMUX"
 pane="${TMUX_PANE:-}"; [ -n "$pane" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 win="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
+# Command sandbox: socket blocked -> identity from the spawn-time environment.
+if [ -z "$win" ] && ! pod_socket_ok; then win="${POD_WINDOW:-}"; fi
 [ -n "$win" ] || exit 0
 
 payload="$(cat 2>/dev/null)"
@@ -79,6 +81,16 @@ digest="${out#*$'\t'}"
 if [ -n "$digest" ]; then
   "$T" set-option -w -t "$win" @last    "$digest"      2>/dev/null || true
   "$T" set-option -w -t "$win" @last_at "$(date +%s)"  2>/dev/null || true
+fi
+# sandbox: the set-options above no-op'd -> mirror the digest to a file the
+# unsandboxed pod-foreign-state poller applies as @last/@last_at/@transcript.
+if [ -n "$digest" ] && ! pod_socket_ok && [ -n "${POD_SESSION:-}" ]; then
+  mdir="$(pod_mirror_dir)"
+  if mkdir -p "$mdir" 2>/dev/null; then
+    printf '%s\t%s\t%s\n' "$(date +%s)" "$digest" "$tpath" > "$mdir/${win}.last.tmp.$$" 2>/dev/null \
+      && mv "$mdir/${win}.last.tmp.$$" "$mdir/${win}.last" 2>/dev/null
+    rm -f "$mdir/${win}.last.tmp.$$" 2>/dev/null
+  fi
 fi
 
 # Fire-and-forget self-summary so podmates see what this agent is actually working on,
