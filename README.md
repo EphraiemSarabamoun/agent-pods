@@ -114,8 +114,9 @@ Every button has a keyboard chord — the full map is in
 
 **Pod vs manager vs worker.** A *pod* is one tmux session, the live cluster of agents
 sharing it, named after a city and recognized by an `@is_pod` session stamp (not a name
-pattern). Window 0 is the *manager* seat (a shell that prints the roster by default, or an
-agent if you point `POD_MANAGER_CMD` at one). Every other window is a *worker*. If you run
+pattern). Window 0 is the *manager* seat (the best agent you have installed by default, a
+plain roster-printing shell if you have none, or whatever you pin with `POD_MANAGER_CMD`;
+name it via `POD_MANAGER_NAME`). Every other window is a *worker*. If you run
 agent-pods across machines, the host mesh is the *fleet*, but a pod is local to one host
 and one tmux session. Rename a pod by double-clicking its badge (or `M-r`); its chat
 history follows the rename.
@@ -156,6 +157,95 @@ transitions) that agents receive at session start and as per-turn deltas. See
 
 **The roster.** Run `pod` from any window to list your podmates (manager plus every
 worker) with each one's identity card, live status, color, stars, and which one is "you".
+
+## Configuration
+
+Runtime config is a plain shell file at `~/.config/pod/config.sh` (copied from
+`config/config.sh.example` on install). Set only what you want to override; everything
+else keeps its default. It's sourced by every pod script, so one `NAME=value` per line
+is all it takes. The knobs you'll reach for most:
+
+### Naming the manager seat
+
+Window 0 (the manager) shows a name on its tab — `manager` by default. Give it a name of
+your own, and optionally a *second* name it switches to while the pod runs itself in FULL
+AUTO, so the tab alone tells you which mode you're in:
+
+```sh
+POD_MANAGER_NAME="Hermes"             # shown in MANUAL mode (✋)
+POD_MANAGER_NAME_AUTO="Hermes Prime"  # shown while FULL AUTO is on (⚡)
+```
+
+Spaces are fine. If you set only `POD_MANAGER_NAME`, the rename is a visible no-op (both
+modes show the same name). The switch is live: toggling FULL AUTO renames the tab, and it
+also heals a tab still showing the old default `manager` from a pod launched before you
+set these — no relaunch needed for a running pod. A fresh `pod-launch` picks it up from
+the start.
+
+### Choosing the manager agent
+
+By default the manager seat becomes the best agent you actually have installed
+(`claude-code`, then `codex`, `cursor`, `openclaw`), launched with that agent's default
+model — or a plain roster-printing shell if none are present. Override the order, or pin
+one outright:
+
+```sh
+POD_MANAGER_PREFER="codex claude-code"   # try codex first
+POD_MANAGER_CMD=claude                    # pin the manager to a specific command
+POD_MANAGER_CMD=/bin/bash                 # force the plain-shell manager
+```
+
+### Naming pods
+
+New pods are named after a random free city; the numeric `<prefix>-N` series is the
+fallback when the pool runs out. Override either:
+
+```sh
+POD_SESSION_PREFIX=pod                 # the <prefix>-N fallback series
+POD_CITIES="Rome Kyoto Cairo Oslo"     # your own pool (single words)
+```
+
+### State location (multi-user hosts)
+
+All ephemeral state lives under one tmp tree (`/tmp/pod` by default), shared per host. On
+a machine several people log into, namespace it per user so registries and mailboxes
+don't interleave:
+
+```sh
+POD_TMP="/tmp/pod-$USER"
+```
+
+### Claude Code behind Bedrock / Vertex / a gateway
+
+Seats inherit your environment's configured model automatically — no override needed. To
+pin a model ID verbatim (skipping the catalog), set `POD_CLAUDE_MODEL`. Full detail in
+[docs/adapters.md](docs/adapters.md#claude-code-behind-bedrock-vertex-or-an-enterprise-gateway).
+
+The complete annotated list of knobs lives in
+[`config/config.sh.example`](config/config.sh.example).
+
+## Troubleshooting
+
+If agents don't seem aware of their pod — no roster at startup, no journal, no mail, or
+state dots stuck grey — run **`pod-doctor`** from a pane inside the pod. It walks the
+whole awareness chain end to end (tmux reachability, json tooling, this window's identity
+stamps, the roster shape the hooks match on, whether your Claude Code `settings.json`
+actually wires the hooks and points at live paths, plus a live emit probe) and names the
+first broken link. It's read-only. Common causes it catches:
+
+- **Hooks not loaded yet.** Lifecycle hooks load when an agent *starts* — a session
+  launched before you ran the hook installer stays blind until you restart it.
+- **A relocated repo.** If you moved or re-cloned the repo after installing, the hook
+  paths baked into `settings.json` can point at files that no longer exist; re-run
+  `hooks/claude-code/install.sh`.
+- **jq missing from the agent's PATH.** The context tier falls back to python3, so
+  awareness still works, but `pod-doctor` flags it (a login shell having jq doesn't put
+  it on the agent process's PATH).
+- **A command sandbox.** When the agent's subprocesses can't reach the tmux socket (some
+  CI runners, containers, restricted shells), the deck automatically falls back to
+  filesystem-based coordination; `pod-doctor` confirms that tier is engaged and that the
+  seat carries the `POD_WINDOW` identity it needs. Seats spawned before that support
+  landed need one respawn to pick it up.
 
 ## Add your agent
 
