@@ -1,7 +1,9 @@
 # agent-pods runtime config — copy to ~/.config/pod/config.sh and edit.
 # This is a PLAIN SHELL FILE, sourced by every pod-* script via _pod-paths.sh.
 # Set only what you want to override; anything you omit keeps its built-in default.
-# (The agent CATALOG is separate — that's adapters/*.toml + ~/.config/pod/slots.toml.)
+# (The agent CATALOG is separate — that's adapters/*.toml in the repo, overridable
+# per-user in ~/.config/pod/adapters/*.toml. The ten quick-pick "+" slots are a THIRD
+# file, ~/.config/pod/slots.json, seeded by install.sh and edited via the ⚙ menu.)
 
 # --- deck identity -------------------------------------------------------------
 # New pods are named after a random free city (Rome, Kyoto, ...); the numeric
@@ -18,6 +20,8 @@
 #   POD_MANAGER_CARD="Claude Code · opus · manager"
 # Set POD_MANAGER_CMD to a shell to FORCE the plain manager seat regardless of agents:
 #   POD_MANAGER_CMD=/bin/bash
+# Setting this before you run install.sh ALSO installs a launcher by that name, so
+# `hermes` opens a pod just like `pod-launch` (only if the name is free on your PATH).
 # POD_MANAGER_NAME=manager
 # POD_MANAGER_PREFER="claude-code codex cursor openclaw"
 # POD_MANAGER_CMD=

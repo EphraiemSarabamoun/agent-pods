@@ -1,5 +1,63 @@
 # Changelog
 
+## The leak guard stops publishing its own denylist, and your manager gets a launcher
+
+- **`test/no-private-leaks.sh` no longer carries the private terms.** The guard exists so
+  no name, path, host or persona from a private upstream tree can be dragged into this
+  one — but it did that by hardcoding the list of terms, in a public file, in a public
+  repo. A denylist is a map of exactly what it is hiding, so the guard was publishing the
+  inventory it protects: usernames, home paths, machine names, private repo names. The
+  mechanism stays here; the terms move out. It now reads one regex per line from
+  `$POD_PRIVATE_PATTERNS` (default `~/.config/pod/private-patterns.txt`) and **skips,
+  exit 0, when there is no such file** — a fork has no private identifiers of ours to
+  leak, so there is nothing to check, and CI stays green without shipping a wordlist.
+  `--require` inverts that for the pre-publish run, where a silent skip is the dangerous
+  case: no patterns configured is then a failure, not a pass. The scan itself is
+  unchanged (same paths, same LICENSE-copyright exemption, still case-insensitive).
+
+- **`POD_MANAGER_NAME` now installs a launcher by that name.** Name the manager seat
+  `Hermes` and `install.sh` puts a `hermes` command on your `PATH` that opens or attaches
+  a pod, identical to `pod-launch` (`hermes mypod` targets one) — the deck answers to
+  whatever you call it. The name comes from your local config at install time, so nothing
+  persona-specific enters the repo. Claimed only when free: if any command already answers
+  to that name anywhere on `PATH`, the installer warns and leaves both alone rather than
+  shadowing it, since a name you chose is trivial to change. Names with spaces or shell
+  metacharacters are skipped, as are collisions with an existing `pod-*` command.
+  `uninstall.sh` removes it, matching only the shim it wrote.
+
+## Continuous integration, and two doc corrections
+
+- **CI (`.github/workflows/ci.yml`).** The test suite existed but nothing ran it. A
+  push/PR workflow now runs ten checks — `check-adapters`, `lint-tmux-targets`,
+  `no-private-leaks`, `check-install-modes`, `check-model-policy`,
+  `check-context-emit`, `check-primer`, `check-sandbox-fallback`,
+  `test-adapter-discovery-timeout`, `check-safety-invariants` — on **both**
+  `ubuntu-latest` and `macos-latest`. The macOS leg is the point, not padding: the
+  scripts are bash 3.2 safe and BSD/GNU portable on purpose, and only a macOS runner
+  catches a `stat -c` or a GNU-only `date` before it ships. The step runs every check
+  and fails once at the end, so one red run reports all faults instead of only the
+  first. `ripgrep` is installed deliberately — `check-model-policy.sh`'s
+  "no hardcoded model catalog" assertion is an `if rg ...` that silently *passes* when
+  `rg` is missing, so without it that check was a no-op reporting success.
+- **`parity-sandbox.sh` runs advisory-only, in its own job.** Several of its assertions
+  are races rather than invariants (the rename section sleeps a fixed 0.8s while the
+  `session-renamed` hook is backgrounded with `run-shell -b` and writes its feed line
+  last, measured at 0.80s–2.85s end to end; the docked-pane scroll checks sleep
+  0.2–0.25s against a 2s repaint tick). Gating on it would paint correct commits red on
+  a loaded shared runner. Once those fixed sleeps become bounded polls on the terminal
+  condition, drop `continue-on-error` and fold it into the matrix.
+- **`config/config.sh.example` no longer points at a file that does not exist.** Line 4
+  advertised `~/.config/pod/slots.toml`; nothing in the project reads that path, and
+  `install.sh` copies this file verbatim to `~/.config/pod/config.sh`, so the wrong name
+  was planted in every installation. The real files are `adapters/*.toml` (overridable
+  at `~/.config/pod/adapters/*.toml`) for the catalog and `~/.config/pod/slots.json`,
+  seeded by `install.sh` and edited via `⚙`, for the ten quick-pick slots.
+- **`docs/keybindings.md` no longer claims `j`/`k` scroll the docked chat.** The table
+  grouped them with the arrow keys as mode-dependent, but only the arrow branch in
+  `bin/pod-summary` is guarded on pane mode; `j`/`k` move the roster card cursor in both
+  modes. The row is now split, so the chat-scroll keys a reader reaches for (arrows,
+  wheel, `u`/`d`) are the ones that actually scroll.
+
 ## Operator primer, memory, and sandbox notices
 
 - **Operator primer.** At each seat's session start, `pod-primer` injects a concise,

@@ -177,7 +177,15 @@ POD_MANAGER_NAME="Hermes"             # shown in MANUAL mode (✋)
 POD_MANAGER_NAME_AUTO="Hermes Prime"  # shown while FULL AUTO is on (⚡)
 ```
 
-Spaces are fine. If you set only `POD_MANAGER_NAME`, the rename is a visible no-op (both
+`install.sh` also gives you a **launcher by that name**: with `POD_MANAGER_NAME="Hermes"`
+set before you install, `hermes` opens or attaches a pod exactly like `pod-launch`
+(`hermes mypod` targets one), so the deck answers to whatever you call it. It is claimed
+only when the name is genuinely free — if anything already answers to it on your `PATH`,
+the installer says so and leaves both alone. Re-run `./install.sh` after changing the
+name; `./uninstall.sh` removes the launcher with everything else.
+
+Spaces are fine, though a name with spaces gets no launcher (it can't be a command name).
+If you set only `POD_MANAGER_NAME`, the rename is a visible no-op (both
 modes show the same name). The switch is live: toggling FULL AUTO renames the tab, and it
 also heals a tab still showing the old default `manager` from a pod launched before you
 set these — no relaunch needed for a running pod. A fresh `pod-launch` picks it up from
@@ -292,6 +300,36 @@ single private per-user runtime tree. Paths, config, and the adapter catalog mee
 [docs/autonomy.md](docs/autonomy.md) for the FULL AUTO loop, and
 [docs/gotchas.md](docs/gotchas.md) for the hard-won tmux details a contributor should
 read before touching the status strip.
+
+## Running the checks
+
+The suite in `test/` is plain bash — no framework, no fixtures to install. Run one
+script, or all of them:
+
+```sh
+bash test/check-adapters.sh          # every adapter parses and has id + base_cmd
+bash test/lint-tmux-targets.sh       # no fuzzy-prefix-match session targets
+bash test/no-private-leaks.sh        # the tree carries no private identifiers (see below)
+bash test/check-safety-invariants.sh # isolation, locking, dispatch races (needs tmux)
+```
+
+`no-private-leaks.sh` **skips by default**: it scans for the patterns in
+`$POD_PRIVATE_PATTERNS` (default `~/.config/pod/private-patterns.txt`, one regex per
+line), and with no such file there is nothing to check. That file deliberately lives
+outside the repo — a denylist is a map of exactly what it hides, so publishing the terms
+would publish the inventory. If you maintain a fork with private identifiers to keep out
+of a public tree, write your list there and run `bash test/no-private-leaks.sh --require`
+before publishing, which fails rather than skips when the list is missing.
+
+Most need only `python3`; `check-safety-invariants.sh` and `parity-sandbox.sh` stand up
+a real tmux server, always on their own private `-L` socket, so they never touch a pod
+you have open. `check-model-policy.sh` wants `ripgrep` — one of its assertions is an
+`if rg ...` that silently passes when `rg` is missing.
+
+CI (`.github/workflows/ci.yml`) runs the same scripts on Linux and macOS on every push
+and pull request. The macOS leg is not redundant: these scripts are bash 3.2 safe and
+BSD/GNU portable deliberately, and only a macOS runner catches a GNU-only `stat -c` or
+`date` before it reaches a user.
 
 ## License
 
