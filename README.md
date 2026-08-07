@@ -231,11 +231,6 @@ Grow that memory with `pod-remember "<lesson>"`; it's durable and cross-session 
 per-pod journal `pod-note` feeds) and reaches every hooked seat you spawn afterward. `POD_PRIMER=0`
 turns the injection off; `POD_OPERATOR_MEMORY` relocates the file.
 
-If a seat runs in a command sandbox that can't reach the tmux socket, the primer also tells
-that agent up front which pod features work from there (roster, journal, pod-mail — anything
-that reads or exchanges) and which are blocked (spawning/killing workers, driving other
-panes — anything that changes the deck). See Troubleshooting.
-
 ### Local and managed model catalogs
 
 The `+` picker queries the agent installed on this device, so Claude Code automatically
@@ -263,11 +258,6 @@ first broken link. It's read-only. Common causes it catches:
 - **jq missing from the agent's PATH.** The context tier falls back to python3, so
   awareness still works, but `pod-doctor` flags it (a login shell having jq doesn't put
   it on the agent process's PATH).
-- **A command sandbox.** When the agent's subprocesses can't reach the tmux socket (some
-  CI runners, containers, restricted shells), the deck automatically falls back to
-  filesystem-based coordination; `pod-doctor` confirms that tier is engaged and that the
-  seat carries the `POD_WINDOW` identity it needs. Seats spawned before that support
-  landed need one respawn to pick it up.
 
 ## Add your agent
 

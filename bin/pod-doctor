@@ -41,33 +41,16 @@ if command -v "$T" >/dev/null 2>&1; then
 else
   fail "tmux not found ($T) — no pod can exist without it"; T=""
 fi
-IN_TMUX=0; SESS=""; WIN=""; SOCK=1
+IN_TMUX=0; SESS=""; WIN=""
 if [ -n "${TMUX:-}" ] && [ -n "$T" ]; then
   IN_TMUX=1
-  if pod_socket_ok; then
-    pass "tmux socket reachable from this process"
-    SESS="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{session_name}' 2>/dev/null)"
-    WIN="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null)"
-    pass "inside tmux: session '$SESS', window $WIN"
-    if [ "$("$T" show-options -t "=${SESS}:" -qv @is_pod 2>/dev/null)" = "1" ]; then
-      pass "session is a stamped pod (@is_pod=1)"
-    else
-      warn "session '$SESS' is NOT stamped @is_pod — was it created by pod-launch? Manager-gated hooks (pod-auto-brief) skip unstamped sessions."
-    fi
+  SESS="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{session_name}' 2>/dev/null)"
+  WIN="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null)"
+  pass "inside tmux: session '$SESS', window $WIN"
+  if [ "$("$T" show-options -t "=${SESS}:" -qv @is_pod 2>/dev/null)" = "1" ]; then
+    pass "session is a stamped pod (@is_pod=1)"
   else
-    SOCK=0
-    warn "tmux socket unreachable (connect denied) — this process runs in a command sandbox that blocks unix-socket connect. The FILE-FALLBACK tier applies: hooks self-identify from \$POD_WINDOW, mirror state to files, and the unsandboxed poller reconciles them onto tmux."
-    SESS="${POD_SESSION:-}"
-    WIN="${POD_WINDOW:-}"
-    [ -n "$SESS" ] && pass "POD_SESSION in env: '$SESS'" \
-      || fail "POD_SESSION not in env — the pod predates the fallback tier or wasn't spawned by pod-launch; relaunch the pod"
-    [ -n "$WIN" ] && pass "POD_WINDOW in env: $WIN" \
-      || fail "POD_WINDOW not in env — this seat was spawned before the fallback tier (pod-worker-bootstrap exports it); respawn the seat"
-    [ -f "$POD_STATE/workers.json" ] && pass "workers.json present (file-backed roster source)" \
-      || warn "no $POD_STATE/workers.json — the file-backed roster will show only the manager"
-    mdir="$(pod_mirror_dir "$SESS")"
-    [ -d "$mdir" ] && pass "mirror dir exists: $mdir" \
-      || echo "      (no mirror dir yet — appears after the first sandboxed pod-state fire)"
+    warn "session '$SESS' is NOT stamped @is_pod — was it created by pod-launch? Manager-gated hooks (pod-auto-brief) skip unstamped sessions."
   fi
 else
   fail "not inside tmux — run pod-doctor from a pane INSIDE the pod (every awareness hook exits silently outside tmux)"
@@ -85,7 +68,7 @@ elif [ "$HAVE_PY" = 1 ]; then echo "      context emission will use: python3 fal
 else echo "      context emission will use: raw stdout (last resort — still injected on SessionStart/UserPromptSubmit)"; fi
 
 # --- 3. this window's stamps ---------------------------------------------------------
-if [ "$IN_TMUX" = 1 ] && [ "$SOCK" = 1 ]; then
+if [ "$IN_TMUX" = 1 ]; then
   say "this window's stamps"
   aid="$("$T" show-options -w -t "$WIN" -qv @agent_id 2>/dev/null)"
   card="$("$T" show-options -w -t "$WIN" -qv @card 2>/dev/null)"
@@ -93,12 +76,6 @@ if [ "$IN_TMUX" = 1 ] && [ "$SOCK" = 1 ]; then
   [ -n "$aid" ]  && pass "@agent_id=$aid" || warn "@agent_id unset — the SessionStart hook hasn't run in this window yet (or isn't wired)"
   [ -n "$card" ] && pass "@card=$card"    || warn "@card unset — spawned outside pod-add-worker/pod-launch?"
   [ -n "$st" ]   && pass "@cc_state=$st"  || warn "@cc_state unset — pod-state has never fired here (hooks not wired, or agent launched before install)"
-elif [ "$IN_TMUX" = 1 ]; then
-  say "this window's stamps"
-  echo "      (unreadable without the socket — the poller reconciles them from the mirror files)"
-  mf="$(pod_mirror_dir "$SESS")/$WIN"
-  [ -f "$mf" ] && pass "mirror state file exists: $(cat "$mf" 2>/dev/null | head -1)" \
-    || echo "      (no mirror state yet — appears after the first hook fire from this seat)"
 fi
 
 # --- 4. roster ------------------------------------------------------------------------
@@ -132,13 +109,82 @@ else
     fi
   done
   [ "$wired" = 4 ] && pass "all 4 pod hook families present in $SETTINGS"
-  # every absolute pod path referenced must still exist (repo moved = dead hooks)
-  dead=0
-  for p in $(grep -o '"[^"]*pod[^"]*"' "$SETTINGS" 2>/dev/null | tr -d '"' | grep '^/' | sort -u); do
-    if [ ! -e "$p" ]; then fail "hook references a DEAD path: $p (repo moved since install? re-run hooks/claude-code/install.sh)"; dead=$((dead + 1)); fi
-  done
-  [ "$dead" = 0 ] && pass "every pod path referenced by settings.json exists on disk"
-  if [ "$wired" = 4 ] && [ "$dead" = 0 ]; then
+  # every absolute pod path referenced must still exist (repo moved = dead hooks).
+  # This has to PARSE settings.json, not scrape it. The installer writes each command
+  # as `bash "<path>" <args>`, so inside the JSON string those quotes are escaped:
+  # "command": "bash \"/repo/bin/pod-state\" idle". A regex over the raw text captures
+  # the backslash too, so every healthy path came back as `/repo/bin/pod-state\` and a
+  # perfect fresh install reported one dead path per hook and exited 1 — sending users
+  # to chase a relocation that never happened. python3 also gives us shlex, the only
+  # honest way to recover argv from `bash "/my pods/bin/pod-state" idle` when the repo
+  # path contains spaces (the old unquoted `for p in $(...)` word-split those too).
+  # NOTE for future editors: this here-doc sits inside $( ), and bash 3.2 (what macOS
+  # ships) still scans that body for quotes despite the quoted PY delimiter. One stray
+  # apostrophe or one unpaired backtick below and the whole SCRIPT dies at parse time
+  # with "unexpected EOF while looking for matching" — verified on bash 3.2.57. Keep
+  # the Python comments free of both.
+  dead=0; scan_ok=0
+  if [ "$HAVE_PY" = 1 ]; then
+    pod_paths="$(python3 - "$SETTINGS" <<'PY'
+import json, shlex, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception as e:
+    # Hand the reason back on STDOUT, not stderr: rc 2 means the caller reads this
+    # capture as the message instead of as paths, so the parser error lands INSIDE
+    # the FAIL line rather than spilling above it looking like a doctor crash.
+    sys.stdout.write("%s\n" % e)
+    sys.exit(2)
+hooks = data.get("hooks") if isinstance(data, dict) else None
+seen = set()
+for groups in (hooks or {}).values():
+    for group in groups or []:
+        if not isinstance(group, dict):
+            continue
+        for h in group.get("hooks", []) or []:
+            if not isinstance(h, dict) or h.get("type") != "command":
+                continue
+            cmd = h.get("command")
+            if not isinstance(cmd, str):
+                continue
+            try:
+                argv = shlex.split(cmd)
+            except ValueError:
+                continue            # unbalanced quotes: not ours to diagnose here
+            # Check EVERY absolute argument naming a pod script, not just argv[1]:
+            # we write "bash <path> <args>", but a hand-edited hook may exec the
+            # script directly, and the old scrape covered that shape too. Keeping the
+            # "pod" filter keeps unrelated user hooks out of our failure count.
+            for tok in argv:
+                if tok.startswith("/") and "pod" in tok:
+                    seen.add(tok)
+for p in sorted(seen):
+    print(p)
+PY
+)"; scan_rc=$?
+    if [ "$scan_rc" = 2 ]; then
+      # Unparseable JSON is a harder failure than a dead path: Claude Code loads NO
+      # hook at all from it, and install.sh deliberately refuses to rewrite it, so
+      # re-running the installer would leave the user exactly as blind as before.
+      fail "$SETTINGS is not valid JSON ($pod_paths) — the agent can load NO hooks from it, and hooks/claude-code/install.sh refuses to touch a file it cannot parse. Fix the syntax, or restore one of the *.pod-bak.* copies beside it."
+    else
+      scan_ok=1
+      # Fed by here-doc, not a pipe, so `fail`/`dead` mutate THIS shell; `IFS= read -r`
+      # keeps paths with spaces in one piece.
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if [ ! -e "$p" ]; then fail "hook references a DEAD path: $p (repo moved since install? re-run hooks/claude-code/install.sh)"; dead=$((dead + 1)); fi
+      done <<EOF
+$pod_paths
+EOF
+    fi
+  else
+    # Deliberately skip rather than fall back to a text scrape: any regex over escaped
+    # JSON re-invents the false-FAIL bug above, and a wrong FAIL is worse than none.
+    warn "dead-path audit skipped — it needs python3 to read $SETTINGS as JSON (python3 is a hard dep of hooks/claude-code/install.sh, so its absence here is itself worth fixing)"
+  fi
+  [ "$scan_ok" = 1 ] && [ "$dead" = 0 ] && pass "every pod path referenced by settings.json exists on disk"
+  if [ "$wired" = 4 ] && [ "$scan_ok" = 1 ] && [ "$dead" = 0 ]; then
     echo "      note: hooks load at agent START — a session launched before install stays blind until restarted."
   fi
 fi

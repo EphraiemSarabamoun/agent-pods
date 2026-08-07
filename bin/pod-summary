@@ -173,11 +173,31 @@ EOF
 # visible width (for the … cue). rendered may contain '|'; parse 3 fields, the
 # remainder is the line.
 FEEDC=(); FEED_NLINES=0; FEED_TOTAL_C=0
+# Nothing ever trims channel.log (unlike journal.md, which pod-brief caps at 500/400),
+# and load_feed re-wraps + ANSI-renders EVERY message in it on every 2s tick — measured
+# 0.84s at 5k messages, 2.49s at 20k, at which point a render no longer fits in the
+# tick and the docked sidebar stalls with no way to recover short of killing the pod.
+# Render only the newest POD_FEED_MAX messages: far deeper than any reachable
+# scrollback, and under the cap (every normal pod) pod-feed still gets the real file,
+# so the common path is byte-for-byte unchanged.
+POD_FEED_MAX="${POD_FEED_MAX:-1500}"
+FEED_TAIL="$POD_STATE/.feed-tail.$$"
+feed_source() {
+  local chan lc
+  chan="$(pod_chan_for "$sess")"
+  lc="$(wc -l < "$chan" 2>/dev/null | tr -d ' ')"
+  case "$lc" in ''|*[!0-9]*) printf '%s' "$chan"; return ;; esac
+  if [ "$lc" -gt "$POD_FEED_MAX" ] && tail -n "$POD_FEED_MAX" "$chan" > "$FEED_TAIL" 2>/dev/null; then
+    printf '%s' "$FEED_TAIL"
+  else
+    printf '%s' "$chan"
+  fi
+}
 load_feed() {
   FEEDC=(); local i=0 l
   while IFS= read -r l; do FEEDC[$i]="$l"; i=$((i+1)); done < <(
     POD_COLS="$COLS" POD_AGENT_COLORS="$AGENT_COLORS" POD_MANAGER_NAME="$MGR_NAME" \
-    POD_FEED_CACHE=1 "$POD_BIN/pod-feed" "$(pod_chan_for "$sess")" 2>/dev/null)
+    POD_FEED_CACHE=1 "$POD_BIN/pod-feed" "$(feed_source)" 2>/dev/null)
   FEED_NLINES=$i
   if [ "$i" -gt 0 ]; then FEED_TOTAL_C=$(( ${FEEDC[$((i-1))]%%|*} + 1 )); else FEED_TOTAL_C=0; fi
 }
@@ -401,6 +421,7 @@ load_rows
 # non-TTY (piped/test): single paint, old behavior
 if ! [ -t 0 ]; then
   draw -1
+  rm -f "$FEED_TAIL" 2>/dev/null            # the feed-tail snapshot is per-process
   exit 0
 fi
 
@@ -428,7 +449,7 @@ printf '\033[?1049h\033[?1006;1000h'
 # call and are unaffected). Restore the saved state on exit.
 STTY_SAVE="$(stty -g 2>/dev/null || true)"
 stty -echo -icanon min 0 time 0 2>/dev/null || true
-trap 'printf "\033[?1000;1006l\033[?1049l\033[?25h"; [ -n "$STTY_SAVE" ] && stty "$STTY_SAVE" 2>/dev/null' EXIT
+trap 'printf "\033[?1000;1006l\033[?1049l\033[?25h"; rm -f "$FEED_TAIL" 2>/dev/null; [ -n "$STTY_SAVE" ] && stty "$STTY_SAVE" 2>/dev/null' EXIT
 
 cur=0
 draw_due=full

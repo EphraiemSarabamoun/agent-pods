@@ -28,6 +28,14 @@ if [ -n "$prev_id" ] && [ "$cmd" = "$prev_cmd" ]; then
   exit 0
 fi
 
+# No pane command at all (the window vanished mid-poll, or tmux errored) is not
+# evidence of anything. Re-deciding identity from a failed lookup would hand the pane
+# to the catch-all shell and drop the agent's delivery/state wiring, so keep the stamp.
+if [ -z "$cmd" ]; then
+  [ -n "$prev_id" ] && { printf '%s' "$prev_id"; exit 0; }
+  printf ''; exit 1
+fi
+
 # capture pane content for any NON-Claude command, so detection-by-content works for
 # any agent regardless of what process name it shows (node, python, sleep, a wrapper,
 # ...). A version-string command (claude reports e.g. "2.1.158") is unambiguous and
@@ -41,7 +49,18 @@ case "$cmd" in
   *)      content="$("$T" capture-pane -p -t "$win" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -60)" ;;
 esac
 
-id="$("$POD_ADAPTER" detect "$cmd" "$content" 2>/dev/null)"
+# Pass the id this window is ALREADY stamped with. Spawn stamps the truth (pod-launch
+# / pod-add-worker KNOW what they launched) but do not set @agent_id_cmd, so the very
+# first poller cycle re-detects and — before --current existed — a content substring
+# ('(?i)codex' matches a `pod` roster line, an `ls adapters/`) could overwrite that
+# truth with a guess. A wrong id flips @state_source/@pod_native_delivery, which
+# freezes the seat's state dot and makes pod-deliver mark its mail delivered without
+# ever showing it. --current makes the re-detect refuse anything but UNAMBIGUOUS
+# pane-command evidence, so a stamped seat can no longer be talked out of its identity
+# by text. The `--` is load-bearing: pane content is arbitrary text, and a scrollback
+# whose first line begins with a dash would otherwise be parsed as an option (a pane
+# literally showing "--current codex" could pick its own id).
+id="$("$POD_ADAPTER" detect --current "$prev_id" -- "$cmd" "$content" 2>/dev/null)"
 [ -n "$id" ] || { printf ''; exit 1; }
 
 label="$("$POD_ADAPTER" field "$id" label 2>/dev/null)"

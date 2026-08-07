@@ -29,13 +29,73 @@ pod_sanitize() { LC_ALL=C printf '%s' "${1:-$POD_SESSION_PREFIX}" | LC_ALL=C tr 
 pod_dir_for()  { printf '%s/%s' "$POD_COMMS" "$(pod_sanitize "$1")"; }
 pod_chan_for() { printf '%s/channel.log' "$(pod_dir_for "$1")"; }
 
+# mtime of a path as a plain integer (0 when unknown). BSD and GNU stat share NO
+# format flag, and the classic `stat -f %m x || stat -c %Y x` chain is a trap: on GNU
+# coreutils -f means "filesystem status", so it treats %m as a FILENAME, prints a
+# multi-line filesystem dump for the real path on STDOUT and exits 1 — the caller's
+# command substitution keeps that dump, and the next `$(( now - mtime ))` dies with
+# "File: unbound variable" under set -u. Branch on uname (memoized) like
+# _pod-paths.sh:118 already does, then scrub the answer to digits.
+pod_file_mtime() {
+  local m=""
+  [ -n "${__POD_UNAME:-}" ] || __POD_UNAME="$(uname -s 2>/dev/null)"
+  case "$__POD_UNAME" in
+    Darwin) m="$(stat -f %m "${1:-}" 2>/dev/null)" ;;
+    *)      m="$(stat -c %Y "${1:-}" 2>/dev/null)" ;;
+  esac
+  case "$m" in ''|*[!0-9]*) m=0 ;; esac
+  printf '%s' "$m"
+}
+
+# Neutralize a message body before it is appended to a LINE-DELIMITED comms file.
+# Every consumer treats one line as one message (pod-mail-check counts '^\[',
+# pod-deliver's high-water is a line count, pod-feed parses one record per line), so a
+# newline inside a body forges extra messages attributed to a podmate — inside another
+# agent's model context, which makes it a straight prompt-injection channel between
+# seats. Newlines become the two-character escape \n: the body stays complete and
+# readable wherever it is rendered, but it can never become a second record. Other C0
+# controls (and DEL) are dropped; the tr ranges touch bytes < 0x80 only, so UTF-8 and
+# emoji pass through untouched.
+pod_msg_oneline() {
+  printf '%s' "${1:-}" \
+    | LC_ALL=C tr -d '\001-\010\013-\037\177' \
+    | LC_ALL=C awk 'NR>1{printf "%s", "\\n"} {printf "%s", $0}'
+}
+
+# Where pod-sync-pod-name leaves a forwarding record for a rename: one file per OLD
+# pod name whose contents are the NEW one.
+pod_rename_record() { printf '%s/renames/%s' "$POD_STATE" "$(pod_sanitize "${1:-}")"; }
+
+# Resolve a pod name that came from $POD_SESSION rather than from a live tmux answer.
+# $POD_SESSION is a SPAWN-TIME snapshot: a pod rename migrates the whole comms subtree
+# out from under it and a RUNNING pane never sees the updated session env, so a caller
+# with no live tmux answer would otherwise read and write a ghost of the pre-rename pod
+# forever — mail delivered to the live dir and never read, notes landing in a directory
+# the next launch sweeps. Follow the forwarding trail.
+pod_resolve_stale_pod() {
+  local cur="${1:-}" nxt="" rec="" hops=0
+  while [ "$hops" -lt 8 ]; do
+    # A comms subtree under this name wins outright: the name is in use RIGHT NOW (a
+    # new pod may legitimately re-use a retired name), so never forward off it.
+    [ -d "$(pod_dir_for "$cur")" ] && break
+    rec="$(pod_rename_record "$cur")"
+    [ -f "$rec" ] || break
+    nxt=""; IFS= read -r nxt < "$rec" 2>/dev/null || true
+    { [ -n "$nxt" ] && [ "$nxt" != "$cur" ]; } || break
+    cur="$nxt"; hops=$((hops + 1))
+  done
+  printf '%s' "$cur"
+}
+
 # current pod (tmux session) from the calling pane, else inherited env, else the prefix.
 pod_name() {
   local s=""
   if [ -n "${TMUX:-}" ]; then
     s="$("$POD_TMUX" display-message -p -t "${TMUX_PANE:-}" '#{session_name}' 2>/dev/null)"
   fi
-  [ -n "$s" ] || s="${POD_SESSION:-$POD_SESSION_PREFIX}"
+  # No live answer: POD_SESSION is only a snapshot, so validate it against the rename
+  # trail before trusting it.
+  [ -n "$s" ] || s="$(pod_resolve_stale_pod "${POD_SESSION:-$POD_SESSION_PREFIX}")"
   printf '%s' "$s"
 }
 

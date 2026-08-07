@@ -62,7 +62,14 @@ $POD_TMP/
 agent id/type, model, effort, identity card, label, host, status, and current task. It's
 written by `pod-add-worker`, the `✕` kill path, and the mcp; all three take the **same**
 `workers.json.lock` and write atomically (temp file plus `os.replace`) so concurrent
-spawn/kill/sync can't drop each other's entries.
+spawn/kill/sync can't drop each other's entries. Worker termination uses a locked
+`drop-if-unassigned` compare-and-delete, so a concurrent dispatcher either claims the
+row or the kill removes it, never both. Queue claims also carry a unique token;
+completion and interrupted-dispatch recovery compare that token under the same lock,
+so a stale poll cannot release a newer claim that reused the same task id.
+Dispatch archives also track the input boundary (`dispatching` → `typing` → `typed`
+→ `dispatched`). If recovery cannot prove whether a live pane submitted typed input,
+the registry holds it as `uncertain` instead of risking a duplicate execution.
 
 `tmux_group.json` records which pod is *primary*, the one the queue and mcp target by
 default, so running several pods at once doesn't confuse them. Only the primary writes
@@ -153,7 +160,9 @@ manager may run the autonomous loop (see [autonomy.md](autonomy.md)). The gate *
 OPEN** for non-pods: `mgr_pod_auto_state` returns `none` for any session without `@is_pod`,
 and callers treat `none` as unrestricted, so a plain tmux session or a headless seat never
 notices the switch exists. The switch's transitions also notify the manager through its
-mailbox, including a resume instruction when a paused loop for this pod is found.
+mailbox, including a resume instruction when a paused loop for this pod is found. AUTO
+resume submits immediately only when the adapter recognizes the last visible input line
+as its empty placeholder; otherwise the mailbox waits for the next native prompt hook.
 
 ## The docked summary pane (mission control)
 

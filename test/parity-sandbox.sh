@@ -61,6 +61,13 @@ export POD_TMP="$SBX/pod" POD_CONFIG_DIR="$SBX/config" POD_STAR_AWARDER="Tester"
 # transitions that this harness drives explicitly below.
 export POD_FOREIGN_INTERVAL=3600
 unset POD_TMUX ANTHROPIC_API_KEY CLAUDECODE
+# Opt OUT of the dedicated-socket shim (_pod-paths.sh) so the deck lands on the
+# isolated socket THIS harness owns. Without this the shim would re-point every
+# "$T" call at the default POD_TMUX_SOCKET server, the pod would be created there,
+# and every assertion below would read an empty sandbox socket ("no session
+# created") — a green feature reported as a total suite failure. Empty (not unset)
+# is the documented opt-out; the $SBX/bin/tmux shim on PATH provides the isolation.
+export POD_TMUX_SOCKET=
 # CRITICAL: this harness may run from INSIDE a tmux (and inside Claude Code). Drop the
 # inherited tmux + Claude context so deck scripts resolve the SANDBOX pod (via
 # tmux_group.json / POD_SESSION), not whatever real session/config we launched from.
@@ -162,6 +169,13 @@ PANE5="$(TM list-panes -s -t "=$POD" -F '#{pane_id}|#{@pod_summary}' | awk -F'|'
 for nx in $(seq -w 1 25); do printf '[09:%s] Tester → chat: MSG-%s line\n' "$nx" "$nx"; done >> "$SBX/pod/comms/$POD/channel.log"
 sleep 2.5   # let the pane reload its feed cache (2s tick)
 capf(){ TM capture-pane -p -t "$PANE5" 2>/dev/null | grep -oE 'MSG-[0-9]+'; }
+# waitfor <tries> <fn> — poll a TERMINAL condition at 100ms instead of sleeping a fixed
+# budget. The docked pane repaints on its own schedule and every reload forks (pod-feed,
+# and the feed-cap line count), so a fixed sleep asserts a LATENCY BUDGET rather than the
+# invariant: it goes red on a loaded runner while the pane is behaving correctly. Polling
+# is also faster in the common case — it returns the moment the pane settles.
+waitfor(){ local n="$1" i=0; while [ "$i" -lt "$n" ]; do "$2" && return 0; i=$((i+1)); sleep 0.1; done; return 1; }
+at_live(){ capf | grep -qx MSG-25 && ! TM capture-pane -p -t "$PANE5" | grep -qi "newer hidden"; }
 chk "feed renders newest-first (MSG-25 visible at live)" 'capf | grep -qx MSG-25'
 chk "oldest (MSG-01) is scrolled off at live" '! capf | grep -qx MSG-01'
 TM send-keys -t "$PANE5" u; sleep 0.2; TM send-keys -t "$PANE5" u; sleep 0.25
@@ -169,8 +183,8 @@ chk "scroll-up shows the newer-hidden indicator" 'TM capture-pane -p -t "$PANE5"
 chk "scroll-up reveals older messages" 'capf | grep -qE "MSG-0[1-9]|MSG-1[0-9]"'
 TM send-keys -t "$PANE5" -l $'\x1b[<65;30;10M'; sleep 0.25
 chk "synthetic mouse-wheel scrolls (mouse parser + burst drain)" 'TM capture-pane -p -t "$PANE5" | grep -qi "newer hidden"'
-TM send-keys -t "$PANE5" r; sleep 0.25
-chk "r returns to live (newest back, indicator gone)" 'capf | grep -qx MSG-25 && ! TM capture-pane -p -t "$PANE5" | grep -qi "newer hidden"'
+TM send-keys -t "$PANE5" r
+chk "r returns to live (newest back, indicator gone)" 'waitfor 30 at_live'
 chk "pane render carries ANSI color" 'TM capture-pane -ep -t "$PANE5" 2>/dev/null | LC_ALL=C grep -qa "$(printf "\033")"'
 
 POD_SESSION="$POD" "$CLONE/bin/pod-summary-pane" off "$POD" >/dev/null 2>&1; sleep 0.1
@@ -323,7 +337,6 @@ else
   chk "no-private-leaks.sh" 'bash "$CLONE/test/no-private-leaks.sh"'
   chk "check-model-policy.sh" 'bash "$CLONE/test/check-model-policy.sh"'
   chk "check-context-emit.sh" 'bash "$CLONE/test/check-context-emit.sh"'
-  chk "check-sandbox-fallback.sh" 'bash "$CLONE/test/check-sandbox-fallback.sh"'
   chk "check-install-modes.sh" 'bash "$CLONE/test/check-install-modes.sh"'
   chk "check-primer.sh" 'bash "$CLONE/test/check-primer.sh"'
   # The safety suite builds its own nested tmux shim. Do not let it discover this

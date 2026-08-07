@@ -28,10 +28,10 @@
 ## Continuous integration, and two doc corrections
 
 - **CI (`.github/workflows/ci.yml`).** The test suite existed but nothing ran it. A
-  push/PR workflow now runs ten checks — `check-adapters`, `lint-tmux-targets`,
+  push/PR workflow now runs nine checks — `check-adapters`, `lint-tmux-targets`,
   `no-private-leaks`, `check-install-modes`, `check-model-policy`,
-  `check-context-emit`, `check-primer`, `check-sandbox-fallback`,
-  `test-adapter-discovery-timeout`, `check-safety-invariants` — on **both**
+  `check-context-emit`, `check-primer`, `test-adapter-discovery-timeout`,
+  `check-safety-invariants` — on **both**
   `ubuntu-latest` and `macos-latest`. The macOS leg is the point, not padding: the
   scripts are bash 3.2 safe and BSD/GNU portable on purpose, and only a macOS runner
   catches a `stat -c` or a GNU-only `date` before it ships. The step runs every check
@@ -58,7 +58,7 @@
   modes. The row is now split, so the chat-scroll keys a reader reaches for (arrows,
   wheel, `u`/`d`) are the ones that actually scroll.
 
-## Operator primer, memory, and sandbox notices
+## Operator primer and memory
 
 - **Operator primer.** At each seat's session start, `pod-primer` injects a concise,
   role-gated primer (as `additionalContext`, like the journal): a manager seat gets
@@ -69,47 +69,8 @@
 - **Operator memory.** `pod-remember "<lesson>"` appends to a durable, cross-session
   file (`~/.config/pod/operator-memory.md`) that `pod-primer` injects into every seat
   you spawn afterward — distinct from `pod-note`, which is one pod's ephemeral journal.
-- **Proactive sandbox notice.** When a seat's tmux socket is blocked (a command
-  sandbox), `pod-primer` tells the agent up front which pod features work from that
-  seat (reads + comms, via files) and which are blocked (deck changes).
-- **Reactive sandbox notice.** `pod_require_socket` makes the deck-changing commands
-  (`pod-add-worker`, `pod-kill-worker`, `pod-auto`) fail with a clear "blocked in this
-  command sandbox — here's what still works" message instead of a cryptic tmux error.
-  Read/exchange commands stay silent; the normal (socket-reachable) path is unchanged.
-- `test/check-primer.sh` covers role selection, memory injection, both notices, and
-  that the normal path stays silent.
-
-## Sandboxed-seat support: the tmux socket is an upgrade, files are the truth
-
-Some environments run the agent's subprocesses in a command sandbox that denies
-unix-socket connect (Claude Code's command sandbox, CI runners, containers). There
-the tmux client→server socket is unreachable from hook subprocesses (`connect()` →
-EPERM) while the deck itself renders fine — agents sat blind and mute in a healthy-
-looking pod. Every fallback gates on ONE probe (`pod_socket_ok`, memoized per
-process): socket reachable → byte-for-byte today's behavior; socket blocked → files.
-
-- **Identity as environment.** `pod-worker-bootstrap` and `pod-launch` export
-  `POD_WINDOW` + `POD_AGENT_ID` into every seat from the (unsandboxed) pane shell.
-  `pod-state`, `pod-mail-check`, `pod-work`, `pod-last`, `pod-brief`, and `pod-tell`
-  resolve self-identity socket-first, env-fallback.
-- **File-backed roster.** `bin/pod` rebuilds the roster from `workers.json` +
-  `tmux_group.json` (+ mirror state) when — and only when — the socket connect
-  fails, same `instance(s):` shape, so the awareness hook injects a real roster.
-- **Mirror files + reconciler.** Sandboxed hooks write per-window state/work/last to
-  `$POD_STATE/mirror/<pod>/<win>*`; the unsandboxed `pod-foreign-state` poller
-  applies them onto the real tmux options (and journals transitions, heals stale
-  unread pills). The strip/roster/badge render paths are completely untouched —
-  data flows agent → file → poller → tmux, never sandboxed-agent → socket.
-- **Journal-delta awareness.** Under a blocked socket `pod-brief refresh` emits new
-  journal lines (per-reader cursor) instead of the live-window delta it can't take.
-- **Sending works too.** `pod-tell` from a sandboxed seat rebuilds the recipient
-  table from the registry; mbox deposits are pure file appends.
-- **Accepted degradation** (documented in docs/gotchas.md): `send-keys` delivery to
-  non-hook seats needs the socket and stays unavailable in sandboxes; dots/badges
-  lag up to one poller tick (~3s) instead of flipping instantly.
-- `pod-doctor` probes the socket first and names this state explicitly;
-  `test/check-sandbox-fallback.sh` runs the acceptance tests against a blocked-socket
-  stub and guards the normal path stays socket-driven.
+- `test/check-primer.sh` covers role selection, memory injection, the `POD_PRIMER=0`
+  kill switch, and silence outside a stamped pod.
 
 ## Context injection hardening + pod-doctor
 

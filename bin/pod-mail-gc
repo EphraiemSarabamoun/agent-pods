@@ -10,19 +10,56 @@
 #                        channel.log (the pre-namespace global bleed file). Run on
 #                        every pod launch as the crash/kill-server backstop.
 #
-# Hard guards: never touches $POD_COMMS itself, an empty name, '.'/'..', or a dir
-# whose name is a LIVE session. bash 3.2 safe.
+# Hard guards: never touches $POD_COMMS itself, an empty name, '.'/'..', a dir whose
+# name is a LIVE session, or ANY dir when the liveness answer could not be trusted
+# (see the probe below). bash 3.2 safe.
 set -u
 
 POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"; . "$POD_BIN/_pod-common.sh"
 T="$POD_TMUX"
+
+# --- liveness probe: an EMPTY session list is not the same answer as a FAILED one ----
+# The sweep's response to "nothing is alive" is rm -rf on every pod's comms subtree —
+# unread mailboxes, the chat feed, the journal — so it may only ever run on an answer
+# we can actually trust. Discarding this call's exit status (2>/dev/null into a
+# substitution) makes an unreachable unix socket, a tmux that isn't on a restricted
+# PATH, and a TMUX_TMPDIR mismatch all look exactly like "no pods exist",
+# which wipes LIVE pods. Same class as the "display-message on a dead window exits 0"
+# trap in docs/gotchas.md, mirrored: there the exit code lies, here the output does —
+# so keep the two apart and judge them separately.
+[ -x "$T" ] || command -v "$T" >/dev/null 2>&1 || exit 0    # no usable tmux -> unknown
+PROBE_ERR="$POD_STATE/.mail-gc.probe.$$"
+LIVE_RAW="$(LC_ALL=C "$T" list-sessions -F '#{session_name}' 2>"$PROBE_ERR")"; PROBE_RC=$?
+PROBE_MSG="$(cat "$PROBE_ERR" 2>/dev/null)"; rm -f "$PROBE_ERR" 2>/dev/null
 
 # Sanitized names of every LIVE tmux session. We compare a dir against THESE rather
 # than calling has-session on an already-sanitized dir name: a session whose real
 # name contains a char pod_sanitize maps to '_' (e.g. a space — tmux allows it) would
 # make has-session on the sanitized form return false, and the sweep would rm -rf the
 # LIVE pod's comms dir. Sanitizing both sides makes the match correct.
-LIVE="$("$T" list-sessions -F '#{session_name}' 2>/dev/null | while IFS= read -r s; do pod_sanitize "$s"; printf '\n'; done)"
+LIVE="$(printf '%s\n' "$LIVE_RAW" | while IFS= read -r s; do [ -n "$s" ] || continue; pod_sanitize "$s"; printf '\n'; done)"
+
+# TRUSTED = "there is definitely nothing more alive than what LIVE lists".
+#   rc 0                     -> the server answered; the list is complete.
+#   rc 1 + tmux's own "there is no server here" wording -> genuinely nothing running
+#     (ECONNREFUSED prints "no server running on <path>", ENOENT prints "error
+#     connecting to <path> (No such file or directory)"; both verified on tmux 3.6b).
+#     This is the crash/kill-server backstop the sweep exists for, so it must survive.
+# Everything else — connect denied ("Operation not permitted"), a missing binary
+# (rc 127), a garbled answer — is "we could not ask", never "nothing is alive".
+TRUSTED=0
+if [ "$PROBE_RC" -eq 0 ]; then
+  TRUSTED=1
+elif [ "$PROBE_RC" -eq 1 ]; then
+  case "$PROBE_MSG" in
+    "no server running on "*) TRUSTED=1 ;;
+    "error connecting to "*"(No such file or directory)"*) TRUSTED=1 ;;
+  esac
+fi
+# Belt: inside tmux we KNOW at least our own session is alive, so an empty list is
+# self-evidently wrong however it was produced (e.g. an agent inside a pod running
+# pod-launch, which sweeps unconditionally).
+if [ -n "${TMUX:-}" ] && [ -z "$LIVE" ]; then TRUSTED=0; fi
 
 remove_pod() {
   name="$(pod_sanitize "${1:-}")"
@@ -33,23 +70,33 @@ remove_pod() {
   dir="$(pod_dir_for "$name")"
   case "$dir" in "$POD_COMMS"|"$POD_COMMS/"|/|"") return 0 ;; esac   # paranoia
   [ -d "$dir" ] && rm -rf "$dir"
-  # the dead pod's sandbox mirror files (same sanitized name) go with it
-  mdir="$POD_STATE/mirror/$name"
-  case "$mdir" in "$POD_STATE/mirror/"|/|"") return 0 ;; esac
-  [ -d "$mdir" ] && rm -rf "$mdir"
   return 0
 }
 
 [ -d "$POD_COMMS" ] || exit 0
 
 if [ -n "${1:-}" ]; then
-  remove_pod "$1"                       # targeted: a pod just closed
+  # Targeted: the session-closed hook names the pod that JUST closed, so that one pod
+  # is known-dead without asking tmux. This is deliberately the only path allowed to
+  # delete on an untrusted probe.
+  remove_pod "$1"
 else
+  # Sweep mode infers death from ABSENCE, so it runs only on a trusted answer.
+  [ "$TRUSTED" = 1 ] || exit 0
   for d in "$POD_COMMS"/*/; do          # sweep: every dead pod's subtree
     [ -d "$d" ] || continue
     remove_pod "$(basename "$d")"
   done
   # legacy pre-namespace global bleed file (display log only, no unread state)
   [ -f "$POD_COMMS/channel.log" ] && rm -f "$POD_COMMS/channel.log"
+  # Rename forwarding records (pod-sync-pod-name) whose OLD name is LIVE again: the
+  # name has been re-used by a new pod, so the record would forward that pod's seats
+  # onto the pod that renamed away from it. A live name is never a forwarding source.
+  if [ -d "$POD_STATE/renames" ]; then
+    for f in "$POD_STATE/renames"/*; do
+      [ -f "$f" ] || continue
+      printf '%s\n' "$LIVE" | grep -Fxq -- "${f##*/}" && rm -f "$f"
+    done
+  fi
 fi
 exit 0

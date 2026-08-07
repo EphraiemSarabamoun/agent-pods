@@ -14,7 +14,24 @@ parser = argparse.ArgumentParser(prog="pod-workers-json")
 parser.add_argument("--path", required=True)
 parser.add_argument(
     "command",
-    choices=("claim", "drop", "free", "prune", "register", "release", "rename-session"),
+    choices=(
+        "claim",
+        "begin-recovery",
+        "cancel-recovery",
+        "check-claim",
+        "confirm-delivery",
+        "drop",
+        "drop-if-unassigned",
+        "finish-recovery",
+        "fence-recovery",
+        "free",
+        "prune",
+        "register",
+        "release",
+        "mark-uncertain",
+        "resume-uncertain",
+        "rename-session",
+    ),
 )
 parser.add_argument("args", nargs="*")
 ns = parser.parse_args()
@@ -44,9 +61,21 @@ with open(path + ".lock", "a+") as lock:
             fail(f"invalid worker row in {path}")
 
         if ns.command == "claim":
-            if len(ns.args) != 4:
-                fail("claim needs <window> <session> <task-id> <timestamp>")
-            window, session, task_id, timestamp = ns.args
+            if len(ns.args) not in (4, 5, 6):
+                fail(
+                    "claim needs <window> <session> <task-id> <timestamp> "
+                    "[epoch] [claim-token]"
+                )
+            window, session, task_id, timestamp = ns.args[:4]
+            epoch = ns.args[4] if len(ns.args) == 5 else None
+            if len(ns.args) == 6:
+                epoch, claim_token = ns.args[4:6]
+            else:
+                claim_token = None
+            if epoch is not None and (not epoch.isdigit() or int(epoch) <= 0):
+                fail("claim epoch must be a positive integer")
+            if claim_token is not None and not claim_token:
+                fail("claim token must not be empty")
             matches = [w for w in workers if w.get("tmux_window") == window
                        and w.get("tmux_session") == session]
             if len(matches) != 1:
@@ -54,11 +83,111 @@ with open(path + ".lock", "a+") as lock:
             worker = matches[0]
             if worker.get("status") != "idle" or worker.get("current_task_id"):
                 fail(f"worker {session}/{window} is no longer idle")
-            worker.update(status="busy", current_task_id=task_id, started_at=timestamp)
+            worker.update(
+                status="busy",
+                current_task_id=task_id,
+                started_at=timestamp,
+                started_epoch=int(epoch) if epoch is not None else None,
+                claim_token=claim_token,
+                recovery_token=None,
+            )
+        elif ns.command == "begin-recovery":
+            if len(ns.args) != 5:
+                fail(
+                    "begin-recovery needs <window> <session> <task-id> "
+                    "<claim-token> <recovery-token>"
+                )
+            window, session, task_id, claim_token, recovery_token = ns.args
+            match = next(
+                (
+                    worker
+                    for worker in workers
+                    if worker.get("tmux_window") == window
+                    and worker.get("tmux_session") == session
+                    and worker.get("current_task_id") == task_id
+                    and worker.get("claim_token") == claim_token
+                    and worker.get("status") in ("busy", "uncertain")
+                ),
+                None,
+            )
+            if match is None:
+                fail(f"claim changed before recovery for {session}/{window} task {task_id}")
+            match.update(status="recovering", recovery_token=recovery_token)
+        elif ns.command == "cancel-recovery":
+            if len(ns.args) != 4:
+                fail(
+                    "cancel-recovery needs <window> <session> <task-id> "
+                    "<recovery-token>"
+                )
+            window, session, task_id, recovery_token = ns.args
+            match = next(
+                (
+                    worker
+                    for worker in workers
+                    if worker.get("tmux_window") == window
+                    and worker.get("tmux_session") == session
+                    and worker.get("current_task_id") == task_id
+                    and worker.get("status") == "recovering"
+                    and worker.get("recovery_token") == recovery_token
+                ),
+                None,
+            )
+            if match is None:
+                fail(f"recovery changed for {session}/{window} task {task_id}")
+            match.update(status="busy", recovery_token=None)
+        elif ns.command == "check-claim":
+            if len(ns.args) != 4:
+                fail("check-claim needs <window> <session> <task-id> <claim-token>")
+            window, session, task_id, claim_token = ns.args
+            if not any(
+                worker.get("tmux_window") == window
+                and worker.get("tmux_session") == session
+                and worker.get("current_task_id") == task_id
+                and worker.get("claim_token") == claim_token
+                and worker.get("status") == "busy"
+                for worker in workers
+            ):
+                fail(f"claim is no longer deliverable for {session}/{window} task {task_id}")
+        elif ns.command == "confirm-delivery":
+            if len(ns.args) != 4:
+                fail("confirm-delivery needs <window> <session> <task-id> <claim-token>")
+            window, session, task_id, claim_token = ns.args
+            match = next(
+                (
+                    worker
+                    for worker in workers
+                    if worker.get("tmux_window") == window
+                    and worker.get("tmux_session") == session
+                    and worker.get("current_task_id") == task_id
+                    and worker.get("claim_token") == claim_token
+                    and worker.get("status") in ("busy", "uncertain", "recovering")
+                ),
+                None,
+            )
+            if match is None:
+                fail(f"claim changed before delivery confirmation for {session}/{window}")
+            match.update(status="busy", recovery_token=None)
         elif ns.command == "drop":
             if len(ns.args) != 2:
                 fail("drop needs <window> <session>")
             window, session = ns.args
+            data["workers"] = [w for w in workers if not (
+                w.get("tmux_window") == window and w.get("tmux_session") == session
+            )]
+        elif ns.command == "drop-if-unassigned":
+            if len(ns.args) != 2:
+                fail("drop-if-unassigned needs <window> <session>")
+            window, session = ns.args
+            matches = [w for w in workers if w.get("tmux_window") == window
+                       and w.get("tmux_session") == session]
+            if len(matches) > 1:
+                fail(f"worker {session}/{window} is registered more than once")
+            if matches and (
+                matches[0].get("status") != "idle"
+                or matches[0].get("current_task_id")
+            ):
+                detail = matches[0].get("current_task_id") or matches[0].get("status")
+                fail(f"worker {session}/{window} is not unassigned ({detail})")
             data["workers"] = [w for w in workers if not (
                 w.get("tmux_window") == window and w.get("tmux_session") == session
             )]
@@ -69,7 +198,65 @@ with open(path + ".lock", "a+") as lock:
             task_ids = set(task_ids)
             for worker in workers:
                 if worker.get("tmux_session") == session and worker.get("current_task_id") in task_ids:
-                    worker.update(status="idle", current_task_id=None, started_at=None)
+                    worker.update(
+                        status="idle",
+                        current_task_id=None,
+                        started_at=None,
+                        started_epoch=None,
+                        claim_token=None,
+                        recovery_token=None,
+                    )
+        elif ns.command == "finish-recovery":
+            if len(ns.args) != 4:
+                fail(
+                    "finish-recovery needs <window> <session> <task-id> "
+                    "<recovery-token>"
+                )
+            window, session, task_id, recovery_token = ns.args
+            match = next(
+                (
+                    worker
+                    for worker in workers
+                    if worker.get("tmux_window") == window
+                    and worker.get("tmux_session") == session
+                    and worker.get("current_task_id") == task_id
+                    and worker.get("status") == "recovering"
+                    and worker.get("recovery_token") == recovery_token
+                ),
+                None,
+            )
+            if match is None:
+                fail(f"recovery changed for {session}/{window} task {task_id}")
+            match.update(
+                status="idle",
+                current_task_id=None,
+                started_at=None,
+                started_epoch=None,
+                claim_token=None,
+                recovery_token=None,
+            )
+        elif ns.command == "fence-recovery":
+            if len(ns.args) != 4:
+                fail(
+                    "fence-recovery needs <window> <session> <task-id> "
+                    "<recovery-token>"
+                )
+            window, session, task_id, recovery_token = ns.args
+            match = next(
+                (
+                    worker
+                    for worker in workers
+                    if worker.get("tmux_window") == window
+                    and worker.get("tmux_session") == session
+                    and worker.get("current_task_id") == task_id
+                    and worker.get("status") == "recovering"
+                    and worker.get("recovery_token") == recovery_token
+                ),
+                None,
+            )
+            if match is None:
+                fail(f"recovery changed before uncertainty fence for {session}/{window}")
+            match.update(status="uncertain", recovery_token=None)
         elif ns.command == "prune":
             if len(ns.args) != 1:
                 fail("prune needs <tmux-binary>")
@@ -89,17 +276,74 @@ with open(path + ".lock", "a+") as lock:
                 if probe.returncode == 0 and probe.stdout.strip() == session:
                     live.append(worker)
             data["workers"] = live
+        elif ns.command == "mark-uncertain":
+            if len(ns.args) != 4:
+                fail("mark-uncertain needs <window> <session> <task-id> <claim-token>")
+            window, session, task_id, claim_token = ns.args
+            match = next(
+                (
+                    worker
+                    for worker in workers
+                    if worker.get("tmux_window") == window
+                    and worker.get("tmux_session") == session
+                    and worker.get("current_task_id") == task_id
+                    and worker.get("claim_token") == claim_token
+                    and worker.get("status") == "busy"
+                ),
+                None,
+            )
+            if match is None:
+                fail(f"claim changed before uncertainty fence for {session}/{window}")
+            match["status"] = "uncertain"
+        elif ns.command == "resume-uncertain":
+            if len(ns.args) != 4:
+                fail("resume-uncertain needs <window> <session> <task-id> <claim-token>")
+            window, session, task_id, claim_token = ns.args
+            match = next(
+                (
+                    worker
+                    for worker in workers
+                    if worker.get("tmux_window") == window
+                    and worker.get("tmux_session") == session
+                    and worker.get("current_task_id") == task_id
+                    and worker.get("claim_token") == claim_token
+                    and worker.get("status") == "uncertain"
+                ),
+                None,
+            )
+            if match is None:
+                fail(f"uncertain claim changed for {session}/{window}")
+            match["status"] = "busy"
         elif ns.command == "release":
-            if len(ns.args) != 3:
-                fail("release needs <window> <session> <task-id>")
-            window, session, task_id = ns.args
+            if len(ns.args) not in (3, 4):
+                fail("release needs <window> <session> <task-id> [claim-token]")
+            window, session, task_id = ns.args[:3]
+            claim_token = ns.args[3] if len(ns.args) == 4 else None
+            released = False
             for worker in workers:
                 if (
                     worker.get("tmux_window") == window
                     and worker.get("tmux_session") == session
                     and worker.get("current_task_id") == task_id
+                    and (
+                        claim_token is None
+                        or worker.get("claim_token") == claim_token
+                    )
                 ):
-                    worker.update(status="idle", current_task_id=None, started_at=None)
+                    worker.update(
+                        status="idle",
+                        current_task_id=None,
+                        started_at=None,
+                        started_epoch=None,
+                        claim_token=None,
+                        recovery_token=None,
+                    )
+                    released = True
+            if claim_token is not None and not released:
+                fail(
+                    f"claim changed before release for {session}/{window} "
+                    f"task {task_id}"
+                )
         elif ns.command == "rename-session":
             if len(ns.args) != 2:
                 fail("rename-session needs <old> <new>")
@@ -133,7 +377,15 @@ with open(path + ".lock", "a+") as lock:
                 # never erase an in-flight queue assignment.
                 assignment = {
                     key: existing.get(key)
-                    for key in ("status", "current_task_id", "started_at", "registered_at")
+                    for key in (
+                        "status",
+                        "current_task_id",
+                        "started_at",
+                        "started_epoch",
+                        "claim_token",
+                        "recovery_token",
+                        "registered_at",
+                    )
                     if key in existing
                 }
                 existing.update(entry)

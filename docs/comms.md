@@ -205,14 +205,3 @@ Unlike `pod-note` (one pod's ephemeral journal, gone when the pod closes), opera
 outlives every pod and reaches every hooked seat you spawn afterward. Set `POD_PRIMER=0` to silence
 the whole injection.
 
-### The sandbox notice
-
-When a seat's tmux socket is blocked (a command sandbox — see
-[docs/gotchas.md](gotchas.md)), `pod-primer` also injects a **proactive notice** so the
-agent knows up front that deck-changing features (spawning/killing workers, sending keys to
-another pane, reading another agent's screen, toggling FULL AUTO) are unavailable from that
-seat, while reads and comms (roster, journal, pod-mail send + receive, its own state dots)
-work normally via the filesystem. And if the agent tries a deck-changing command anyway
-(`pod-add-worker`, `pod-kill-worker`, `pod-auto`), it fails with the same explanation
-instead of a cryptic tmux error — a **reactive** notice at the point of use. `pod-doctor`
-prints the full breakdown on demand.

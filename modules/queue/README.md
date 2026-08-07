@@ -61,9 +61,15 @@ All live in `modules/queue/bin/`; add that dir to your PATH (or call by path).
   qualifies when its LIVE window agrees (alive, in the calling pod, `@cc_state`
   idle); busy/wait windows are never interrupted, and cross-pod targets are
   refused. Marks the worker busy, stamps the board (`@work`/`@cc_state`), and
-  logs the assignment to the pod's channel feed. A durable `dispatching` record
-  plus signal rollback lets `mgr-poll` recover an interrupted dispatcher without
-  silently losing or blindly duplicating the task.
+  logs the assignment to the pod's channel feed. The locked worker claim carries a
+  start epoch plus a unique claim token. Durable `dispatching`, `typing`, and
+  `typed` phases bracket the input-buffer and submission boundaries, while signal
+  rollback handles ordinary interruption. Together these let `mgr-poll` recover
+  process kills before the queue move, before the marker rewrite, or after submission
+  without silently losing or blindly duplicating the task. If a live pane might hold
+  a typed-but-unsubmitted trigger, the task becomes `delivery_uncertain` and the worker
+  becomes `uncertain`; it is deliberately not requeued until the pane either reports
+  busy/wait or dies.
 - `mgr-poll [--quiet] [--json]` — sweep for `DONE` sentinels and flip completed
   workers back to idle (clearing their `@work` headline). Requeues the task of
   any worker whose window died mid-assignment, and — once the queue is fully
@@ -82,7 +88,15 @@ All live in `modules/queue/bin/`; add that dir to your PATH (or call by path).
   (guarded: window alive, not the manager, registry idle, live state not
   busy/wait). Set to `0` to keep finished workers open for reuse.
 - `MGR_DISPATCH_RECOVERY_SECONDS` (default `30`) — grace period before `mgr-poll`
-  heals a stale pre-delivery `dispatching` transaction.
+  heals a stale claim, pre-marker queue move, or pre-delivery `dispatching` transaction.
+  Production values clamp to at least one second; tests may explicitly opt into zero
+  with `MGR_DISPATCH_ALLOW_ZERO_RECOVERY=1`.
+
+`mgr-status` surfaces an `uncertain` worker with its task id. Do not press Enter or
+blindly requeue it: first inspect the pane. If the agent is running, its next busy/wait
+state lets `mgr-poll` commit the dispatch. If the pane is genuinely stranded, closing
+that worker window discards the stale input buffer; the next `mgr-poll` safely requeues
+the task and prunes the dead row.
 
 ## Templates
 

@@ -34,7 +34,11 @@ done
 # Step 1: poll for newly-completed tasks (frees workers if any). This runs in BOTH
 # modes — manual mode still tracks completions; it just won't auto-dispatch below.
 echo "==> Polling for completions"
-"$QBIN/mgr-poll"
+# Tolerate a failed sweep rather than aborting the turn under set -e. Dispatch below
+# re-checks live worker state and claims under the workers.json lock, so a stale
+# registry can only make this run dispatch LESS, never onto a busy worker — whereas
+# letting the failure propagate costs the whole wake cycle and dispatches nothing.
+"$QBIN/mgr-poll" || echo "    (poll returned $? — continuing to dispatch)" >&2
 
 # FULL AUTO gate: only AUTO-dispatch when this pod's switch is on. Fail-OPEN for
 # non-pods (plain tmux / no @is_pod stamp) so the queue works outside a stamped pod.

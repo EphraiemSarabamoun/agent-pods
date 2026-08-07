@@ -14,6 +14,18 @@ INBOX_ROOT="$POD_INBOX"
 WORKERS_PATH="$POD_STATE/workers.json"
 LOG_PATH="$POD_STATE/log.jsonl"
 
+# workers.json is only created when the FIRST worker registers (pod-add-worker), so a
+# freshly launched pod does not have one. Read it ONCE into an empty-registry-defaulted
+# snapshot rather than pointing jq at the path in three places: jq exits 2 on a missing
+# file, and under set -e that killed the report right after the WORKERS banner — which
+# is why the "(no workers registered)" hint below could never actually print, and why
+# --json emitted a raw jq "Could not open" error instead of an empty board. The registry
+# is written atomically (pod-workers-json os.replace), so one cat is a consistent read.
+WORKERS_JSON='{"workers":[]}'
+if [ -f "$WORKERS_PATH" ]; then
+  WORKERS_JSON="$(jq -c '{workers: (.workers // [])}' "$WORKERS_PATH" 2>/dev/null || echo '{"workers":[]}')"
+fi
+
 CURRENT_POD="$(mgr_current_pod)"
 CURRENT_POD="$(mgr_pod_component "$CURRENT_POD")" || exit 2
 QUEUE_DIR="$(mgr_queue_dir "$CURRENT_POD")"
@@ -29,13 +41,18 @@ if [ "$EMIT_JSON" -eq 1 ]; then
     off) fa=false ;;
     *)   fa=null ;;
   esac
+  queue_json='[]'
+  if [ -d "$QUEUE_DIR" ]; then
+    queue_json="$(find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.json' -exec basename {} \; \
+      | sort | jq -R . | jq -s .)"
+  fi
   jq -n \
-    --slurpfile workers "$WORKERS_PATH" \
-    --argjson queue "$(ls "$QUEUE_DIR" 2>/dev/null | jq -R . | jq -s . || echo '[]')" \
+    --argjson workers "$WORKERS_JSON" \
+    --argjson queue "$queue_json" \
     --arg inbox "$INBOX_ROOT" \
     --arg pod "$CURRENT_POD" \
     --argjson fa "$fa" \
-    '{workers: [$workers[0].workers[] | select(.tmux_session==$pod)],
+    '{workers: [$workers.workers[]? | select(.tmux_session==$pod)],
       queue_files: $queue, inbox_root: $inbox, pod:$pod, full_auto: $fa}'
   exit 0
 fi
@@ -48,15 +65,19 @@ esac
 echo "================================================================"
 echo " WORKERS"
 echo "================================================================"
-jq -r --arg pod "$CURRENT_POD" '.workers[] | select(.tmux_session==$pod)
-  | "  " + (.tmux_window // "?") + " " + (.color // "") + " [" + (.label // "—") + "] " + .status + (if .current_task_id then " · " + .current_task_id else "" end) + (if .started_at then " · started " + .started_at else "" end)' "$WORKERS_PATH" 2>/dev/null
-[ "$(jq --arg pod "$CURRENT_POD" '[.workers[]|select(.tmux_session==$pod)] | length' "$WORKERS_PATH" 2>/dev/null || echo 0)" -eq 0 ] && echo "  (no workers registered — spawn one via the + button or pod-add-worker)"
+# Both readers keep a fallback: a row missing .status (or any shape the filter can't
+# add to a string) makes jq exit non-zero, and this is a REPORTER — one malformed row
+# must degrade its own section, not abort the queue and completions sections below it.
+printf '%s' "$WORKERS_JSON" | jq -r --arg pod "$CURRENT_POD" '.workers[] | select(.tmux_session==$pod)
+  | "  " + (.tmux_window // "?") + " " + (.color // "") + " [" + (.label // "—") + "] " + .status + (if .current_task_id then " · " + .current_task_id else "" end) + (if .started_at then " · started " + .started_at else "" end)' || true
+[ "$(printf '%s' "$WORKERS_JSON" | jq --arg pod "$CURRENT_POD" '[.workers[]|select(.tmux_session==$pod)] | length' 2>/dev/null || echo 0)" -eq 0 ] && echo "  (no workers registered — spawn one via the + button or pod-add-worker)"
 
 echo ""
 echo "================================================================"
 echo " QUEUE (highest priority / earliest first)"
 echo "================================================================"
-queue_files=$(ls "$QUEUE_DIR" 2>/dev/null | sort)
+queue_files=""
+[ ! -d "$QUEUE_DIR" ] || queue_files="$(find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.json' -exec basename {} \; | sort)"
 if [ -z "$queue_files" ]; then
   echo "  (queue empty)"
 else
@@ -83,6 +104,10 @@ else
 fi
 
 echo ""
+archive_count=0
+if [ -d "$DISPATCHED" ]; then
+  archive_count="$(find "$DISPATCHED" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')"
+fi
 echo "================================================================"
-echo " DISPATCHED ARCHIVE COUNT: $(ls "$DISPATCHED" 2>/dev/null | wc -l | tr -d ' ')"
+echo " DISPATCHED ARCHIVE COUNT: $archive_count"
 echo "================================================================"

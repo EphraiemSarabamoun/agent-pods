@@ -35,6 +35,8 @@ mode            = "hooks"
 installer       = "hooks/codex/install.sh"
 native_delivery = true
 state_source    = "hooks"
+prompt_line_regex  = '^›'
+empty_prompt_regex = '^›[ \t\u00a0]*Find and fix a bug in @filename[ \t\u00a0]*$'
 
 # Query the locally installed Codex /model menu. This reflects the account/provider
 # Codex is actually using, unlike the public platform API model index.

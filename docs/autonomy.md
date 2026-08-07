@@ -52,8 +52,10 @@ session option `@full_auto=1`; see [keybindings.md](keybindings.md) for how to f
 When you flip FULL AUTO back **on**, `pod-auto` looks for a paused `pod-task` belonging to
 this pod and, if it finds one, queues a self-contained resume instruction in the manager's
 mailbox. It then uses the normal guarded delivery path to submit that instruction only if
-the manager is an idle agent with a stable pane. A busy manager is never interrupted; its
-durable mailbox resumes the loop at the next safe prompt instead.
+the manager is idle, its pane is stable, and its adapter proves that the last visible
+input line is the agent's rendered empty placeholder. A stable human draft is not an
+empty prompt and is never submitted. If the TUI changed or has no such proof, the
+durable mailbox resumes the loop through the manager's next native prompt hook instead.
 
 Two helpers keep the loop honest without you watching it:
 
@@ -67,8 +69,12 @@ Two helpers keep the loop honest without you watching it:
   row drops, so an assignment can never vanish), and once the queue fully drains,
   finished worker windows are closed so a long-running loop doesn't accumulate idle
   agents (`MGR_REAP_FINISHED_WORKERS=0` to keep them). Queue and archive state is
-  namespaced by pod, and interrupted pre-delivery transactions are recovered after a
-  short grace period.
+  namespaced by pod. Interrupted dispatches are recovered after a short grace period,
+  including process kills before the queue move, before the durable `dispatching`
+  marker, and after prompt submission. A crash after text may have reached a live
+  input buffer but before submission is treated as ambiguous, not idle: the worker is
+  fenced as `uncertain` and the task is withheld from the queue until the agent reports
+  busy/wait or the pane dies with its stale input.
 
 ## State: per-pod task files
 

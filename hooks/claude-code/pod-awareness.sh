@@ -26,8 +26,13 @@ if [ -n "${POD_BIN:-}" ] && [ -x "$POD_BIN/pod" ]; then
   :
 else
   # this file lives at <repo>/hooks/claude-code/pod-awareness.sh -> bin is ../../bin
-  HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
-  POD_BIN="$(cd "$HOOK_DIR/../../bin" 2>/dev/null && pwd)"
+  # `cd -P`, not a bare `cd`: the rest of the repo (bin/_pod-paths.sh) resolves paths
+  # physically, and the installers wire this hook by its physical path — deriving a
+  # LOGICAL POD_BIN here would hand a differently-spelled repo root to anything
+  # downstream that compares paths (state mirrors, roster lookups) on a machine where
+  # the invocation path crosses a symlink (macOS /tmp, an autofs $HOME).
+  HOOK_DIR="$(cd -P "$(dirname "$0")" 2>/dev/null && pwd)"
+  POD_BIN="$(cd -P "$HOOK_DIR/../../bin" 2>/dev/null && pwd)"
 fi
 [ -n "${POD_BIN:-}" ] && [ -x "$POD_BIN/pod" ] || exit 0
 

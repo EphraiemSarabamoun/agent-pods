@@ -19,6 +19,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Resolve from the environment (set by _pod-paths.sh), with repo-relative fallbacks.
@@ -42,16 +43,6 @@ TMUX = os.environ.get("POD_TMUX") or "tmux"
 
 client = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
 
-# Self-heal: on a fresh setup the slots file doesn't exist yet (it's normally
-# written by the gear/settings menu). Seed catalog defaults so the "+" picker
-# never crashes with FileNotFoundError before the user has curated any slots.
-if not os.path.exists(SLOTS):
-    subprocess.run([os.path.join(POD_BIN, "pod-seed-slots")])
-
-with open(SLOTS) as f:
-    data = json.load(f)
-slots = (data.get("slots") or [])[:10]
-
 
 def adapter(*args):
     """Return adapter stdout, or None when the semantic selection is unavailable."""
@@ -62,6 +53,97 @@ def adapter(*args):
     except (OSError, subprocess.SubprocessError):
         return None
     return result.stdout.rstrip("\n") if result.returncode == 0 else None
+
+
+def notify(msg):
+    """The ONLY channel back to the user: the "+" runs from a backgrounded run-shell,
+    so a traceback (or a silent no-op) goes nowhere anyone will ever look."""
+    if os.environ.get("POD_MENU_PRINT"):
+        # POD_MENU_PRINT is a dry run whose whole point is not popping anything at a
+        # live client; surface the text instead of firing it at someone's screen.
+        sys.stderr.write("pod-spawn-menu-build: would notify: %s\n" % msg)
+        return
+    try:
+        subprocess.run([TMUX, "display-message", "-d", "5000", msg], timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def provisional_slots():
+    """Cheap, discovery-free defaults: one inherited-model slot per installed agent.
+
+    Deliberately does NOT go near `pod-adapter models` (the live-discovery entry
+    point). `list --available` is PATH + TOML only, and `field <id> label` is a raw
+    TOML scalar read — unlike `card`, which resolves the adapter's default model and
+    so CAN fall into discovery when that default is a concrete slug rather than
+    "inherit". The label here is provisional anyway: the render loop below replaces it
+    with the resolved card. This is the same shape install.sh writes, which is why an
+    installed setup never paid for the richer seed either.
+    """
+    out = []
+    for aid in (adapter("list", "--available") or "").splitlines():
+        aid = aid.strip()
+        if not aid:
+            continue
+        out.append({"agent": aid, "model": "", "effort": "",
+                    "label": adapter("field", aid, "label") or aid})
+    return out[:10]
+
+
+def seed_in_background():
+    """Kick the discovery-backed seeder OFF the click path.
+
+    Seeding inline ran live discovery for every installed agent serially, so the first
+    "+" press on a fresh setup sat dead for ~47s with no spinner and no message. The
+    mkdir lock matters because a button that looks dead gets clicked again and again,
+    and each click used to start another full discovery sweep.
+    """
+    lock = os.path.join(STATE, "seed-slots.lock")
+    try:
+        os.makedirs(STATE, mode=0o700, exist_ok=True)
+        try:
+            os.mkdir(lock)
+        except FileExistsError:
+            # A seeder that died leaves the lock behind; let a new one through once
+            # the marker is older than any run could plausibly still be.
+            if time.time() - os.stat(lock).st_mtime < 300:
+                return
+            os.utime(lock, None)
+        subprocess.Popen([os.path.join(POD_BIN, "pod-seed-slots")],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        pass
+
+
+# Self-heal: on a fresh setup the slots file doesn't exist yet (it's normally written
+# by the gear/settings menu). Render from the cheap declared defaults NOW and let the
+# seeder fill in the richer, discovery-backed slots for the next open. The old code
+# ran the seeder inline and then opened the file BLIND, so a seeder that wrote nothing
+# (empty catalog, python < 3.11, read-only $POD_CONFIG_DIR) turned the pod's primary
+# spawn affordance into a silent FileNotFoundError with no diagnostic anywhere.
+data = None
+try:
+    with open(SLOTS) as f:
+        data = json.load(f)
+except (OSError, ValueError):
+    data = None
+
+title = data.get("title") if isinstance(data, dict) else None
+raw = data.get("slots") if isinstance(data, dict) else None
+# Non-dict entries can only come from a hand-edited slots.json, and one of them must
+# not be able to take the whole picker down with an AttributeError.
+slots = [s for s in raw if isinstance(s, dict)][:10] if isinstance(raw, list) else []
+
+if not slots:
+    if not os.environ.get("POD_MENU_PRINT"):   # POD_MENU_PRINT is a dry run
+        seed_in_background()
+    slots = provisional_slots()
+    if not slots:
+        notify("pod: no agents found on PATH — run `pod-doctor`. Falling back to a shell.")
+        slots = [{"agent": "generic-shell", "label": "Shell"}]
+
+data = {"title": title or "Spawn agent (0-9)", "slots": slots}
 
 # NO -c: tmux resolves the current client automatically here, exactly like the ✕
 # button's `tmux confirm-before` does from the same backgrounded run-shell context.
@@ -96,7 +178,11 @@ for i, s in enumerate(slots):
             if effort:
                 card_args += ["--effort", effort]
             current_label = adapter(*card_args)
-            if current_label:
+            # `card` falls back to echoing the bare id for an agent the catalog can no
+            # longer resolve (unreadable adapters dir, python < 3.11). Keep the slot's
+            # saved label in that case, so a degraded menu still reads "Shell" rather
+            # than "generic-shell".
+            if current_label and current_label != agent:
                 label = current_label
             spawn += ["--agent", agent]
             if model:

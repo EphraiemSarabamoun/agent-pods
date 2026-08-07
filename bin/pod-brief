@@ -85,19 +85,26 @@ list_wins() {
 
 me_id=""
 [ -n "$pane" ] && me_id="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
-# command sandbox: socket blocked -> identity from the spawn-time environment
-if [ -z "$me_id" ] && ! pod_socket_ok; then me_id="${POD_WINDOW:-}"; fi
 [ -n "$me_id" ] || me_id="self"
 
 case "$CMD" in
   note)
     text="$*"
     [ -n "$text" ] || { echo "usage: pod-brief note <text>" >&2; exit 1; }
+    # No live pane AND no inherited POD_SESSION means pod_name() returned the bare
+    # $POD_SESSION_PREFIX — we are not in a pod at all. Appending anyway invents a
+    # phantom comms/<prefix>/journal.md that no agent ever reads and that the next
+    # launch's gc sweeps (it is not a live session name), while printing a success
+    # line. Say so instead of banking the note somewhere it will silently die.
+    if [ "$in_tmux" != 1 ] && [ -z "${POD_SESSION:-}" ] && [ "$POD" = "$POD_SESSION_PREFIX" ]; then
+      echo "pod-brief: not inside a pod — this note would reach no agent." >&2
+      echo "           Use pod-remember for durable operator memory, or run it from a pod window." >&2
+      exit 1
+    fi
     mkdir -p "$DIR" 2>/dev/null
     who=""
     [ "$in_tmux" = 1 ] && who="$(get_opt "$me_id" @card)"
     [ -z "$who" ] && who="${POD_BRIEF_WHO:-}"
-    [ -z "$who" ] && who="${POD_AGENT_ID:-}"   # sandbox: card read needs the socket
     [ -z "$who" ] && who="me"
     printf '[%s] NOTE (%s): %s\n' "$(now_hm)" "$who" "$text" >> "$JOURNAL"
     echo "noted -> $JOURNAL"
@@ -121,30 +128,7 @@ $tailtxt"
     [ "$in_tmux" = 1 ] || exit 0
     EVENT="${1:-UserPromptSubmit}"
     wins="$(list_wins)"
-    if [ -z "$wins" ]; then
-      # Command sandbox: list-windows needs the socket. Podmate awareness rides the
-      # JOURNAL instead — the unsandboxed pod-foreign-state reconciler appends every
-      # mirror-observed transition there — so emit only the lines this reader hasn't
-      # seen (per-reader line-count high-water). A shrink (the 500->400 trim) resets
-      # the cursor silently.
-      pod_socket_ok && exit 0
-      [ -s "$JOURNAL" ] || exit 0
-      mkdir -p "$BRIEF" 2>/dev/null
-      hw="$BRIEF/jcursor.$(printf '%s' "$me_id" | tr -c 'A-Za-z0-9' '_')"
-      seen="$(cat "$hw" 2>/dev/null)"
-      case "$seen" in ''|*[!0-9]*) seen="" ;; esac
-      total="$(wc -l < "$JOURNAL" 2>/dev/null | tr -d ' ')"
-      case "$total" in ''|*[!0-9]*) exit 0 ;; esac
-      printf '%s\n' "$total" > "$hw" 2>/dev/null
-      # first sight (no cursor yet): boot already delivered the tail — just arm.
-      [ -n "$seen" ] || exit 0
-      [ "$total" -gt "$seen" ] || exit 0
-      delta="$(sed -n "$((seen + 1)),\$p" "$JOURNAL" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 20)"
-      [ -n "$delta" ] || exit 0
-      emit_ctx "$EVENT" "[pod] journal updates since your last turn:
-$delta"
-      exit 0
-    fi
+    [ -n "$wins" ] || exit 0
     mkdir -p "$BRIEF" 2>/dev/null
     cursor="$BRIEF/cursor.$(printf '%s' "$me_id" | tr -c 'A-Za-z0-9' '_')"
     journaled="$BRIEF/journaled"
@@ -160,8 +144,11 @@ $delta"
       if mkdir "$lock" 2>/dev/null; then got=1; break; fi
       # A killed hook can leave the mkdir lock behind forever. Steal only an old
       # lock, and do so by atomic rename so concurrent stealers cannot remove a
-      # freshly-acquired replacement.
-      lock_mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
+      # freshly-acquired replacement. The mtime MUST come from pod_file_mtime: the
+      # obvious `stat -f %m || stat -c %Y` chain feeds a GNU filesystem dump into this
+      # arithmetic and kills the shell here under set -u, taking the journal, the
+      # podmate delta AND every future refresh (the lock is then never stolen) with it.
+      lock_mtime="$(pod_file_mtime "$lock")"
       lock_age=$(( $(date +%s) - lock_mtime ))
       if [ "$lock_age" -gt 30 ] 2>/dev/null; then
         stale="$lock.stale.$$"

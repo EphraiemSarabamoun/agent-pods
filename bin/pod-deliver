@@ -20,7 +20,13 @@
 #   2. recipient @cc_state == idle    (never interrupt a working agent)
 #   3. pane not in a full-screen app  (vim/less/man/... would eat the keystrokes as commands)
 #   4. (submit only) the pane is settled across a 0.4s re-check (nobody is typing right now)
-#   5. NEVER send Enter in buffer mode -> a clobber is at worst editable text, never a run.
+#   5. (submit only, ON BY DEFAULT) the adapter proves the LAST visible input line is
+#      its empty placeholder; a stable human draft is never sufficient — it sits
+#      unchanged indefinitely and gate 4 passes over it trivially. An adapter with no
+#      prompt_line_regex/empty_prompt_regex cannot supply that proof, so it drops to
+#      buffer mode rather than risk submitting whatever the human left in the box.
+#      POD_DELIVER_REQUIRE_EMPTY=0 restores the old settle-check-only behavior.
+#   6. NEVER send Enter in buffer mode -> a clobber is at worst editable text, never a run.
 #
 # Notifies once per batch of unread lines via a per-mailbox high-water mark, so the
 # poller calling this every cycle doesn't re-ping the same mail. bash 3.2 safe.
@@ -47,15 +53,47 @@ sess="$("$T" display-message -p -t "$win" '#{session_name}' 2>/dev/null)"
 maildir="$(pod_dir_for "$sess")"
 mbox="$maildir/${win}.mbox"
 hwf="$maildir/${win}.hw"
-[ -f "$mbox" ] || exit 0
+if [ ! -f "$mbox" ]; then
+  # A drain (pod-mail / pod-mail-check) renames the mailbox ASIDE and deletes it, so
+  # after a read the mbox is ABSENT, not empty — the `count -eq 0` reset below is
+  # unreachable. Leaving the high-water at the drained batch's line count silently
+  # swallows every later batch that is no bigger than it: the single-message case is
+  # then never notified again, forever, for that window.
+  rm -f "$hwf" 2>/dev/null || true
+  exit 0
+fi
+
+# Claim this mailbox before reading the high-water. pod-tell fires a deliver the
+# instant it appends and the ~3s poller fires another; the high-water is read here but
+# only written after send-keys (plus a settle in submit mode), so both racers see the
+# same stale value, both type the note, and both press Enter — one garbled turn plus
+# one empty submission. mkdir is the atomic primitive available on macOS (no flock).
+dlock="$maildir/${win}.dlock"
+if ! mkdir "$dlock" 2>/dev/null; then
+  # A killed deliver can leave the lock behind; a live one holds it for well under a
+  # second, so only an old lock is stealable — and steal by atomic rename so two
+  # stealers cannot remove a freshly-acquired replacement.
+  lock_age=$(( $(date +%s) - $(pod_file_mtime "$dlock") ))
+  [ "$lock_age" -gt 30 ] || exit 0
+  stale="$dlock.stale.$$"
+  mv "$dlock" "$stale" 2>/dev/null && rmdir "$stale" 2>/dev/null
+  mkdir "$dlock" 2>/dev/null || exit 0
+fi
+trap 'rmdir "$dlock" 2>/dev/null || true' EXIT
+trap 'exit 0' INT TERM
 
 # how many lines are unread vs already-notified (high-water).
 count="$(awk 'END{print NR+0}' "$mbox" 2>/dev/null || echo 0)"
 hw="$(cat "$hwf" 2>/dev/null || echo 0)"
 case "$hw" in ''|*[!0-9]*) hw=0 ;; esac
-if [ "$count" -eq 0 ]; then printf '0' > "$hwf" 2>/dev/null || true; exit 0; fi   # pod-mail drained it
+if [ "$count" -eq 0 ]; then printf '0' > "$hwf" 2>/dev/null || true; exit 0; fi   # truncated in place
 if [ "$count" -lt "$hw" ]; then hw=0; fi                                           # shrank -> reset
 [ "$count" -gt "$hw" ] || exit 0                                                   # nothing new
+
+# Resolve the adapter even when the caller forced a mode: the stricter FULL AUTO
+# path also needs its agent-specific empty-prompt proof.
+aid="$("$T" show-options -wqv -t "$win" @agent_id 2>/dev/null)"
+[ -n "$aid" ] || aid="$("$POD_BIN/pod-detect" "$win" 2>/dev/null)"
 
 # resolve delivery mode if not forced.
 if [ -z "$mode" ]; then
@@ -63,8 +101,6 @@ if [ -z "$mode" ]; then
   if [ "$nd" = "1" ]; then
     mode="none"
   else
-    aid="$("$T" show-options -wqv -t "$win" @agent_id 2>/dev/null)"
-    [ -n "$aid" ] || aid="$("$POD_BIN/pod-detect" "$win" 2>/dev/null)"
     adv="$("$POD_ADAPTER" field "$aid" deliver 2>/dev/null || true)"   # optional adapter override
     if [ -n "$adv" ]; then mode="$adv"
     elif [ "$aid" = "generic-shell" ]; then mode="buffer"
@@ -73,6 +109,20 @@ if [ -z "$mode" ]; then
 fi
 [ "${POD_DELIVER_SUBMIT:-1}" = "0" ] && [ "$mode" = "submit" ] && mode="buffer"
 [ "$mode" = "none" ] && { printf '%s' "$count" > "$hwf" 2>/dev/null || true; exit 0; }
+
+# gate 5, resolved BEFORE we commit to submit. A stable pane is NOT proof that its
+# input buffer is empty — a human draft can sit unchanged indefinitely, and pressing
+# Enter over one SUBMITS it. Only an adapter that can point at its own empty prompt
+# line can tell the two apart, so an agent without those regexes drops to buffer
+# (type it, never Enter) instead of gambling. Set POD_DELIVER_REQUIRE_EMPTY=0 to go
+# back to trusting the settle check alone.
+require_empty="${POD_DELIVER_REQUIRE_EMPTY:-1}"
+prompt_re=""; empty_re=""
+if [ "$mode" = "submit" ] && [ "$require_empty" = "1" ]; then
+  prompt_re="$("$POD_ADAPTER" field "$aid" prompt_line_regex 2>/dev/null || true)"
+  empty_re="$("$POD_ADAPTER" field "$aid" empty_prompt_regex 2>/dev/null || true)"
+  { [ -n "$prompt_re" ] && [ -n "$empty_re" ]; } || mode="buffer"
+fi
 
 # gate 2: only deliver to an idle recipient.
 st="$("$T" show-options -wqv -t "$win" @cc_state 2>/dev/null)"
@@ -101,13 +151,33 @@ fi
 
 # gate 4 (submit only): make sure nobody is actively typing/streaming right now.
 if [ "$mode" = "submit" ]; then
-  h1="$("$T" capture-pane -p -t "$win" 2>/dev/null | cksum | awk '{print $1}')"
+  screen1="$("$T" capture-pane -p -J -t "$win" 2>/dev/null)"
+  h1="$(printf '%s' "$screen1" | cksum | awk '{print $1}')"
+  if [ "$require_empty" = "1" ]; then
+    printf '%s' "$screen1" | python3 -c '
+import re, sys
+prompt, empty = sys.argv[1:3]
+lines = [line.rstrip("\r") for line in sys.stdin.read().splitlines()]
+candidates = [line for line in lines if re.search(prompt, line)]
+raise SystemExit(0 if candidates and re.fullmatch(empty, candidates[-1]) else 1)
+' "$prompt_re" "$empty_re" || exit 0
+  fi
   sleep 0.4
-  h2="$("$T" capture-pane -p -t "$win" 2>/dev/null | cksum | awk '{print $1}')"
+  screen2="$("$T" capture-pane -p -J -t "$win" 2>/dev/null)"
+  h2="$(printf '%s' "$screen2" | cksum | awk '{print $1}')"
   [ "$h1" = "$h2" ] || exit 0          # screen changed -> active -> retry next cycle
+  if [ "$require_empty" = "1" ]; then
+    printf '%s' "$screen2" | python3 -c '
+import re, sys
+prompt, empty = sys.argv[1:3]
+lines = [line.rstrip("\r") for line in sys.stdin.read().splitlines()]
+candidates = [line for line in lines if re.search(prompt, line)]
+raise SystemExit(0 if candidates and re.fullmatch(empty, candidates[-1]) else 1)
+' "$prompt_re" "$empty_re" || exit 0
+  fi
 fi
 
-# deliver. -l = literal text (no key interpretation). gate 5: Enter ONLY in submit mode.
+# deliver. -l = literal text (no key interpretation). gate 6: Enter ONLY in submit mode.
 "$T" send-keys -t "$win" -l "$note" 2>/dev/null || exit 0
 if [ "$mode" = "submit" ]; then
   sleep 0.15                            # let the literal text land before Enter (race guard)

@@ -153,7 +153,16 @@ content unchanged across a ~0.4s re-check) before submitting; send the literal t
 `-l`, then `sleep 0.15` before sending `Enter` so the text lands first; and only send
 Enter at all in `submit` mode. `buffer` mode never presses Enter, so a clobber there is
 at worst editable text, never a command run. See [comms.md](comms.md) for the full gate
-list.
+list. Settled is not the same as empty: the FULL AUTO resume path additionally requires
+the adapter's last prompt-looking line to match its `empty_prompt_regex`. An unknown or
+changed TUI remains mailbox-only instead of guessing over a human draft.
+
+The queue dispatcher uses the same conservative rule across process death. Its archive
+records `typing` before touching a pane and `typed` after the literal trigger lands.
+If a hard kill leaves either phase on a live idle pane, `mgr-poll` marks the worker
+`uncertain` and refuses to requeue. Inspect the pane; a real busy/wait transition commits
+the dispatch, while closing a stranded pane discards the buffered text and makes the
+task safe to requeue on the next poll.
 
 ---
 
@@ -273,36 +282,3 @@ tmux 3.6b).
 Same rule for any `#{session_name}` / `#{window_index}` probe — compare the value,
 don't trust the return.
 
-## Command sandboxes block the tmux socket entirely
-
-**Symptom.** When the agent's subprocesses run in a command sandbox that denies
-unix-socket connect (e.g. Claude Code's command sandbox, a CI runner, a container),
-the deck looks perfectly healthy — windows, colors, the strip — but every agent is
-blind: no roster at SessionStart, no journal, no pod-mail, no state dots from its own
-hooks. `tmux ls` from inside the agent says `connect() → EPERM`.
-
-**Cause.** The sandbox denies unix-socket connect from the agent's subprocesses (hooks,
-Bash tool). The tmux server is alive and the pane genuinely sits in a pod — but every
-`tmux` call the agent's side makes fails, so hooks that self-identify or read/write
-window options silently no-op.
-
-**Fix (built in).** Filesystem is the source of truth; the socket is a render/transport
-upgrade. Everything gates on one probe (`pod_socket_ok`): when connect fails, hooks
-self-identify from `$POD_WINDOW`/`$POD_AGENT_ID`/`$POD_SESSION` (exported by
-pod-worker-bootstrap / pod-launch in the unsandboxed pane), `bin/pod` builds a
-file-backed roster from `workers.json`, and state/work/last mirror to
-`$POD_STATE/mirror/<pod>/<win>` files that the unsandboxed pod-foreign-state poller
-reconciles onto the real tmux options. The normal path is byte-for-byte unchanged —
-the fallback triggers ONLY on socket connect failure, never on empty output (an empty
-list from a working socket is a genuinely dead pod; falling back there would resurrect
-ghosts).
-
-**Accepted degradation.** Under a blocked socket, hook-parity agents (Claude Code,
-Codex) are fully functional — awareness, journal, mail, and state all ride files.
-`send-keys` delivery to non-hook seats (Aider, plain shells) is unavailable — it
-genuinely needs the socket; don't try to fix it. Badges/dots lag up to one poller
-interval (~3s) instead of flipping instantly. Seats spawned before the upgrade lack
-`$POD_WINDOW` — respawn them once.
-
-**Diagnose.** `pod-doctor` from a pane inside the pod names the broken link, including
-this one (its section 1 probes the socket explicitly).

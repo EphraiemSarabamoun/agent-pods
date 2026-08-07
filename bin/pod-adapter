@@ -11,7 +11,10 @@ overrides); same `[agent].id` -> the user file wins. Requires Python 3.11+ (toml
 
 Subcommands:
   list [--available]            ids, one per line (--available = base_cmd resolves on PATH)
-  detect <pane_cmd> [content]   id of the adapter that claims this pane (priority order)
+  detect <pane_cmd> [content] [--current ID]
+                                id of the adapter that claims this pane (priority order);
+                                --current keeps an already-stamped id unless the pane
+                                COMMAND itself contradicts it (content text never does)
   launch <id> [--model S] [--effort S]   the launch command (space-joined argv tokens)
   card <id> [--model S] [--effort S] [--suffix S]   "Label · Model · effort · suffix"
   models <id>                   "slug\tlabel" per locally discovered model, plus
@@ -47,6 +50,63 @@ except ModuleNotFoundError:  # pragma: no cover
 
 SAFE_ADAPTER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
+# Sections the subcommands index into as dicts, and the list-valued keys they iterate
+# without re-checking types. A hand-written adapter that gets one of these shapes wrong
+# — `[[agent]]` instead of `[agent]` is the classic, since _schema.toml itself
+# demonstrates `[[models]]` — used to raise out of load_adapters() and take the WHOLE
+# catalog down: no agent ids, no detection, and a "+" button that dies silently in a
+# backgrounded run-shell. One bad user file must only cost that file.
+_DICT_SECTIONS = ("agent", "launch", "detect", "defaults", "lifecycle", "discover")
+_PATTERN_KEYS = ("pane_cmd_patterns", "content_patterns", "reject_content")
+
+
+def _str_list(value):
+    return isinstance(value, list) and all(isinstance(x, str) for x in value)
+
+
+def _table_list(value):
+    return isinstance(value, list) and all(isinstance(x, dict) for x in value)
+
+
+def _validate_adapter(data):
+    """Return why this document cannot be trusted, or None when it is usable."""
+    for section in _DICT_SECTIONS:
+        if section in data and not isinstance(data[section], dict):
+            return "[%s] must be a table, not %s" % (section, type(data[section]).__name__)
+    prio = data.get("agent", {}).get("priority", 0)
+    if isinstance(prio, bool) or not isinstance(prio, (int, float)):
+        return "[agent].priority must be a number"
+    for key in ("id", "label"):
+        if key in data.get("agent", {}) and not isinstance(data["agent"][key], str):
+            return "[agent].%s must be a string" % key
+    launch = data.get("launch", {})
+    if "base_cmd" in launch and not isinstance(launch["base_cmd"], str):
+        return "[launch].base_cmd must be a string"
+    for key in ("model_arg", "effort_arg"):
+        if key in launch and not _str_list(launch[key]):
+            return "[launch].%s must be a list of strings" % key
+    det = data.get("detect", {})
+    for key in _PATTERN_KEYS:
+        if key not in det:
+            continue
+        if not _str_list(det[key]):
+            return "[detect].%s must be a list of strings" % key
+        for pat in det[key]:
+            try:
+                # Compile HERE so a bad pattern is one skipped file, not a
+                # re.PatternError thrown from the middle of `detect`.
+                re.compile(pat)
+            except re.error as e:
+                return "[detect].%s has an invalid regex %r (%s)" % (key, pat, e)
+    if not _table_list(data.get("models", [])):
+        return "[[models]] must be an array of tables"
+    for m in data.get("models", []):
+        if not _table_list(m.get("efforts", []) or []):
+            return "[[models]].efforts must be an array of tables"
+    if not _table_list(data.get("discover", {}).get("efforts", []) or []):
+        return "[discover].efforts must be an array of tables"
+    return None
+
 
 def _repo_root():
     # env wins (set by _pod-paths.sh); else resolve relative to this file (bin/..).
@@ -78,8 +138,15 @@ def load_adapters():
             try:
                 with open(path, "rb") as f:
                     data = tomllib.load(f)
+                # Validate INSIDE the same guard as the parse: everything below (and
+                # every subcommand) assumes the document's shape, so an unusable file
+                # has to be dropped here by name rather than crash the catalog later.
+                reason = _validate_adapter(data)
             except Exception as e:
                 sys.stderr.write("pod-adapter: skipping %s (%s)\n" % (path, e))
+                continue
+            if reason:
+                sys.stderr.write("pod-adapter: skipping %s (%s)\n" % (path, reason))
                 continue
             ag = data.get("agent", {})
             aid = ag.get("id")
@@ -109,6 +176,9 @@ def load_adapters():
 #
 # Results are cached under $POD_STATE/discover/<id>.json with a TTL, so the gear
 # menu stays snappy; `pod-adapter refresh [id]` busts the cache and re-queries.
+# FAILURES are cached too, under a much shorter TTL: a broken/logged-out/proxied CLI
+# otherwise re-pays its full timeout_s (25-35s) on EVERY menu open forever, because a
+# cache that only remembers successes has nothing to short-circuit on.
 
 def _state_dir():
     runtime = os.environ.get("POD_TMP") or os.path.join(
@@ -120,8 +190,12 @@ def _discover_cache_path(aid):
     return os.path.join(_state_dir(), "discover", "%s.json" % aid)
 
 
-def _write_discovery_cache(path, models):
-    """Write discovery results atomically with private runtime permissions."""
+def _write_discovery_cache(path, models, error=""):
+    """Write discovery results atomically with private runtime permissions.
+
+    A non-empty `error` marks a NEGATIVE result (models=[]): the marker is what lets
+    the next caller skip a re-run it already knows will cost the whole timeout.
+    """
     parent = os.path.dirname(path)
     tmp = ""
     try:
@@ -129,7 +203,7 @@ def _write_discovery_cache(path, models):
         os.chmod(parent, 0o700)
         fd, tmp = tempfile.mkstemp(prefix=".models-", suffix=".json", dir=parent)
         with os.fdopen(fd, "w") as f:
-            json.dump({"ts": int(time.time()), "models": models}, f)
+            json.dump({"ts": int(time.time()), "models": models, "error": error}, f)
             f.flush()
             os.fsync(f.fileno())
         os.chmod(tmp, 0o600)
@@ -243,18 +317,23 @@ def _cached_discovery(aid, disc):
     path = _discover_cache_path(aid)
     try:
         age = time.time() - os.stat(path).st_mtime
-        if age < float(disc.get("ttl_s", 21600)):
-            with open(path) as f:
-                payload = json.load(f)
-            if isinstance(payload, dict):
-                cached = _valid_discovery_rows(payload.get("models"))
-                if cached:
-                    return cached
+        with open(path) as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            cached = _valid_discovery_rows(payload.get("models"))
+            if cached and age < float(disc.get("ttl_s", 21600)):
+                return cached
+            # A remembered failure expires far sooner than a success, so a CLI that
+            # comes back (login finished, proxy cleared) is picked up within minutes
+            # while a burst of menu opens costs one timeout, not one each.
+            if not cached and payload.get("error") \
+                    and age < float(disc.get("fail_ttl_s", 120)):
+                return None
     except (OSError, TypeError, ValueError):
         pass
     models = _run_discovery(disc)
-    if models:
-        _write_discovery_cache(path, models)
+    _write_discovery_cache(path, models or [],
+                           "" if models else "discovery returned no usable models")
     return models
 
 
@@ -360,6 +439,52 @@ def cmd_detect(adapters, args):
     def con_pats(aid):
         return det(aid).get("content_patterns", []) or []
 
+    def claims_cmd(aid):
+        """Does the LIVE pane command itself fit this adapter? (the strong signal)"""
+        return aid in adapters and bool(cmd_pats(aid)) and \
+            any(re.search(p, pane_cmd) for p in cmd_pats(aid))
+
+    def exclusive_cmd_claim(aid):
+        """Pane-command evidence that points at THIS adapter and no other.
+
+        '^node$' is shared by codex/cursor/gemini/opencode/openclaw, so a bare "node"
+        says only "some node TUI" — that is the ambiguity a re-stamp must never act on.
+        'cursor-agent', 'gemini', claude's version string are exclusive: nothing else
+        claims them. (generic-shell's '.*' is stripped by cmd_pats, so the catch-all
+        never counts as a rival claimant here.)
+        """
+        return claims_cmd(aid) and not any(claims_cmd(o) for o in adapters if o != aid)
+
+    def answer(aid):
+        # IDENTITY STICKINESS. A window that already carries an @agent_id keeps it
+        # unless the new claim is UNAMBIGUOUS — i.e. an EXCLUSIVE pane-command match.
+        # Nothing else may relabel a stamped seat, in EITHER direction:
+        #
+        #  - Upgrade by content is how the seat gets silently swallowed. Content
+        #    patterns are unanchored substrings ('(?i)codex', '(?i)cursor'), so a pane
+        #    that merely MENTIONS another agent — a `pod` roster line, an ls of
+        #    adapters/, a diff of this repo — used to win. The re-stamp is not
+        #    cosmetic: it rewrites @state_source and @pod_native_delivery, freezing the
+        #    state dot and making pod-deliver mark mail delivered that it never showed
+        #    (permanently — the high-water mark advances past it).
+        #  - Downgrade to the catch-all shell is a ONE-WAY TRAP, which is why it is not
+        #    allowed either. A node-hosted agent (codex/cursor/gemini/opencode) that
+        #    momentarily shows a shell as its pane command, on a screen scrolled past
+        #    its own banner, would be relabelled Shell — and could never climb back,
+        #    because '^node$' is shared and so never exclusive. One transient frame
+        #    would permanently cost the seat its hooks state and native delivery.
+        #
+        # Cost of the strictness, both ways: an agent hand-started inside a Shell seat
+        # under a SHARED command name stays labelled Shell, and an adopted seat whose
+        # agent later exits keeps the agent's label. Fix either deliberately with
+        # `pod-add-worker @id [--agent X]`, which re-stamps authoritatively. Unstamped
+        # windows (hand-opened, never adopted) are unaffected: they have no id to keep,
+        # so the full priority ladder below still classifies them by content.
+        cur = args.current
+        if cur and cur in adapters and aid != cur and not exclusive_cmd_claim(aid):
+            aid = cur
+        print(aid)
+
     # 4-phase, so the right agent wins and CLAUDE is never mis-ID'd by transcript text:
     #  1. specific pane_cmd of agents identified PURELY by pane_cmd (claude's version
     #     string, a unique binary name) — highest confidence; checked before any content
@@ -372,24 +497,24 @@ def cmd_detect(adapters, args):
         if rejected(aid):
             continue
         if not con_pats(aid) and cmd_pats(aid) and any(re.search(p, pane_cmd) for p in cmd_pats(aid)):
-            print(aid)
-            return
+            return answer(aid)
     for aid in order:
         if rejected(aid):
             continue
         if content and con_pats(aid) and any(re.search(p, content) for p in con_pats(aid)):
-            print(aid)
-            return
+            return answer(aid)
     for aid in order:
         if rejected(aid):
             continue
         if cmd_pats(aid) and any(re.search(p, pane_cmd) for p in cmd_pats(aid)):
-            print(aid)
-            return
+            return answer(aid)
     for aid in order:
         if ".*" in (det(aid).get("pane_cmd_patterns", []) or []):
-            print(aid)
-            return
+            return answer(aid)
+    # Nothing claimed the pane. A window that is already stamped keeps that id rather
+    # than losing its identity to an empty catalog read.
+    if args.current and args.current in adapters:
+        return answer(args.current)
     sys.exit(1)
 
 
@@ -502,12 +627,15 @@ def cmd_refresh(adapters, args):
         except OSError:
             pass
         models = _run_discovery(disc)
+        path = _discover_cache_path(aid)
         if models:
-            path = _discover_cache_path(aid)
             _write_discovery_cache(path, models)
             print("%s\t%d models" % (aid, len(models)))
         else:
             failed = True
+            # Record the failure as well, so the picker that follows a failed refresh
+            # gets the fast inherited-default answer instead of re-running the query.
+            _write_discovery_cache(path, [], "refresh returned no usable models")
             sys.stderr.write("%s: discovery returned nothing; inherited default only\n" % aid)
     if not any_disc:
         sys.stderr.write("pod-adapter refresh: no adapter with a [discover] block%s\n"
@@ -559,6 +687,9 @@ def main():
     s = sub.add_parser("detect")
     s.add_argument("pane_cmd")
     s.add_argument("content", nargs="?", default="")
+    # the id this window is ALREADY stamped with, so a re-detect can refuse to
+    # relabel it on weak (content-only) evidence — see answer() in cmd_detect.
+    s.add_argument("--current", default="")
     s = sub.add_parser("launch")
     s.add_argument("id")
     s.add_argument("--model", default="")
