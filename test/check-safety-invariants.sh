@@ -458,14 +458,25 @@ HOME="$TMP/home" CODEX_HOME="$TMP/home/.codex" \
   "$REPO/hooks/codex/uninstall.sh" >/dev/null
 check "Claude uninstaller preserves unrelated lookalike" grep -q pod-mail-check-health "$TMP/home/.claude/settings.json"
 check "Codex uninstaller preserves unrelated lookalike" grep -q pod-codex-state-health "$TMP/home/.codex/hooks.json"
+# Permission bits, BSD and GNU. Branch on uname — do NOT use the obvious
+# `stat -f '%Lp' x || stat -c '%a' x` chain: on GNU coreutils -f is --file-system, so
+# it SUCCEEDS (exit 0) and prints a filesystem dump, the fallback never fires, and the
+# comparison below silently reads `File: "..."` instead of a mode. Same trap
+# _pod-common.sh's pod_file_mtime documents for the -f %m / -c %Y pair.
+file_mode() {
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) stat -f '%Lp' "${1:-}" 2>/dev/null ;;
+    *)      stat -c '%a'  "${1:-}" 2>/dev/null ;;
+  esac
+}
 mode_ok=1
 for backup in "$TMP/home/.claude/settings.json".pod-bak.* "$TMP/home/.codex/hooks.json".pod-bak.*; do
-  mode="$(stat -f '%Lp' "$backup" 2>/dev/null || stat -c '%a' "$backup")"
+  mode="$(file_mode "$backup")"
   [ "$mode" = 600 ] || { bad "backup mode preserved at 0600 ($backup was $mode)"; mode_ok=0; }
 done
 [ "$mode_ok" = 1 ] && ok "hook backups preserve 0600 mode"
 for config in "$TMP/home/.claude/settings.json" "$TMP/home/.codex/hooks.json"; do
-  mode="$(stat -f '%Lp' "$config" 2>/dev/null || stat -c '%a' "$config")"
+  mode="$(file_mode "$config")"
   check "hook rewrite preserves 0600 mode ($(basename "$config"))" test "$mode" = 600
 done
 

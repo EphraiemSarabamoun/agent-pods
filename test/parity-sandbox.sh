@@ -78,8 +78,18 @@ printf '\033[1magent-pods parity sandbox\033[0m  (clone=%s socket=%s)\n' "$CLONE
 # ── 1. install.sh isolation (sandboxed HOME — touches nothing real) ───────────
 sec "install.sh (isolated HOME)"
 IHOME="$SBX/home"; mkdir -p "$IHOME/.claude"
+# install.sh wires an agent's hooks only when that agent is DETECTED (pod-adapter
+# --available = its base_cmd resolves on PATH). On a machine without Claude Code the
+# installer therefore skips the wiring CORRECTLY, and the two assertions below would go
+# red for an environment reason rather than a defect — which is precisely what happened
+# on a Linux CI runner while a developer box with `claude` installed stayed green. Put a
+# stub on PATH so the wiring path is genuinely exercised everywhere. Scoped to the two
+# install subshells ONLY: a `claude` visible to the whole harness would also be found by
+# local model discovery, which launches the binary and waits on its banner.
+STUBAGENT="$SBX/agentstub"; mkdir -p "$STUBAGENT"
+printf '#!/bin/sh\nexit 0\n' > "$STUBAGENT/claude"; chmod +x "$STUBAGENT/claude"
 ( cd "$CLONE" && HOME="$IHOME" XDG_CONFIG_HOME="$IHOME/.config" CLAUDE_CONFIG_DIR="$IHOME/.claude" \
-    ./install.sh --with-claude-hooks --no-logins ) >"$SBX/install.log" 2>&1
+    PATH="$STUBAGENT:$PATH" ./install.sh --with-claude-hooks --no-logins ) >"$SBX/install.log" 2>&1
 chk "install.sh exits 0" '[ $? -eq 0 ] || grep -q "wired\|already" "$SBX/install.log"' "see $SBX/install.log"
 chk "symlinks bin/* into sandbox ~/.local/bin" '[ -L "$IHOME/.local/bin/pod-launch" ] && [ -L "$IHOME/.local/bin/pod-auto" ] && [ -L "$IHOME/.local/bin/pod-summary-pane" ]'
 chk "seeds slots.json" '[ -s "$IHOME/.config/pod/slots.json" ]'
@@ -87,7 +97,7 @@ chk "agent slots do not persist launch commands" '! jq -e ".slots[] | select(.ag
 chk "wires Claude Code hooks into settings.json" 'grep -q "pod-state" "$IHOME/.claude/settings.json"'
 chk "PostToolUse rescue hook wired" 'grep -q "PostToolUse" "$IHOME/.claude/settings.json"'
 ( cd "$CLONE" && HOME="$IHOME" XDG_CONFIG_HOME="$IHOME/.config" CLAUDE_CONFIG_DIR="$IHOME/.claude" \
-    ./install.sh --with-claude-hooks --no-logins ) >"$SBX/install2.log" 2>&1
+    PATH="$STUBAGENT:$PATH" ./install.sh --with-claude-hooks --no-logins ) >"$SBX/install2.log" 2>&1
 chk "re-run is idempotent (no duplicate hooks)" 'grep -qi "already present\|nothing to do" "$SBX/install2.log"'
 
 # ── 2. launch a pod headless (attach fails w/o a tty; the session persists) ────
