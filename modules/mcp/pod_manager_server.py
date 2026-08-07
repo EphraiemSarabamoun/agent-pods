@@ -47,14 +47,74 @@ POD_BIN = Path(os.environ.get("POD_BIN") or (REPO_ROOT / "bin"))
 MGR_BIN = POD_MODULES / "queue" / "bin"
 REPO_TEMPLATES = POD_MODULES / "queue" / "templates"
 
-# One state/inbox tree under POD_INBOX / POD_STATE. Match _pod-paths.sh's private,
-# per-user default for direct module launches that did not source the shell config.
-_RUNTIME_ROOT = Path(
-    os.environ.get("POD_TMP")
-    or (Path(os.environ.get("TMPDIR") or "/tmp") / f"agent-pods-{os.getuid()}")
-)
-INBOX_ROOT = Path(os.environ.get("POD_INBOX") or (_RUNTIME_ROOT / "inbox"))
-STATE_DIR = Path(os.environ.get("POD_STATE") or (_RUNTIME_ROOT / "state"))
+
+def _bash_bin() -> str:
+    """bash, explicitly — never $SHELL, never /bin/sh.
+
+    The pod shell layer IS bash (`${BASH_SOURCE[0]}`, arrays, `local`): dash rejects it
+    with "Bad substitution" and csh/tcsh never parse it at all. $SHELL is the user's
+    login shell, which is none of our business.
+    """
+    return shutil.which("bash") or "/bin/bash"
+
+
+def _shell_runtime_paths() -> dict[str, str]:
+    """Ask bin/_pod-paths.sh where the runtime tree is instead of re-deriving it.
+
+    That file is the ONE place the tree is resolved: it applies the default, then
+    sources ~/.config/pod/config.sh, which is exactly where a user relocates POD_TMP
+    (config/config.sh.example documents the knob). A Python re-derivation cannot see
+    that file, so the server built a second, permanently empty inbox/state tree while
+    every mgr-* helper wrote into the configured one — pod_stage returning a
+    prompt_path that does not exist, pod_read_prompt answering "no prompt.txt", and
+    every tool still reporting ok. Delegating also inherits future changes to the
+    default for free (it moved off $TMPDIR precisely because a per-command TMPDIR
+    forked one pod into two trees).
+
+    Resolved once per process: config is startup state, and every other consumer of
+    this file pays the same one-time read.
+    """
+    paths_sh = POD_BIN / "_pod-paths.sh"
+    if not paths_sh.exists():
+        return {}
+    # NUL-separated so a path containing whitespace (or, absurdly, a newline) survives.
+    script = (
+        '. "$1" >/dev/null || exit 1; '
+        'printf "%s\\0" "$POD_TMP" "$POD_STATE" "$POD_INBOX" "$POD_COMMS" "$POD_TMUX"'
+    )
+    try:
+        proc = subprocess.run(
+            [_bash_bin(), "-c", script, "pod-paths", str(paths_sh)],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    keys = ("POD_TMP", "POD_STATE", "POD_INBOX", "POD_COMMS", "POD_TMUX")
+    values = proc.stdout.split("\0")
+    if len(values) < len(keys):
+        return {}
+    return {key: value for key, value in zip(keys, values) if value}
+
+
+_SHELL_PATHS = _shell_runtime_paths()
+
+
+def _runtime_path(var: str, fallback: Path) -> Path:
+    """Shell answer first (it already folded in env AND config.sh), env second (only
+    reachable when the shell layer is missing), repo default last."""
+    return Path(_SHELL_PATHS.get(var) or os.environ.get(var) or fallback)
+
+
+# One state/inbox tree under POD_INBOX / POD_STATE. The fallbacks below only fire when
+# _pod-paths.sh is unavailable; KEEP THEM IN SYNC with it — notably a FIXED /tmp root,
+# never $TMPDIR, because TMPDIR is per-context (GUI terminal vs ssh vs a sandbox that
+# hands every command its own) and a TMPDIR-derived root splits one pod in two.
+_RUNTIME_ROOT = _runtime_path("POD_TMP", Path(f"/tmp/agent-pods-{os.getuid()}"))
+INBOX_ROOT = _runtime_path("POD_INBOX", _RUNTIME_ROOT / "inbox")
+STATE_DIR = _runtime_path("POD_STATE", _RUNTIME_ROOT / "state")
+COMMS_DIR = _runtime_path("POD_COMMS", _RUNTIME_ROOT / "comms")
 QUEUE_DIR = INBOX_ROOT / "_queue"  # per-pod children live below this root
 TEMPLATES_DIR = INBOX_ROOT / "_templates"
 DISPATCHED_DIR = STATE_DIR / "dispatched"  # per-pod children live below this root
@@ -101,10 +161,61 @@ def _host_short() -> str:
     return "localhost"
 
 
+def _child_env() -> dict[str, str]:
+    """Environment for every helper we shell out to, with the runtime tree PINNED.
+
+    A child re-derives POD_TMP from its own environment, so anything that changes
+    between our startup and the call — a sandbox handing each command a fresh TMPDIR,
+    a config.sh edit — is enough to send parent and child to different trees while both
+    report success. Passing the four roots we already resolved makes that impossible.
+    POD_TMUX rides along for the same reason: agent-pods runs on a dedicated tmux
+    socket by default, and a child that resolves a bare `tmux` would talk to the user's
+    server instead of the deck we are looking at.
+    """
+    env = dict(os.environ)
+    env["POD_TMP"] = str(_RUNTIME_ROOT)
+    env["POD_STATE"] = str(STATE_DIR)
+    env["POD_INBOX"] = str(INBOX_ROOT)
+    env["POD_COMMS"] = str(COMMS_DIR)
+    env["POD_TMUX"] = _tmux_bin()
+    return env
+
+
+def _mgr_query(snippet: str, count: int, args: list[str] | None = None) -> list[str]:
+    """Run one _mgr-runtime.sh helper in a subshell and return its NUL-separated fields.
+
+    This is how the server asks the shell layer a question it must not answer itself
+    (which pod am I in, is FULL AUTO on). Same reasoning as _shell_runtime_paths:
+    reimplementing the rule in Python is what let the two sides drift apart. Returns []
+    on any failure so callers can fall back rather than crash.
+    """
+    paths_sh = POD_BIN / "_pod-paths.sh"
+    runtime_sh = POD_BIN / "_mgr-runtime.sh"
+    if not paths_sh.exists() or not runtime_sh.exists():
+        return []
+    # _pod-paths.sh EXPLICITLY first: _mgr-runtime.sh only sources it when POD_TMUX is
+    # unset, and _child_env pins POD_TMUX — so leaving it implicit gave us a runtime
+    # with mgr_current_pod defined but pod_json_get and POD_SESSION_PREFIX missing, and
+    # the helper answered the empty string instead of the pod name.
+    script = f'. "$1" >/dev/null || exit 1; . "$2" >/dev/null || exit 1; {snippet}'
+    try:
+        proc = subprocess.run(
+            [_bash_bin(), "-c", script, "mgr-runtime", str(paths_sh), str(runtime_sh),
+             *(args or [])],
+            capture_output=True, text=True, timeout=20, check=False, env=_child_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    fields = proc.stdout.split("\0")
+    return fields[:count] if len(fields) > count else []
+
+
 def _run_mgr(script: str, args: list[str], check: bool = True) -> dict[str, Any]:
     """Invoke a mgr-* helper (from the queue module). Returns {stdout, stderr, returncode}."""
     cmd = [str(MGR_BIN / script), *args]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False, env=_child_env())
     result = {
         "command": " ".join(cmd),
         "stdout": proc.stdout.strip(),
@@ -266,11 +377,17 @@ def _tmux_bin() -> str:
     grp = _read_json(TMUX_GROUP_PATH, {}) or {}
     if isinstance(grp, dict) and grp.get("tmux_bin"):
         return grp["tmux_bin"]
-    return os.environ.get("POD_TMUX") or shutil.which("tmux") or "tmux"
+    # _SHELL_PATHS' POD_TMUX before a bare `tmux`: agent-pods runs on its own tmux
+    # socket by default (via the shim _pod-paths.sh writes), so resolving the plain
+    # binary here would point every call at the user's default server — a deck that
+    # looks empty while the real one is running next door.
+    return (os.environ.get("POD_TMUX") or _SHELL_PATHS.get("POD_TMUX")
+            or shutil.which("tmux") or "tmux")
 
 
 def _run_tmux(args: list[str]) -> dict[str, Any]:
-    proc = subprocess.run([_tmux_bin(), *args], capture_output=True, text=True, check=False)
+    proc = subprocess.run([_tmux_bin(), *args], capture_output=True, text=True, check=False,
+                          env=_child_env())
     return {"stdout": proc.stdout.strip(), "stderr": proc.stderr.strip(), "returncode": proc.returncode}
 
 
@@ -335,17 +452,45 @@ def _tmux_group() -> dict[str, Any] | None:
 
 
 def _current_pod_component() -> str:
-    """Return the same safe queue namespace the mgr-* helpers resolve."""
-    grp = _tmux_group()
-    candidate = (
-        (grp or {}).get("pod")
-        or os.environ.get("POD_SESSION")
-        or os.environ.get("POD_SESSION_PREFIX")
-        or "pod"
-    )
+    """Return the same safe queue namespace the mgr-* helpers resolve.
+
+    Delegated to mgr_current_pod rather than re-derived, because the two rules were
+    not the same rule: _tmux_group() additionally demands a LIVE, @is_pod-stamped
+    session and answers None otherwise, while the shell reads tmux_group.json's pod
+    name verbatim. A pod whose tmux server had restarted therefore had mgr-queue
+    writing into _queue/<recorded-name>/ while this side scanned _queue/pod/ — so every
+    queued task read back as in-flight and state='queued' returned nothing. The local
+    derivation survives only as the fallback for a missing shell layer.
+    """
+    fields = _mgr_query('printf "%s\\0" "$(mgr_current_pod)"', 1)
+    candidate = fields[0] if fields else ""
+    if not candidate:
+        grp = _tmux_group()
+        candidate = (
+            (grp or {}).get("pod")
+            or os.environ.get("POD_SESSION")
+            or os.environ.get("POD_SESSION_PREFIX")
+            or "pod"
+        )
     if not _valid_component(candidate):
         raise ValueError(f"invalid pod name for queue namespace: {candidate!r}")
     return candidate
+
+
+def _pod_auto_state() -> tuple[str, str]:
+    """(pod, FULL AUTO state) exactly as the shell resolves them: on | off | none.
+
+    'none' means the caller is not in a stamped pod, which mgr_pod_auto_state defines
+    as fail-OPEN — a plain tmux session or a headless seat must behave as if the switch
+    did not exist. Returns ("", "none") when the shell layer is unreachable, so an
+    unanswerable question never blocks a dispatch.
+    """
+    fields = _mgr_query(
+        'p="$(mgr_current_pod)"; printf "%s\\0%s\\0" "$p" "$(mgr_pod_auto_state "$p")"', 2
+    )
+    if len(fields) < 2 or not fields[1]:
+        return "", "none"
+    return fields[0], fields[1]
 
 
 def _scoped_queue_dir() -> Path:
@@ -432,7 +577,7 @@ def _pick_worker_color(session: str, win_id: str) -> tuple[str, str]:
 def _adapter_field(agent_id: str, key: str, default: str = "") -> str:
     try:
         r = subprocess.run([POD_ADAPTER, "field", agent_id, key],
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, timeout=5, env=_child_env())
         if r.returncode == 0:
             return r.stdout.strip()
     except Exception:
@@ -448,7 +593,7 @@ def _adapter_card(agent_id: str, model: str = "", effort: str = "") -> str:
         if effort:
             args += ["--effort", effort]
         r = subprocess.run(args,
-                           capture_output=True, text=True, timeout=40)
+                           capture_output=True, text=True, timeout=40, env=_child_env())
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout.strip()
     except Exception:
@@ -467,7 +612,7 @@ def _detect_window_agent(tmux_window: str) -> str:
     try:
         detected = subprocess.run(
             [POD_ADAPTER, "detect", pane_cmd, content], capture_output=True,
-            text=True, timeout=10,
+            text=True, timeout=10, env=_child_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -497,7 +642,7 @@ def _spawn_tmux_window(label: str, cd_to: str, register: bool, agent_id: str,
     name = ""
     try:
         r = subprocess.run([str(POD_BIN / "pod-name"), session],
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, timeout=5, env=_child_env())
         name = r.stdout.strip()
     except Exception:
         name = ""
@@ -513,7 +658,7 @@ def _spawn_tmux_window(label: str, cd_to: str, register: bool, agent_id: str,
         try:
             resolved = subprocess.run(
                 [POD_ADAPTER, "resolve-model", agent_id, model], capture_output=True,
-                text=True, timeout=40,
+                text=True, timeout=40, env=_child_env(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return {"error": f"could not resolve local models for '{agent_id}': {exc}"}
@@ -522,7 +667,7 @@ def _spawn_tmux_window(label: str, cd_to: str, register: bool, agent_id: str,
         try:
             resolved_effort_proc = subprocess.run(
                 [POD_ADAPTER, "resolve-effort", agent_id, resolved_model, effort],
-                capture_output=True, text=True, timeout=40,
+                capture_output=True, text=True, timeout=40, env=_child_env(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return {"error": f"could not resolve effort for '{agent_id}': {exc}"}
@@ -536,7 +681,8 @@ def _spawn_tmux_window(label: str, cd_to: str, register: bool, agent_id: str,
         if resolved_effort:
             args += ["--effort", resolved_effort]
         try:
-            launched = subprocess.run(args, capture_output=True, text=True, timeout=40)
+            launched = subprocess.run(args, capture_output=True, text=True, timeout=40,
+                                      env=_child_env())
         except (OSError, subprocess.SubprocessError) as exc:
             return {"error": f"could not launch adapter '{agent_id}': {exc}"}
         command = launched.stdout.strip() if launched.returncode == 0 else ""
@@ -544,9 +690,16 @@ def _spawn_tmux_window(label: str, cd_to: str, register: bool, agent_id: str,
             return {"error": f"adapter could not launch agent '{agent_id}'",
                     "stderr": launched.stderr.strip()}
         bootstrap = POD_BIN / "pod-worker-bootstrap"
-        body = "exec " + command
-        launch = (f"cd {shlex.quote(str(target))} && exec {shlex.quote(str(bootstrap))} "
-                  f"{shlex.quote(shell)} -lc {shlex.quote(body)}")
+        # Hand the adapter's argv straight to the bootstrap, exactly as pod-add-worker
+        # does (`exec "$POD_BIN/pod-worker-bootstrap" $CMD`) — the two spawn paths must
+        # produce identical panes. The old `$SHELL -lc <cmd>` wrapper broke that twice:
+        # csh/tcsh reject a combined -lc outright ("Unknown option: `-lc'"), so the pane
+        # died milliseconds after new-window reported success; and even under bash, -l
+        # sourced the login profile, dumping banners and a re-ordered PATH into the
+        # agent's pane that a "+"-spawned worker never sees. `command` stays unquoted
+        # because it is a space-joined argv meant for the spawning shell to split.
+        launch = (f"cd {shlex.quote(str(target))} && "
+                  f"exec {shlex.quote(str(bootstrap))} {command}")
     else:
         resolved_effort = ""
         launch = f"cd {shlex.quote(str(target))} && exec {shlex.quote(shell)}"
@@ -963,7 +1116,7 @@ def pod_window_contents(window_id: int | None = None, last_n_lines: int | None =
     Pass tmux_window ("@7") for a grouped worker, or window_id to look it up in the
     roster (which resolves to its tmux_window).
 
-    last_n_lines: tail of the buffer (default 80). None = full contents.
+    last_n_lines: tail of the buffer (default 80). None (or 0) = full scrollback.
     """
     err = _ensure_initialized()
     if err:
@@ -982,13 +1135,17 @@ def pod_window_contents(window_id: int | None = None, last_n_lines: int | None =
     live = _run_tmux(["display-message", "-p", "-t", tw, "#{session_name}"])
     if live["returncode"] != 0 or live["stdout"] != grp["session"]:
         return {"error": "registered worker is not live in this pod", "tmux_window": tw}
-    n = last_n_lines if (last_n_lines and last_n_lines > 0) else 200
-    res = _run_tmux(["capture-pane", "-p", "-t", tw, "-S", f"-{n}"])
+    # "None = full contents" has to mean the WHOLE history (-S -), not a silent 200-line
+    # cap: the old fallback captured 200 lines and then computed truncated against a
+    # None cap, so it always answered truncated=false. A manager hunting for an error
+    # the worker printed 300 lines ago was told, explicitly, that nothing had been cut.
+    cap = last_n_lines if (last_n_lines and last_n_lines > 0) else None
+    start = f"-{cap}" if cap else "-"
+    res = _run_tmux(["capture-pane", "-p", "-t", tw, "-S", start])
     if res["returncode"] != 0:
         return {"error": f"capture-pane failed: {res['stderr']}", "tmux_window": tw}
     content = res["stdout"]
     lines = content.splitlines()
-    cap = last_n_lines if (last_n_lines and last_n_lines > 0) else None
     truncated = bool(cap and len(lines) > cap)
     if truncated:
         content = "\n".join(lines[-cap:])
@@ -1111,10 +1268,29 @@ def pod_dispatch(
     Defaults: highest-priority queued task -> first idle worker. Override
     either side with task_id / tmux_window. print_only=True returns the
     command that would fire without actually firing it (dry run).
+
+    Gated by the pod's FULL AUTO switch, same as pod_pick_next: while the strip shows
+    ✋ MAN, picking a worker automatically is refused. Passing tmux_window is the
+    deliberate, always-allowed act (that is the scope pod-auto documents), so a human
+    or an agent acting on a human's instruction can still dispatch by hand.
     """
     err = _ensure_initialized()
     if err:
         return err
+    if tmux_window is None:
+        # Pre-flight the switch here so an MCP manager gets a typed refusal it can
+        # branch on instead of a non-zero exit plus a stderr string — and so the gate
+        # holds even against a queue module older than the one that enforces it inside
+        # mgr-dispatch. The rule itself is still the shell's (mgr_pod_auto_state).
+        pod, auto = _pod_auto_state()
+        if auto == "off":
+            return {
+                "error": f"FULL AUTO is OFF for pod '{pod}' — automatic worker-picking "
+                         "is held. Pass tmux_window to dispatch by hand, or run "
+                         "`pod-auto on`.",
+                "pod": pod,
+                "full_auto": auto,
+            }
     args: list[str] = []
     if task_id:
         if not _valid_component(task_id):
@@ -1141,13 +1317,22 @@ def pod_poll() -> dict[str, Any]:
     err = _ensure_initialized()
     if err:
         return err
-    res = _run_mgr("mgr-poll", ["--json"])
+    # --quiet as well as --json: --json alone still prints "no newly-completed tasks"
+    # ahead of the array on the (very common) empty sweep, which is not parseable JSON.
+    res = _run_mgr("mgr-poll", ["--json", "--quiet"])
     if res["returncode"] != 0:
         return {"error": res.get("error", "mgr-poll failed"), **res}
     try:
         freed = json.loads(res["stdout"]) if res["stdout"] else []
     except json.JSONDecodeError:
-        freed = []
+        freed = None
+    # An unparseable sweep is an ERROR, never an empty success. Reporting count 0 for
+    # garbage on stdout (a jq error, a warning from a sourced config.sh, a truncated
+    # pipe) tells the manager "nobody finished" forever: workers are never freed and the
+    # queue stalls with nothing surfaced anywhere. Matches pod_status's handling.
+    if not isinstance(freed, list):
+        return {"error": "mgr-poll did not emit a JSON array", "raw_stdout": res["stdout"],
+                "stderr": res["stderr"]}
     return {"status": "ok", "freed_task_ids": freed, "count": len(freed)}
 
 
@@ -1245,9 +1430,10 @@ def pod_read_prompt(task_id: str) -> dict[str, Any]:
 def pod_list_inbox(state: str = "all") -> dict[str, Any]:
     """List all task dirs under the inbox root, optionally filtered.
 
-    state: 'all' | 'queued' | 'in-flight' | 'done'
-        - queued: in _queue/ but not yet dispatched
-        - in-flight: dispatched but no DONE sentinel
+    state: 'all' | 'staged' | 'queued' | 'in-flight' | 'done'
+        - staged: prompt written, not queued and never dispatched
+        - queued: in _queue/<pod>/ but not yet dispatched
+        - in-flight: dispatched (archive present) but no DONE sentinel
         - done: DONE sentinel present
     """
     err = _ensure_initialized()
@@ -1258,6 +1444,7 @@ def pod_list_inbox(state: str = "all") -> dict[str, Any]:
 
     try:
         queue_dir = _scoped_queue_dir()
+        dispatched_dir = _scoped_dispatched_dir()
     except ValueError as exc:
         return {"error": str(exc)}
     queued_ids: set[str] = set()
@@ -1277,8 +1464,15 @@ def pod_list_inbox(state: str = "all") -> dict[str, Any]:
             task_state = "done"
         elif d.name in queued_ids:
             task_state = "queued"
-        else:
+        elif (dispatched_dir / f"{d.name}.json").exists():
+            # mgr-dispatch archives the queue record here the moment it fires, so this
+            # file — not "everything left over" — is what in-flight actually means.
             task_state = "in-flight"
+        else:
+            # Staged but never queued. Calling this in-flight told a manager a worker
+            # was executing a task nobody had dispatched, and it waited for a DONE that
+            # no one would ever write.
+            task_state = "staged"
         if state != "all" and task_state != state:
             continue
         tasks.append(
@@ -1308,6 +1502,9 @@ def pod_send_input(
     mid-flight can confuse them. Pass tmux_window ("@7") for a grouped worker, or a
     window_id that resolves in the roster. Refuses to send into the manager window.
     submit=True presses Return after.
+
+    Newlines and tabs in `text` are flattened to spaces before sending (see
+    text_flattened in the return); only submit=True submits.
     """
     err = _ensure_initialized()
     if err:
@@ -1328,7 +1525,14 @@ def pod_send_input(
         return {"error": "registered worker is not live in this pod", "tmux_window": tw}
     if tw == grp.get("manager_window"):
         return {"error": "refusing to send into the manager window"}
-    r1 = _run_tmux(["send-keys", "-t", tw, "-l", text])
+    # `send-keys -l` writes the bytes literally, and a literal 0x0a IS Enter to the
+    # pane's terminal — so a multi-line message submitted every line but the last while
+    # this function still reported submitted=false. Flatten first, exactly as
+    # pod-deliver does (`tr '\n\r\t' '   '`); tabs go too because a bare tab triggers
+    # completion in most agent TUIs. Submission stays the caller's explicit choice.
+    payload = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    flattened = payload != text
+    r1 = _run_tmux(["send-keys", "-t", tw, "-l", payload])
     if r1["returncode"] != 0:
         return {"error": f"send-keys failed: {r1['stderr']}", "tmux_window": tw}
     submitted = False
@@ -1341,9 +1545,11 @@ def pod_send_input(
         if r2["returncode"] != 0:
             _run_tmux(["send-keys", "-t", tw, "C-u"])
             return {"error": f"submit failed: {r2['stderr']}", "tmux_window": tw,
-                    "text_length": len(text), "submitted": False}
+                    "text_length": len(payload), "text_flattened": flattened,
+                    "submitted": False}
         submitted = True
-    return {"status": "ok", "tmux_window": tw, "text_length": len(text), "submitted": submitted}
+    return {"status": "ok", "tmux_window": tw, "text_length": len(payload),
+            "text_flattened": flattened, "text_sent": payload, "submitted": submitted}
 
 
 # ============================================================
@@ -1357,6 +1563,10 @@ def pod_group_status() -> dict[str, Any]:
 
     grouped=False means there is no active pod. Start the manager via pod-launch to
     group workers as colored tmux windows in one deck.
+
+    full_auto is the pod's FULL AUTO switch (on | off | none, where none = not a
+    stamped pod and therefore unrestricted). Check it before pod_dispatch /
+    pod_pick_next: while it is off, automatic worker-picking is held.
     """
     grp = _tmux_group()
     if not grp:
@@ -1364,11 +1574,13 @@ def pod_group_status() -> dict[str, Any]:
                 "hint": "launch the manager with pod-launch to group workers as colored tmux windows"}
     res = _run_tmux(["list-windows", "-t", grp["session"],
                      "-F", "#{window_id} #{window_index}:#{window_name}"])
+    _, auto = _pod_auto_state()
     return {
         "status": "ok",
         "grouped": True,
         "session": grp["session"],
         "manager_window": grp.get("manager_window"),
+        "full_auto": auto,
         "windows": res["stdout"].splitlines(),
     }
 

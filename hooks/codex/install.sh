@@ -18,7 +18,7 @@
 #
 # If bin/pod-brief exists (an optional module), SessionStart/UserPromptSubmit also get
 # its boot/refresh entries; if bin/pod-primer exists, SessionStart also injects the role
-# primer + operator memory + sandbox notice. Absent, they're simply not wired (re-run to add).
+# primer + operator memory. Absent, they're simply not wired (re-run to add).
 #
 # Idempotent: a pod hook is added only if an identical command isn't already present,
 # so re-running is safe. Existing non-pod hooks are left intact. hooks.json is backed
@@ -27,11 +27,18 @@
 #
 # Hook commands use ABSOLUTE resolved paths under this repo's bin ($POD_BIN), so the
 # wiring survives a relocated repo as long as the files stay where install.sh found them.
+# If the repo DID move, re-running heals rather than accumulates: pod hook entries that
+# point at a different checkout are pruned before the new group is appended.
 set -uo pipefail
 POD_BIN="$(cd "$(dirname "$0")/../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
 
 # the awareness hook is shared with the claude-code wiring; argv1 sets the stamped id.
-AWARENESS="$(cd "$(dirname "$0")/../claude-code" && pwd)/pod-awareness.sh"
+# Built from the PHYSICAL repo root that _pod-paths.sh resolved, never from a logical
+# `cd "$(dirname "$0")" && pwd`: every other command below comes from the symlink-resolved
+# $POD_BIN, and a logical $0 keeps whatever symlinked component the caller typed (macOS
+# /tmp -> /private/tmp, an autofs $HOME). The two spellings then disagree and uninstall.sh,
+# which rebuilds this path from the physical $POD_BIN, could never match what we wrote.
+AWARENESS="$POD_REPO/hooks/claude-code/pod-awareness.sh"
 
 # optional modules: only wire these if they exist right now (a re-run picks them up).
 BRIEF="$POD_BIN/pod-brief"
@@ -66,7 +73,7 @@ command -v python3 >/dev/null 2>&1 || { echo "install.sh: python3 required" >&2;
 
 # --- merge via python: back up, add only missing pod entries, atomic write ---------
 python3 - "$HOOKS_FILE" "$POD_BIN" "$AWARENESS" "$BRIEF" "$PRIMER" <<'PY'
-import json, os, shutil, sys, tempfile, datetime
+import json, os, shlex, shutil, sys, tempfile, datetime
 
 hooks_path, pod_bin, awareness, brief, primer = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 
@@ -131,6 +138,69 @@ def existing_commands(event):
                 out.add(h["command"])
     return out
 
+# --- structural ownership: recognize a pod hook baked with ANY path prefix ----------
+# The wiring above bakes absolute paths, so a user who moves or re-clones the repo and
+# re-runs this installer would otherwise end up with BOTH sets wired: the dead one keeps
+# firing `bash "/gone/bin/pod-codex-state" idle` on every event, and no uninstaller run
+# from the new location can reach it, because ownership was matched by exact string.
+# So match on the SCRIPT instead: argv[1]'s basename, required to sit under a `bin/` or
+# `hooks/claude-code/` parent. Tight enough that an unrelated user command never matches,
+# loose enough to recognize our own entries from any prior checkout.
+POD_BIN_SCRIPTS = {
+    "pod-codex-state", "pod-mail-check", "pod-brief", "pod-primer",
+}
+
+def pod_hook_script(cmd):
+    """The pod script this hook command runs, or None when the command isn't ours."""
+    if not isinstance(cmd, str):
+        return None
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        return None                       # unbalanced quotes: not something we wrote
+    if len(argv) < 2 or os.path.basename(argv[0]) not in ("bash", "sh"):
+        return None
+    path, parent = argv[1], os.path.dirname(argv[1])
+    if os.path.basename(path) == "pod-awareness.sh":
+        if os.path.basename(parent) == "claude-code" and \
+           os.path.basename(os.path.dirname(parent)) == "hooks":
+            return path
+        return None
+    if os.path.basename(path) in POD_BIN_SCRIPTS and os.path.basename(parent) == "bin":
+        return path
+    return None
+
+# Entries pointing at THIS checkout are handled by the idempotent merge below; anything
+# else is an orphan from a checkout that has moved, and gets pruned.
+CURRENT_DIRS = {pod_bin, os.path.dirname(awareness)}
+
+pruned = []
+for event in list(hooks.keys()):
+    groups = hooks.get(event)
+    if not isinstance(groups, list):
+        continue
+    new_groups = []
+    for group in groups:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+            new_groups.append(group)
+            continue
+        kept = []
+        for h in group["hooks"]:
+            script = pod_hook_script(h.get("command")) \
+                if isinstance(h, dict) and h.get("type") == "command" else None
+            if script is not None and os.path.dirname(script) not in CURRENT_DIRS:
+                pruned.append("%s: %s" % (event, h.get("command")))
+                continue
+            kept.append(h)
+        if kept:
+            group["hooks"] = kept
+            new_groups.append(group)
+        # else: the group held nothing but stale pod entries -> drop the empty scaffolding
+    if new_groups:
+        hooks[event] = new_groups
+    else:
+        del hooks[event]
+
 added = []
 for event, cmds in WIRING.items():
     have = existing_commands(event)
@@ -148,7 +218,7 @@ for event, cmds in WIRING.items():
     })
     added.extend(["%s: %s" % (event, c) for c in missing])
 
-if not added:
+if not added and not pruned:
     print("install.sh: all agent-pods Codex hooks already present in %s — nothing to do." % hooks_path)
     sys.exit(0)
 
@@ -164,20 +234,31 @@ if existed:
         sys.exit(1)
 
 # --- atomic write ---
-os.makedirs(os.path.dirname(os.path.abspath(hooks_path)), exist_ok=True)
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(hooks_path)), prefix=".hooks.", suffix=".tmp")
+# Write to the REALPATH, not the path we were handed: os.replace() acts on the link
+# itself, so a dotfiles-managed hooks.json (stow/chezmoi/yadm point ~/.codex/hooks.json
+# at a repo file) would be silently detached and replaced by a regular file — the dotfiles
+# copy keeps being edited and never takes effect again. Resolving first also puts the
+# tempfile on the real file's filesystem, which is what makes the rename atomic.
+real_path = os.path.realpath(hooks_path)
+os.makedirs(os.path.dirname(real_path), exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real_path), prefix=".hooks.", suffix=".tmp")
 try:
     os.fchmod(fd, (os.stat(hooks_path).st_mode & 0o777) if existed else 0o600)
     with os.fdopen(fd, "w") as tf:
         json.dump(data, tf, indent=2)
         tf.write("\n")
-    os.replace(tmp, hooks_path)
+    os.replace(tmp, real_path)
 except Exception:
     try: os.unlink(tmp)
     except OSError: pass
     raise
 
-print("install.sh: wired %d pod hook(s) into %s:" % (len(added), hooks_path))
-for a in added:
-    print("  + " + a)
+if pruned:
+    print("install.sh: pruned %d pod hook(s) from a previous repo location in %s:" % (len(pruned), hooks_path))
+    for p in pruned:
+        print("  - " + p)
+if added:
+    print("install.sh: wired %d pod hook(s) into %s:" % (len(added), hooks_path))
+    for a in added:
+        print("  + " + a)
 PY

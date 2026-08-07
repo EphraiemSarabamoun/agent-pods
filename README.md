@@ -177,7 +177,15 @@ POD_MANAGER_NAME="Hermes"             # shown in MANUAL mode (✋)
 POD_MANAGER_NAME_AUTO="Hermes Prime"  # shown while FULL AUTO is on (⚡)
 ```
 
-Spaces are fine. If you set only `POD_MANAGER_NAME`, the rename is a visible no-op (both
+`install.sh` also gives you a **launcher by that name**: with `POD_MANAGER_NAME="Hermes"`
+set before you install, `hermes` opens or attaches a pod exactly like `pod-launch`
+(`hermes mypod` targets one), so the deck answers to whatever you call it. It is claimed
+only when the name is genuinely free — if anything already answers to it on your `PATH`,
+the installer says so and leaves both alone. Re-run `./install.sh` after changing the
+name; `./uninstall.sh` removes the launcher with everything else.
+
+Spaces are fine, though a name with spaces gets no launcher (it can't be a command name).
+If you set only `POD_MANAGER_NAME`, the rename is a visible no-op (both
 modes show the same name). The switch is live: toggling FULL AUTO renames the tab, and it
 also heals a tab still showing the old default `manager` from a pod launched before you
 set these — no relaunch needed for a running pod. A fresh `pod-launch` picks it up from
@@ -223,11 +231,6 @@ Grow that memory with `pod-remember "<lesson>"`; it's durable and cross-session 
 per-pod journal `pod-note` feeds) and reaches every hooked seat you spawn afterward. `POD_PRIMER=0`
 turns the injection off; `POD_OPERATOR_MEMORY` relocates the file.
 
-If a seat runs in a command sandbox that can't reach the tmux socket, the primer also tells
-that agent up front which pod features work from there (roster, journal, pod-mail — anything
-that reads or exchanges) and which are blocked (spawning/killing workers, driving other
-panes — anything that changes the deck). See Troubleshooting.
-
 ### Local and managed model catalogs
 
 The `+` picker queries the agent installed on this device, so Claude Code automatically
@@ -255,11 +258,6 @@ first broken link. It's read-only. Common causes it catches:
 - **jq missing from the agent's PATH.** The context tier falls back to python3, so
   awareness still works, but `pod-doctor` flags it (a login shell having jq doesn't put
   it on the agent process's PATH).
-- **A command sandbox.** When the agent's subprocesses can't reach the tmux socket (some
-  CI runners, containers, restricted shells), the deck automatically falls back to
-  filesystem-based coordination; `pod-doctor` confirms that tier is engaged and that the
-  seat carries the `POD_WINDOW` identity it needs. Seats spawned before that support
-  landed need one respawn to pick it up.
 
 ## Add your agent
 
@@ -292,6 +290,36 @@ single private per-user runtime tree. Paths, config, and the adapter catalog mee
 [docs/autonomy.md](docs/autonomy.md) for the FULL AUTO loop, and
 [docs/gotchas.md](docs/gotchas.md) for the hard-won tmux details a contributor should
 read before touching the status strip.
+
+## Running the checks
+
+The suite in `test/` is plain bash — no framework, no fixtures to install. Run one
+script, or all of them:
+
+```sh
+bash test/check-adapters.sh          # every adapter parses and has id + base_cmd
+bash test/lint-tmux-targets.sh       # no fuzzy-prefix-match session targets
+bash test/no-private-leaks.sh        # the tree carries no private identifiers (see below)
+bash test/check-safety-invariants.sh # isolation, locking, dispatch races (needs tmux)
+```
+
+`no-private-leaks.sh` **skips by default**: it scans for the patterns in
+`$POD_PRIVATE_PATTERNS` (default `~/.config/pod/private-patterns.txt`, one regex per
+line), and with no such file there is nothing to check. That file deliberately lives
+outside the repo — a denylist is a map of exactly what it hides, so publishing the terms
+would publish the inventory. If you maintain a fork with private identifiers to keep out
+of a public tree, write your list there and run `bash test/no-private-leaks.sh --require`
+before publishing, which fails rather than skips when the list is missing.
+
+Most need only `python3`; `check-safety-invariants.sh` and `parity-sandbox.sh` stand up
+a real tmux server, always on their own private `-L` socket, so they never touch a pod
+you have open. `check-model-policy.sh` wants `ripgrep` — one of its assertions is an
+`if rg ...` that silently passes when `rg` is missing.
+
+CI (`.github/workflows/ci.yml`) runs the same scripts on Linux and macOS on every push
+and pull request. The macOS leg is not redundant: these scripts are bash 3.2 safe and
+BSD/GNU portable deliberately, and only a macOS runner catches a GNU-only `stat -c` or
+`date` before it reaches a user.
 
 ## License
 

@@ -145,15 +145,13 @@ queue_resume_trigger() {  # durable mailbox first; guarded delivery wakes an idl
   [ -n "$mgrwin" ] || return 0
   agent_id="$("$T" show-options -w -t "$mgrwin" -qv @agent_id 2>/dev/null || true)"
   case "$agent_id" in ""|generic-shell) return 0 ;; esac
-  # pod-deliver rechecks @cc_state, rejects full-screen programs, waits for a stable
-  # pane, then submits. Forcing submit here is intentional: this is the one transition
-  # that must wake a paused manager, and the delivery gates make it safe while busy.
-  POD_DELIVER_SUBMIT=1 "$POD_BIN/pod-deliver" "$mgrwin" --mode submit >/dev/null 2>&1 || true
+  # A stable pane is not proof that its input buffer is empty: a human draft can sit
+  # unchanged indefinitely. FULL AUTO therefore asks pod-deliver for the adapter's
+  # stronger empty-placeholder proof. Unknown/changed TUIs stay mailbox-only and the
+  # native prompt hook resumes them on their next turn.
+  POD_DELIVER_SUBMIT=1 POD_DELIVER_REQUIRE_EMPTY=1 \
+    "$POD_BIN/pod-deliver" "$mgrwin" --mode submit >/dev/null 2>&1 || true
 }
-
-# every pod-auto action reads/writes tmux options (the @full_auto stamp, the pill,
-# the manager rename) — all need the socket. From a sandboxed seat, say so plainly.
-pod_require_socket "toggling FULL AUTO" || exit 1
 
 case "$ACTION" in
   status)

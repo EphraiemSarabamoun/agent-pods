@@ -16,6 +16,12 @@ Knox Greta Roman Stella Miles Clara Hugo Daisy Otis Willa Felix Lena Asa Romy Th
 Nina Gus Elsie Rex Bea Jonah Esme Arlo Mabel Dex Opal"
 
 # names already on a tab, plus the reserved manager name (space-padded for whole-word match).
+# NOTE this is a SNAPSHOT: the caller creates the window afterwards, so two concurrent
+# spawns read the same `used` set and can draw the same name out of ~60. There is no
+# lock to take here that would help (the window doesn't exist yet), so the duplicate is
+# resolved where tmux can actually arbitrate — pod-add-worker re-checks after
+# new-window and renames the loser to "<Name>-2". A caller that creates windows itself
+# (the MCP) needs the same post-creation check.
 used=" $POD_MANAGER_NAME $("$T" list-windows -t "$S" -F '#{window_name}' 2>/dev/null | tr '\n' ' ') "
 
 free=""

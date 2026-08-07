@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # uninstall.sh — undo what install.sh did, conservatively.
 #
-# Removes the bin/* symlinks this repo placed in ~/.local/bin (only links that actually
-# point back into THIS repo's bin/ are touched — a same-named link to something else is
-# left alone). Offers to remove the Claude Code and Codex lifecycle hooks. Your config in
-# ~/.config/pod (slots.json, config.sh) is LEFT INTACT unless you pass --purge.
+# Removes the bin/* symlinks and the modules/*/bin/* exec shims this repo placed in
+# ~/.local/bin (only entries that actually point back into THIS repo are touched — a
+# same-named link or script belonging to something else is left alone), and restores any
+# <name>.pre-agent-pods file install.sh moved aside to make room. Offers to remove the
+# Claude Code and Codex lifecycle hooks. Your config in ~/.config/pod (slots.json,
+# config.sh) is LEFT INTACT unless you pass --purge.
 #
 #   ./uninstall.sh                 remove symlinks, offer to remove lifecycle hooks
 #   ./uninstall.sh --remove-hooks  non-interactively remove Claude Code + Codex hooks
@@ -38,30 +40,67 @@ say()  { printf '%s\n' "$*"; }
 ok()   { printf '  ok    %s\n' "$*"; }
 warn() { printf '  warn  %s\n' "$*" >&2; }
 
-# --- remove symlinks that point into this repo's bin/ ----------------------------
-say "Removing command symlinks from $LOCAL_BIN"
+# --- remove the entries that point back into this repo ---------------------------
+say "Removing agent-pods commands from $LOCAL_BIN"
 removed=0
+restored=0
 if [ -d "$LOCAL_BIN" ]; then
-  # Walk the repo's bin/ for the names install.sh linked, including sourced _pod-*
-  # helpers, and remove a link only when
-  # it actually resolves back into THIS repo's bin — never a same-named foreign link.
-  for f in "$POD_BIN"/*; do
-    [ -f "$f" ] || continue
+  # Walk every name install.sh could have installed — the repo's bin/ (including the
+  # sourced _pod-* helpers) plus each optional module's bin/ — and remove an entry only
+  # when it actually points back into THIS repo, never a same-named foreign one.
+  for f in "$POD_BIN"/* "$REPO"/modules/*/bin/*; do
+    [ -f "$f" ] || continue                    # unmatched glob stays literal under set -u
     base="$(basename "$f")"
     link="$LOCAL_BIN/$base"
-    [ -L "$link" ] || continue
-    target="$(readlink "$link" 2>/dev/null || true)"
-    # resolve relative targets against the link's own directory before comparing
-    case "$target" in
-      /*) resolved="$target" ;;
-      *)  resolved="$LOCAL_BIN/$target" ;;
-    esac
-    if [ "$target" = "$f" ] || [ "$resolved" = "$f" ]; then
-      rm -f "$link" && removed=$((removed + 1))
+    ours=0
+    if [ -L "$link" ]; then
+      target="$(readlink "$link" 2>/dev/null || true)"
+      # resolve relative targets against the link's own directory before comparing
+      case "$target" in
+        /*) resolved="$target" ;;
+        *)  resolved="$LOCAL_BIN/$target" ;;
+      esac
+      if [ "$target" = "$f" ] || [ "$resolved" = "$f" ]; then ours=1; fi
+    elif [ -f "$link" ]; then
+      # Module commands are installed as exec shims, not symlinks (their bootstrap
+      # cannot survive a link — see install.sh step 4b). The generated marker line
+      # names the exact target, and we compare it literally, so we only ever delete a
+      # shim this repo wrote.
+      shim_target="$(head -n 8 "$link" 2>/dev/null | sed -n 's/^# agent-pods-shim: //p' | head -n 1)"
+      [ "$shim_target" = "$f" ] && ours=1
+    fi
+    [ "$ours" -eq 1 ] || continue
+    rm -f "$link" && removed=$((removed + 1))
+    # install.sh moves a colliding stranger aside as <name>.pre-agent-pods instead of
+    # destroying it; now that our entry is gone, put the original back where it was.
+    bak="$link.pre-agent-pods"
+    if { [ -e "$bak" ] || [ -L "$bak" ]; } && [ ! -e "$link" ] && [ ! -L "$link" ]; then
+      if mv "$bak" "$link" 2>/dev/null; then
+        restored=$((restored + 1))
+      else
+        warn "could not restore $base from $base.pre-agent-pods — it is still there"
+      fi
     fi
   done
 fi
-ok "removed $removed symlink(s)"
+# The manager-name launcher (install.sh step 4c) is named from your config, not from
+# the repo, so the walk above cannot have seen it. Resolve the same name and remove it
+# only when it is the shim we wrote — its marker names pod-launch literally.
+mgr_name="$( cfg="$CONFIG_DIR/config.sh"; [ -f "$cfg" ] && . "$cfg" >/dev/null 2>&1; printf '%s' "${POD_MANAGER_NAME:-}" )"
+case "$mgr_name" in
+  ""|manager|-*|.*|*[!A-Za-z0-9_-]*) : ;;
+  *)
+    link="$LOCAL_BIN/$mgr_name"
+    if [ -f "$link" ] && [ ! -L "$link" ]; then
+      shim_target="$(head -n 8 "$link" 2>/dev/null | sed -n 's/^# agent-pods-shim: //p' | head -n 1)"
+      if [ "$shim_target" = "$POD_BIN/pod-launch" ]; then
+        rm -f "$link" && { removed=$((removed + 1)); ok "removed the '$mgr_name' launcher"; }
+      fi
+    fi ;;
+esac
+
+ok "removed $removed command(s)"
+[ "$restored" -eq 0 ] || ok "restored $restored pre-existing command(s) from *.pre-agent-pods"
 
 # --- offer to remove lifecycle hooks ---------------------------------------------
 say ""

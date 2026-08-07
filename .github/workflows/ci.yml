@@ -1,0 +1,156 @@
+name: CI
+
+# The repo ships a real test suite that nothing ran. This wires it up.
+#
+# The matrix is deliberately two-platform: the scripts are bash 3.2 safe and
+# BSD/GNU portable ON PURPOSE (no `sed -i` without a suffix, no `readlink -f`,
+# no `stat -c` without a BSD fallback), and only a macOS leg actually exercises
+# that. A Linux-only CI would let a `stat -c` or a GNU-only `date` land green
+# and break every macOS user on the next release.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A public repo's CI needs no write scope; the checks only read the tree.
+permissions:
+  contents: read
+
+# Superseded runs on the same branch/PR are pointless spend.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      # Never cancel the other platform on one failure — a portability bug that
+      # only shows on one OS is exactly the signal this matrix exists to catch.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # check-install-modes.sh reads the git INDEX mode of bin/_* (100644), which
+      # is what a fresh clone gets; actions/checkout gives a real repo, so no
+      # extra fetch depth is needed here.
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # ripgrep is not optional here: check-model-policy.sh's last assertion
+          # ("bundled adapters must not ship a hardcoded model catalog") is an
+          # `if rg ...` whose command-not-found silently classifies as PASS. Without
+          # rg installed that check is a no-op that reports success.
+          sudo apt-get install -y --no-install-recommends tmux jq ripgrep
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # `brew install` on an already-present formula is noisy and can be
+          # non-zero on an outdated pin, so probe first and only install what's
+          # genuinely missing.
+          for f in tmux jq ripgrep; do
+            brew list --formula "$f" >/dev/null 2>&1 || brew install "$f"
+          done
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # >= 3.11 is a hard requirement: the adapter catalog parses TOML with
+          # tomllib, which is stdlib only from 3.11.
+          python-version: '3.12'
+
+      - name: Environment
+        run: |
+          # Printed unconditionally: nearly every CI-only failure in this suite is
+          # a tool-version difference, and this is the first thing to look at.
+          bash --version | head -1
+          tmux -V
+          jq --version
+          python3 --version
+          rg --version | head -1
+
+      - name: Run checks
+        run: |
+          set -u
+          # Run EVERY check even after one fails, then fail once at the end. A
+          # stop-at-first-failure loop hides the other nine results and turns a
+          # multi-fault CI run into a serial bisect.
+          #
+          # Cheap static checks first (seconds, no tmux) so an obvious lint or
+          # leak surfaces immediately; check-safety-invariants is last because it
+          # stands up a real tmux server and is by far the slowest.
+          #
+          # Not listed: test/parity-sandbox.sh — see the `parity` job below.
+          fails=""
+          for t in \
+            check-adapters \
+            lint-tmux-targets \
+            no-private-leaks \
+            check-install-modes \
+            check-model-policy \
+            check-context-emit \
+            check-primer \
+            test-adapter-discovery-timeout \
+            check-safety-invariants
+          do
+            printf '\n===== %s =====\n' "$t"
+            if bash "test/$t.sh"; then
+              printf -- '-> PASS  %s\n' "$t"
+            else
+              printf -- '-> FAIL  %s\n' "$t"
+              # bash 3.2 has no arrays worth the trouble here; a space-joined
+              # string is enough and expands safely under `set -u`.
+              fails="$fails $t"
+            fi
+          done
+          if [ -n "$fails" ]; then
+            printf '\nFAILED:%s\n' "$fails" >&2
+            exit 1
+          fi
+          printf '\nall checks passed\n'
+
+  # parity-sandbox.sh is the full end-to-end smoke: it launches real pods, renames
+  # them, docks the summary pane, and drives the queue. Valuable, but it is NOT a
+  # gating check, for one concrete reason: several of its assertions are races, not
+  # invariants. The rename section sleeps a fixed 0.8s and then asserts, while
+  # pod-launch wires the rename hook with `run-shell -b` (backgrounded) and
+  # pod-sync-pod-name writes its feed line LAST, after ~8 tmux round-trips and two
+  # python3 processes — measured at 0.80s-2.85s end to end. The docked-pane scroll
+  # checks sleep 0.2-0.25s against a 2s repaint tick. On a shared, loaded CI runner
+  # those lose more often than they win, so gating on it would paint correct commits
+  # red and train everyone to ignore the badge.
+  #
+  # So it runs, on one platform, advisory-only. When those fixed sleeps become
+  # bounded polls on the terminal condition, drop `continue-on-error` and fold this
+  # into the matrix above.
+  parity:
+    name: parity-sandbox (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tmux jq ripgrep
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run parity sandbox
+        run: bash test/parity-sandbox.sh

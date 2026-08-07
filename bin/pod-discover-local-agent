@@ -4,8 +4,10 @@
 Claude Code and Codex do not expose a non-interactive ``list-models`` command, but
 their local ``/model`` menus are the authoritative view of the models available to
 the currently authenticated account/provider.  This helper opens the installed CLI
-in a disposable tmux server, captures that menu, cancels without selecting anything,
-and emits tab-separated ``slug, label, launch value`` rows for pod-adapter.
+in a disposable tmux server, captures that menu, backs out without confirming
+anything, and emits tab-separated ``slug, label, launch value`` rows for pod-adapter.
+(Codex 0.144+ parks the ladder behind a quick chooser, so that one step is navigated
+into as well — see _codex_open_all_models. A model is still never confirmed.)
 
 No model names live in this file.  If the local agent cannot be queried safely, the
 command exits non-zero and pod-adapter offers only its inherited-default choice.
@@ -27,6 +29,17 @@ from pathlib import Path
 
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 NUMBERED = re.compile(r"^\s*(?:[❯›>]\s*)?(\d+)\.\s+(.+?)\s*$")
+SELECTED = re.compile(r"^\s*[❯›>]\s*\d+\.\s+")
+# A screen that has stopped changing and still doesn't match what we're waiting for is
+# a screen that never will (wrong CLI version, an onboarding/login wall, an update
+# prompt). Give up after this many seconds of a stable, non-empty screen instead of
+# burning the caller's whole deadline — that stall is paid on EVERY menu open.
+SETTLE_S = 5.0
+# Codex 0.144+ hides the model+effort ladder behind a quick chooser that carries the
+# SHORTER of these two titles, so the wait has to accept both and disambiguate.
+CODEX_LIST_TITLE = "Select Model and Effort"
+CODEX_CHOOSER_TITLE = "Select Model"
+CODEX_ALL_MODELS = "all models"
 
 
 def _clean(text: str) -> str:
@@ -38,13 +51,30 @@ def _slug(value: str) -> str:
     return value or "model"
 
 
-def _numbered_rows(screen: str) -> list[str]:
-    rows: list[str] = []
+def _numbered_entries(screen: str) -> list[tuple[int, str, bool]]:
+    """(number, text, is_selected) per numbered menu row, in screen order."""
+    rows: list[tuple[int, str, bool]] = []
     for line in _clean(screen).splitlines():
         match = NUMBERED.match(line)
         if match:
-            rows.append(match.group(2).strip())
+            rows.append((int(match.group(1)), match.group(2).strip(),
+                         bool(SELECTED.match(line))))
     return rows
+
+
+def _numbered_rows(screen: str) -> list[str]:
+    return [text for _, text, _ in _numbered_entries(screen)]
+
+
+def _menu_block(screen: str, title: str) -> str:
+    """The screen from the LAST occurrence of `title` onward.
+
+    These TUIs redraw in place inside a scrolling pane, so a naive whole-screen parse
+    can pick up rows from a menu frame that is no longer on screen.
+    """
+    cleaned = _clean(screen)
+    index = cleaned.rfind(title)
+    return cleaned[index:] if index >= 0 else ""
 
 
 def parse_claude(screen: str) -> list[tuple[str, str, str]]:
@@ -79,11 +109,12 @@ def parse_claude(screen: str) -> list[tuple[str, str, str]]:
 
 def parse_codex(screen: str) -> list[tuple[str, str, str]]:
     """Parse Codex's local ``Select Model and Effort`` menu."""
-    if "Select Model and Effort" not in _clean(screen):
+    block = _menu_block(screen, CODEX_LIST_TITLE)
+    if not block:
         return []
     out: list[tuple[str, str, str]] = []
     seen: set[str] = set()
-    for body in _numbered_rows(screen):
+    for body in _numbered_rows(block):
         left = re.split(r"\s{2,}", body, maxsplit=1)[0]
         model = re.sub(r"\s*\(current\)\s*$", "", left, flags=re.I).strip()
         if not model or any(ch.isspace() for ch in model):
@@ -109,13 +140,75 @@ def _capture(tmux: str, socket: str) -> str:
     return result.stdout if result.returncode == 0 else ""
 
 
-def _wait_for(tmux: str, socket: str, predicate, deadline: float) -> str:
+def _wait_for(tmux: str, socket: str, predicate, deadline: float,
+              settle: float = SETTLE_S) -> str:
+    """Poll until `predicate` accepts a screen; "" when it never does.
+
+    Bails out early once the screen has been non-empty and UNCHANGED for `settle`
+    seconds (see SETTLE_S): waiting out the full deadline on a settled screen is pure
+    dead time, and it is dead time the picker pays on every open.
+    """
+    previous, stable_since = None, 0.0
     while time.monotonic() < deadline:
         screen = _capture(tmux, socket)
         if predicate(screen):
             return screen
+        now = time.monotonic()
+        if screen != previous:
+            previous, stable_since = screen, now
+        elif screen.strip() and now - stable_since >= settle:
+            return ""
         time.sleep(0.2)
     return ""
+
+
+def _wait_stable(tmux: str, socket: str, deadline: float, quiet: float = 0.6) -> None:
+    """Block until the screen stops changing (or the deadline passes).
+
+    These TUIs re-render when their startup queries land — Codex's header flips from
+    "model: loading" to the resolved model — and input typed into that re-render is
+    dropped on the floor. That is the observed cause of a ``/model`` that submits but
+    never opens a menu, so wait for the paint to settle before typing.
+    """
+    previous, since = None, time.monotonic()
+    while time.monotonic() < deadline:
+        screen = _capture(tmux, socket)
+        now = time.monotonic()
+        if screen != previous:
+            previous, since = screen, now
+        elif now - since >= quiet:
+            return
+        time.sleep(0.2)
+
+
+def _send(tmux: str, socket: str, env: dict, *keys: str) -> None:
+    subprocess.run([tmux, "-L", socket, "send-keys", "-t", "models:0.0", *keys],
+                   env=env, timeout=2, check=True)
+
+
+def _codex_open_all_models(tmux: str, socket: str, env: dict, screen: str,
+                           deadline: float) -> str:
+    """Step past Codex 0.144+'s quick chooser onto the real model+effort ladder.
+
+    ``/model`` used to open the ladder directly; it now opens a two-row chooser
+    (``codex-auto-review`` / ``All models``) that shares the ladder's title prefix, so
+    discovery waited for a string that never appeared and failed after the full
+    timeout. Move onto the "All models" row EXPLICITLY rather than pressing Enter on
+    whatever is highlighted — a blind Enter would confirm the other row. Nothing is
+    confirmed on the ladder itself; the caller escapes back out of both levels.
+    """
+    if CODEX_LIST_TITLE in _clean(screen):
+        return screen                       # pre-0.144 layout: already the ladder
+    rows = _numbered_entries(_menu_block(screen, CODEX_CHOOSER_TITLE))
+    target = next((n for n, text, _ in rows
+                   if text.lower().startswith(CODEX_ALL_MODELS)), 0)
+    current = next((n for n, _, selected in rows if selected), 0)
+    if not target or not current:
+        return ""                           # unrecognised chooser: don't guess keys
+    for _ in range(abs(target - current)):
+        _send(tmux, socket, env, "Down" if target > current else "Up")
+    _send(tmux, socket, env, "Enter")
+    return _wait_for(tmux, socket, lambda s: CODEX_LIST_TITLE in _clean(s), deadline)
 
 
 def discover(agent: str, timeout: float) -> str:
@@ -127,7 +220,7 @@ def discover(agent: str, timeout: float) -> str:
     socket = f"agent-pods-models-{os.getuid()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     env = dict(os.environ)
     # Never let discovery masquerade as a seat in the caller's real pod.
-    for key in ("TMUX", "TMUX_PANE", "POD_SESSION", "POD_WINDOW", "POD_ROLE", "POD_AGENT_ID"):
+    for key in ("TMUX", "TMUX_PANE", "POD_SESSION"):
         env.pop(key, None)
     home = str(Path.home())
     if agent == "claude-code":
@@ -150,7 +243,10 @@ def discover(agent: str, timeout: float) -> str:
             return "OpenAI Codex" in cleaned and "/model to change" in cleaned
 
         def menu(screen):
-            return "Select Model and Effort" in _clean(screen)
+            # Accept EITHER layout: 0.144+ opens a quick chooser first, and both it
+            # and the ladder start with this title. _codex_open_all_models sorts out
+            # which one we landed on.
+            return CODEX_CHOOSER_TITLE in _clean(screen)
 
     deadline = time.monotonic() + timeout
     try:
@@ -167,38 +263,51 @@ def discover(agent: str, timeout: float) -> str:
         screen = _wait_for(tmux, socket, ready, deadline)
         if not screen or "Update available!" in _clean(screen):
             raise RuntimeError("agent did not reach a safe input prompt")
-        subprocess.run(
-            [tmux, "-L", socket, "send-keys", "-t", "models:0.0", "-l", "/model"],
-            env=env,
-            timeout=2,
-            check=True,
-        )
-        # As with task dispatch, give the TUI one render tick to register literal
-        # input before submitting it. Without this gap Codex can leave `/model`
-        # visibly buffered even though tmux accepted the following Enter.
-        time.sleep(0.15)
         # Codex 0.144.x treats a literal C-m differently inside its TUI; tmux's
         # named Enter key opens the menu reliably. Claude Code accepts C-m and
         # retaining it avoids changing its already-proven discovery path.
         submit_key = "Enter" if agent == "codex" else "C-m"
-        subprocess.run(
-            [tmux, "-L", socket, "send-keys", "-t", "models:0.0", submit_key],
-            env=env,
-            timeout=2,
-            check=True,
-        )
-        screen = _wait_for(tmux, socket, menu, deadline)
+        # RETRY the open: a dropped keystroke (see _wait_stable) is intermittent, and
+        # one dropped /model used to sink the whole discovery — which the picker then
+        # re-paid on every open. Each attempt fails fast on a settled screen instead
+        # of holding the shared deadline.
+        screen = ""
+        for attempt in range(3):
+            if attempt:
+                # Best-effort clear, so a "/model" that was typed but swallowed cannot
+                # combine with the retry into a line that gets submitted as a PROMPT.
+                _send(tmux, socket, env, "C-u")
+            # Cap the settle wait: a TUI with a permanent spinner never goes quiet,
+            # and letting it eat the shared deadline would leave nothing for the
+            # retries this loop exists to make.
+            _wait_stable(tmux, socket, min(deadline, time.monotonic() + 3))
+            _send(tmux, socket, env, "-l", "/model")
+            # As with task dispatch, give the TUI one render tick to register literal
+            # input before submitting it. Without this gap Codex can leave `/model`
+            # visibly buffered even though tmux accepted the following Enter.
+            time.sleep(0.15)
+            _send(tmux, socket, env, submit_key)
+            screen = _wait_for(tmux, socket, menu,
+                               min(deadline, time.monotonic() + 8), settle=2.0)
+            if screen or time.monotonic() >= deadline:
+                break
         if not screen:
             raise RuntimeError("local /model menu did not appear")
+        if agent == "codex":
+            screen = _codex_open_all_models(tmux, socket, env, screen, deadline)
+            if not screen:
+                raise RuntimeError("local model list did not open")
         # Escape first, then tear down the disposable server. No default or
-        # session-only selection is ever confirmed.
-        subprocess.run(
-            [tmux, "-L", socket, "send-keys", "-t", "models:0.0", "Escape"],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=2,
-        )
+        # session-only selection is ever confirmed. Codex gets a second Escape
+        # because we may be two menus deep (ladder -> chooser -> prompt).
+        for _ in range(2 if agent == "codex" else 1):
+            subprocess.run(
+                [tmux, "-L", socket, "send-keys", "-t", "models:0.0", "Escape"],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
         return screen
     finally:
         subprocess.run(
@@ -208,6 +317,49 @@ def discover(agent: str, timeout: float) -> str:
             stderr=subprocess.DEVNULL,
             timeout=2,
         )
+        _sweep_sockets(env, socket)
+
+
+# tmux resolves its socket dir as $TMUX_TMPDIR (else /tmp) + /tmux-<uid>.
+SOCKET_PREFIX = "agent-pods-models-"
+# A discovery server outlives its run by seconds at most (the caller's timeout_s is
+# 35s at the high end), so anything this old is provably abandoned.
+STALE_SOCKET_S = 3600.0
+
+
+def _socket_dir(env: dict) -> str:
+    return os.path.join(env.get("TMUX_TMPDIR") or "/tmp", "tmux-%d" % os.getuid())
+
+
+def _sweep_sockets(env: dict, own: str) -> None:
+    """Drop OUR socket, plus any long-abandoned sibling discovery socket.
+
+    ``kill-server`` normally unlinks the socket itself, but a run killed hard leaves
+    the file behind — pod-adapter's discovery timeout SIGKILLs the whole process group,
+    which skips this cleanup entirely. Discovery runs on every cache miss, so the
+    orphans accumulate (174 of them on the machine this was written against). The age
+    floor is what makes the sweep safe: it can never touch a concurrent discovery's
+    live socket, and only this helper's own uniquely-prefixed names are considered.
+    """
+    directory = _socket_dir(env)
+    try:
+        os.unlink(os.path.join(directory, own))
+    except OSError:
+        pass
+    now = time.time()
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(SOCKET_PREFIX):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            if now - os.stat(path).st_mtime > STALE_SOCKET_S:
+                os.unlink(path)
+        except OSError:
+            pass
 
 
 def main() -> int:

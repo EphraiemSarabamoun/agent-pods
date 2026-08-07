@@ -53,6 +53,14 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 0' INT TERM HUP
 
+# Registry hygiene cadence (in poll cycles). An agent that exits on its own (Ctrl-D,
+# /exit, a crash) closes its window with no hook, so its workers.json row survives —
+# and nothing else prunes between launches (pod-launch prunes once, at pod creation).
+# A stale row is invisible to the live roster but still addressable by every registry
+# consumer (the queue's dispatch/poll, the MCP), so this poller settles it.
+PRUNE_EVERY=20
+prune_tick=0
+
 while :; do
   # pods are identified by their @is_pod stamp (not a name regex — pods are city-named).
   pods=""
@@ -65,70 +73,6 @@ while :; do
   for s in $pods; do
     while IFS='|' read -r wid wname _cmd; do
       [ -n "$wid" ] || continue
-
-      # ---- mirror reconciliation (sandboxed hook agents) --------------------------
-      # A per-window mirror file exists ONLY when the seat's own hooks run with the
-      # tmux socket connect-blocked (command sandbox) — they write files instead of
-      # set-option, and THIS poller (unsandboxed, it lives outside the agent) applies
-      # them onto the real tmux options. Everything downstream (strip, roster,
-      # badges, pod-deliver's native-delivery gate) then behaves exactly as if the
-      # seat had stamped itself. A window with a mirror is by definition a
-      # hook-parity agent: apply + skip the content-hash inference entirely.
-      mf="$POD_STATE/mirror/$(pod_path_component "$s")/$wid"
-      if [ -f "$mf" ]; then
-        mstate=""; mts=""; maid=""
-        read -r mstate mts maid < "$mf" 2>/dev/null
-        if [ -n "$mstate" ]; then
-          cur="$("$T" show-options -w -t "$wid" -qv @cc_state 2>/dev/null)"
-          if [ "$cur" != "$mstate" ]; then
-            "$T" set-option -w -t "$wid" @cc_state    "$mstate"            2>/dev/null || true
-            "$T" set-option -w -t "$wid" @state_since "${mts:-$(date +%s)}" 2>/dev/null || true
-            touched=1
-            # journal the transition on the seat's behalf (its own pod-brief refresh
-            # can't list windows without the socket) — same line shape pod-brief uses.
-            jdir="$POD_COMMS/$(pod_path_component "$s")"
-            if mkdir -p "$jdir" 2>/dev/null; then
-              hl=""
-              [ -f "$mf.work" ] && hl="$(cut -f2 "$mf.work" 2>/dev/null | head -1)"
-              [ -z "$hl" ] && [ -f "$mf.last" ] && hl="$(cut -f2 "$mf.last" 2>/dev/null | head -1)"
-              printf '[%s] %s · %s · %s\n' "$(date +%H:%M)" "$wname" "$mstate" "${hl:-…}" \
-                >> "$jdir/journal.md" 2>/dev/null || true
-            fi
-          fi
-          # one-time identity stamps the sandboxed SessionStart hook couldn't apply
-          if [ "$("$T" show-options -w -t "$wid" -qv @state_source 2>/dev/null)" != "file" ]; then
-            "$T" set-option -w -t "$wid" @state_source        "file"                    2>/dev/null || true
-            "$T" set-option -w -t "$wid" @agent_id            "${maid:-claude-code}"    2>/dev/null || true
-            "$T" set-option -w -t "$wid" @pod_native_delivery 1                         2>/dev/null || true
-          fi
-          # work/last mirrors -> the roster's on:/last: lines and headline fallbacks
-          if [ -f "$mf.work" ]; then
-            wts="$(cut -f1 "$mf.work" 2>/dev/null | head -1)"
-            if [ "$wts" != "$("$T" show-options -w -t "$wid" -qv @work_at 2>/dev/null)" ]; then
-              "$T" set-option -w -t "$wid" @work    "$(cut -f2 "$mf.work" 2>/dev/null | head -1)" 2>/dev/null || true
-              "$T" set-option -w -t "$wid" @work_at "$wts" 2>/dev/null || true
-            fi
-          fi
-          if [ -f "$mf.last" ]; then
-            lts="$(cut -f1 "$mf.last" 2>/dev/null | head -1)"
-            if [ "$lts" != "$("$T" show-options -w -t "$wid" -qv @last_at 2>/dev/null)" ]; then
-              "$T" set-option -w -t "$wid" @last    "$(cut -f2 "$mf.last" 2>/dev/null | head -1)" 2>/dev/null || true
-              "$T" set-option -w -t "$wid" @last_at "$lts" 2>/dev/null || true
-              tpv="$(cut -f3 "$mf.last" 2>/dev/null | head -1)"
-              [ -n "$tpv" ] && "$T" set-option -w -t "$wid" @transcript "$tpv" 2>/dev/null || true
-            fi
-          fi
-          # badge self-heal: the sandboxed reader drained its mailbox but couldn't
-          # clear the pill (set-option needs the socket). Empty mailbox + lit badge
-          # -> clear it here.
-          if [ -n "$("$T" show-options -w -t "$wid" -qv @unread 2>/dev/null)" ] \
-             && [ ! -s "$POD_COMMS/$(pod_path_component "$s")/$wid.mbox" ]; then
-            "$T" set-option -uw -t "$wid" @unread 2>/dev/null || true
-            touched=1
-          fi
-          continue
-        fi
-      fi
 
       # identify (cached; cheap re-detect when the pane command is unchanged).
       "$POD_BIN/pod-detect" "$wid" >/dev/null 2>&1 || true
@@ -184,14 +128,28 @@ print(mod + "|" + eff)
       if [ "$st" = "idle" ]; then
         ( "$POD_BIN/pod-deliver" "$wid" >/dev/null 2>&1 & )
         ( "$POD_BIN/pod-star" --deliver-pending "$wid" "$s" >/dev/null 2>&1 & )
-        # this (non-hook) agent is idle = caught up; clear its red unread pill (hook
-        # agents clear theirs via pod-mail-check at their next prompt instead).
-        "$T" set-option -uw -t "$wid" @unread 2>/dev/null || true
+        # Clear the red unread pill only once the mailbox is actually EMPTY — idle is
+        # not "caught up". The pod-deliver fired above is backgrounded and independent:
+        # it can decline (pane in less/vim/git, screen still moving) and the mail stays
+        # unread. Clearing on idle alone erased, within one poll interval, the only cue
+        # a hook-less seat has that mail is waiting.
+        [ -s "$POD_COMMS/$(pod_path_component "$s")/$wid.mbox" ] || \
+          "$T" set-option -uw -t "$wid" @unread 2>/dev/null || true
       fi
     done <<EOF
 $("$T" list-windows -t "$s" -F '#{window_id}|#{window_name}|#{pane_current_command}' 2>/dev/null)
 EOF
   done
   [ "$touched" = "1" ] && "$T" refresh-client -S 2>/dev/null || true
+
+  # ~PRUNE_EVERY×INTERVAL seconds: drop registry rows whose window is gone (one cheap
+  # tmux probe per registered worker, and only every 20th cycle, so the 3s loop is
+  # unaffected).
+  prune_tick=$((prune_tick + 1))
+  if [ "$prune_tick" -ge "$PRUNE_EVERY" ]; then
+    prune_tick=0
+    [ -f "$POD_STATE/workers.json" ] && \
+      "$POD_BIN/pod-workers-json" --path "$POD_STATE/workers.json" prune "$T" >/dev/null 2>&1 || true
+  fi
   sleep "$INTERVAL"
 done

@@ -28,16 +28,38 @@ to="${1:-}"; shift || true
 msg="$*"
 { [ -n "$to" ] && [ -n "$msg" ]; } || { echo "usage: pod-tell <name|@id|chat|all> <message>"; exit 1; }
 
+# Cap the body BEFORE it is appended. O_APPEND only makes a SINGLE write(2) atomic;
+# a multi-KB `echo` flushes through stdio in several writes, so two concurrent senders
+# splice their bytes inside one "line" and the mailbox/channel.log stop being
+# line-per-message (measured: clean at 4 KB and 8 KB, interleaved from ~16 KB up).
+# Agent-to-agent traffic hits that size easily (a diff, a stack trace, a file dump).
+POD_TELL_MAX="${POD_TELL_MAX:-4000}"
+case "$POD_TELL_MAX" in ''|*[!0-9]*) POD_TELL_MAX=4000 ;; esac
+if [ "${#msg}" -gt "$POD_TELL_MAX" ]; then
+  msg="${msg:0:$POD_TELL_MAX}…(truncated at $POD_TELL_MAX chars — send a path, not a dump)"
+fi
+# Collapse control characters to a single line. Both the sender name and the body are
+# attacker-reachable (a window can rename itself; a body can be relayed untrusted text
+# — a web page, a log excerpt, a PR description), and one newline in either forges a
+# whole extra message attributed to a podmate inside another agent's context.
+msg="$(pod_msg_oneline "$msg")"
+
 # --- sender: ONE combined display-message ---
-me="?"; me_id=""; sess="${POD_SESSION:-$POD_SESSION_PREFIX}"
+me="?"; me_id=""; sess=""
 pane="${TMUX_PANE:-}"
 if [ -n "$pane" ]; then
   meta="$("$T" display-message -p -t "$pane" '#{window_name}|#{window_id}|#{session_name}' 2>/dev/null)"
   IFS='|' read -r r_me r_id r_sess <<<"$meta"
-  [ -n "$r_me" ]   && me="$r_me"
+  [ -n "$r_me" ]   && me="$(pod_msg_oneline "$r_me")"
   [ -n "$r_id" ]   && me_id="$r_id"
   [ -n "$r_sess" ] && sess="$r_sess"
 fi
+# No live answer: POD_SESSION is a spawn-time snapshot, and a pod RENAME migrates the
+# comms subtree out from under it while this pane keeps the old value forever — so
+# resolve it through the rename trail instead of depositing mail in a directory the pod
+# has moved away from (and that the next launch sweeps).
+[ -n "$sess" ] || sess="$(pod_resolve_stale_pod "${POD_SESSION:-$POD_SESSION_PREFIX}")"
+[ -n "$me" ] || me="?"                 # a name that was pure control characters
 MAILDIR="$(pod_dir_for "$sess")"; CHAN="$(pod_chan_for "$sess")"
 mkdir -p "$MAILDIR" || { echo "pod-tell: cannot create mail dir $MAILDIR"; exit 1; }
 ts="$(date +%H:%M)"
@@ -45,34 +67,6 @@ ts="$(date +%H:%M)"
 # --- pod window table: ONE list-windows. Exact-match (=) so a sibling pod whose name
 # is a prefix can't leak in. ---
 TABLE="$("$T" list-windows -t "=$sess" -F '#{window_id}|#{window_name}' 2>/dev/null)"
-
-# Command sandbox: socket blocked -> sending is pure FILE work (mbox appends), only
-# the window table and self-identity came from the socket. Rebuild both from the
-# registry (workers.json + tmux_group.json). Badges/nudges degrade (the poller and
-# each recipient's own pod-mail-check are the backstop); delivery itself is intact.
-if [ -z "$TABLE" ] && ! pod_socket_ok && command -v python3 >/dev/null 2>&1; then
-  TABLE="$(python3 - "$POD_STATE/workers.json" "$POD_STATE/tmux_group.json" "$sess" "$POD_MANAGER_NAME" <<'PY' 2>/dev/null
-import json, sys
-wpath, gpath, sess, mgrname = sys.argv[1:5]
-def load(p):
-    try:
-        return json.load(open(p))
-    except Exception:
-        return {}
-g = load(gpath)
-if (g.get("pod") or g.get("session")) == sess and g.get("manager_window"):
-    print("%s|%s" % (g["manager_window"], mgrname))
-for w in load(wpath).get("workers", []) or []:
-    if isinstance(w, dict) and w.get("tmux_session") == sess and w.get("tmux_window"):
-        print("%s|%s" % (w["tmux_window"], w.get("label") or w["tmux_window"]))
-PY
-)"
-  if [ -z "$me_id" ] && [ -n "${POD_WINDOW:-}" ]; then
-    me_id="$POD_WINDOW"
-    n_me="$(printf '%s\n' "$TABLE" | awk -F'|' -v id="$me_id" '$1==id{print $2; exit}')"
-    [ -n "$n_me" ] && me="$n_me" || me="${POD_AGENT_ID:-$me}"
-  fi
-fi
 
 # --- resolve targets from the snapshot ---
 disp="$to"; targets=""

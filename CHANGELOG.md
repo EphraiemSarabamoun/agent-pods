@@ -1,6 +1,64 @@
 # Changelog
 
-## Operator primer, memory, and sandbox notices
+## The leak guard stops publishing its own denylist, and your manager gets a launcher
+
+- **`test/no-private-leaks.sh` no longer carries the private terms.** The guard exists so
+  no name, path, host or persona from a private upstream tree can be dragged into this
+  one — but it did that by hardcoding the list of terms, in a public file, in a public
+  repo. A denylist is a map of exactly what it is hiding, so the guard was publishing the
+  inventory it protects: usernames, home paths, machine names, private repo names. The
+  mechanism stays here; the terms move out. It now reads one regex per line from
+  `$POD_PRIVATE_PATTERNS` (default `~/.config/pod/private-patterns.txt`) and **skips,
+  exit 0, when there is no such file** — a fork has no private identifiers of ours to
+  leak, so there is nothing to check, and CI stays green without shipping a wordlist.
+  `--require` inverts that for the pre-publish run, where a silent skip is the dangerous
+  case: no patterns configured is then a failure, not a pass. The scan itself is
+  unchanged (same paths, same LICENSE-copyright exemption, still case-insensitive).
+
+- **`POD_MANAGER_NAME` now installs a launcher by that name.** Name the manager seat
+  `Hermes` and `install.sh` puts a `hermes` command on your `PATH` that opens or attaches
+  a pod, identical to `pod-launch` (`hermes mypod` targets one) — the deck answers to
+  whatever you call it. The name comes from your local config at install time, so nothing
+  persona-specific enters the repo. Claimed only when free: if any command already answers
+  to that name anywhere on `PATH`, the installer warns and leaves both alone rather than
+  shadowing it, since a name you chose is trivial to change. Names with spaces or shell
+  metacharacters are skipped, as are collisions with an existing `pod-*` command.
+  `uninstall.sh` removes it, matching only the shim it wrote.
+
+## Continuous integration, and two doc corrections
+
+- **CI (`.github/workflows/ci.yml`).** The test suite existed but nothing ran it. A
+  push/PR workflow now runs nine checks — `check-adapters`, `lint-tmux-targets`,
+  `no-private-leaks`, `check-install-modes`, `check-model-policy`,
+  `check-context-emit`, `check-primer`, `test-adapter-discovery-timeout`,
+  `check-safety-invariants` — on **both**
+  `ubuntu-latest` and `macos-latest`. The macOS leg is the point, not padding: the
+  scripts are bash 3.2 safe and BSD/GNU portable on purpose, and only a macOS runner
+  catches a `stat -c` or a GNU-only `date` before it ships. The step runs every check
+  and fails once at the end, so one red run reports all faults instead of only the
+  first. `ripgrep` is installed deliberately — `check-model-policy.sh`'s
+  "no hardcoded model catalog" assertion is an `if rg ...` that silently *passes* when
+  `rg` is missing, so without it that check was a no-op reporting success.
+- **`parity-sandbox.sh` runs advisory-only, in its own job.** Several of its assertions
+  are races rather than invariants (the rename section sleeps a fixed 0.8s while the
+  `session-renamed` hook is backgrounded with `run-shell -b` and writes its feed line
+  last, measured at 0.80s–2.85s end to end; the docked-pane scroll checks sleep
+  0.2–0.25s against a 2s repaint tick). Gating on it would paint correct commits red on
+  a loaded shared runner. Once those fixed sleeps become bounded polls on the terminal
+  condition, drop `continue-on-error` and fold it into the matrix.
+- **`config/config.sh.example` no longer points at a file that does not exist.** Line 4
+  advertised `~/.config/pod/slots.toml`; nothing in the project reads that path, and
+  `install.sh` copies this file verbatim to `~/.config/pod/config.sh`, so the wrong name
+  was planted in every installation. The real files are `adapters/*.toml` (overridable
+  at `~/.config/pod/adapters/*.toml`) for the catalog and `~/.config/pod/slots.json`,
+  seeded by `install.sh` and edited via `⚙`, for the ten quick-pick slots.
+- **`docs/keybindings.md` no longer claims `j`/`k` scroll the docked chat.** The table
+  grouped them with the arrow keys as mode-dependent, but only the arrow branch in
+  `bin/pod-summary` is guarded on pane mode; `j`/`k` move the roster card cursor in both
+  modes. The row is now split, so the chat-scroll keys a reader reaches for (arrows,
+  wheel, `u`/`d`) are the ones that actually scroll.
+
+## Operator primer and memory
 
 - **Operator primer.** At each seat's session start, `pod-primer` injects a concise,
   role-gated primer (as `additionalContext`, like the journal): a manager seat gets
@@ -11,47 +69,8 @@
 - **Operator memory.** `pod-remember "<lesson>"` appends to a durable, cross-session
   file (`~/.config/pod/operator-memory.md`) that `pod-primer` injects into every seat
   you spawn afterward — distinct from `pod-note`, which is one pod's ephemeral journal.
-- **Proactive sandbox notice.** When a seat's tmux socket is blocked (a command
-  sandbox), `pod-primer` tells the agent up front which pod features work from that
-  seat (reads + comms, via files) and which are blocked (deck changes).
-- **Reactive sandbox notice.** `pod_require_socket` makes the deck-changing commands
-  (`pod-add-worker`, `pod-kill-worker`, `pod-auto`) fail with a clear "blocked in this
-  command sandbox — here's what still works" message instead of a cryptic tmux error.
-  Read/exchange commands stay silent; the normal (socket-reachable) path is unchanged.
-- `test/check-primer.sh` covers role selection, memory injection, both notices, and
-  that the normal path stays silent.
-
-## Sandboxed-seat support: the tmux socket is an upgrade, files are the truth
-
-Some environments run the agent's subprocesses in a command sandbox that denies
-unix-socket connect (Claude Code's command sandbox, CI runners, containers). There
-the tmux client→server socket is unreachable from hook subprocesses (`connect()` →
-EPERM) while the deck itself renders fine — agents sat blind and mute in a healthy-
-looking pod. Every fallback gates on ONE probe (`pod_socket_ok`, memoized per
-process): socket reachable → byte-for-byte today's behavior; socket blocked → files.
-
-- **Identity as environment.** `pod-worker-bootstrap` and `pod-launch` export
-  `POD_WINDOW` + `POD_AGENT_ID` into every seat from the (unsandboxed) pane shell.
-  `pod-state`, `pod-mail-check`, `pod-work`, `pod-last`, `pod-brief`, and `pod-tell`
-  resolve self-identity socket-first, env-fallback.
-- **File-backed roster.** `bin/pod` rebuilds the roster from `workers.json` +
-  `tmux_group.json` (+ mirror state) when — and only when — the socket connect
-  fails, same `instance(s):` shape, so the awareness hook injects a real roster.
-- **Mirror files + reconciler.** Sandboxed hooks write per-window state/work/last to
-  `$POD_STATE/mirror/<pod>/<win>*`; the unsandboxed `pod-foreign-state` poller
-  applies them onto the real tmux options (and journals transitions, heals stale
-  unread pills). The strip/roster/badge render paths are completely untouched —
-  data flows agent → file → poller → tmux, never sandboxed-agent → socket.
-- **Journal-delta awareness.** Under a blocked socket `pod-brief refresh` emits new
-  journal lines (per-reader cursor) instead of the live-window delta it can't take.
-- **Sending works too.** `pod-tell` from a sandboxed seat rebuilds the recipient
-  table from the registry; mbox deposits are pure file appends.
-- **Accepted degradation** (documented in docs/gotchas.md): `send-keys` delivery to
-  non-hook seats needs the socket and stays unavailable in sandboxes; dots/badges
-  lag up to one poller tick (~3s) instead of flipping instantly.
-- `pod-doctor` probes the socket first and names this state explicitly;
-  `test/check-sandbox-fallback.sh` runs the acceptance tests against a blocked-socket
-  stub and guards the normal path stays socket-driven.
+- `test/check-primer.sh` covers role selection, memory injection, the `POD_PRIMER=0`
+  kill switch, and silence outside a stamped pod.
 
 ## Context injection hardening + pod-doctor
 

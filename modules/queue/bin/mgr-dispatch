@@ -23,7 +23,7 @@
 
 set -euo pipefail
 POD_BIN="$(cd "$(dirname "$0")/../../../bin" && pwd)"; . "$POD_BIN/_pod-paths.sh"
-. "$POD_BIN/_mgr-runtime.sh"    # mgr_current_pod, mgr_manager_window (+ _pod-common.sh)
+. "$POD_BIN/_mgr-runtime.sh"    # mgr_current_pod, mgr_manager_window, mgr_full_auto (+ _pod-common.sh)
 T="$POD_TMUX"
 
 INBOX_ROOT="$POD_INBOX"
@@ -133,6 +133,18 @@ if [ -n "$TMUX_WINDOW" ]; then
   esac
   R_TMUX_WIN="$TMUX_WINDOW"
 else
+  # FULL AUTO gate. mgr-pick-next checks the switch too, but it is only a convenience
+  # wrapper — THIS is the command that claims a worker and types into its pane, so the
+  # human-authority switch has to be enforced here or a bare `mgr-dispatch` walks
+  # straight around it. Scope matches what pod-auto documents: MANUAL disables
+  # automatic worker-PICKING only, so an explicit --tmux-window (a deliberate act)
+  # stays allowed, and so does an empty-queue no-op or a ghost quarantine above —
+  # those repair state without dispatching anything. mgr_pod_auto_state fails OPEN
+  # for non-pods, so plain tmux sessions and headless seats never notice the gate.
+  mgr_full_auto "$CURRENT_POD" || {
+    echo "ERROR: FULL AUTO is OFF for pod '${CURRENT_POD}' — pass --tmux-window <@id> to dispatch by hand (or: pod-auto on)" >&2
+    exit 1
+  }
   for cand in $(jq -r '[.workers[] | select(.status=="idle")] | sort_by(.registered_at) | .[].tmux_window // empty' "$WORKERS_PATH" 2>/dev/null); do
     [ -n "$cand" ] || continue
     [ "$cand" = "$MGR_WIN" ] && continue
@@ -188,6 +200,7 @@ fi
 # old idle snapshot and interrupting the same worker.
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 STARTED_EPOCH=$(date +%s)
+CLAIM_TOKEN="${STARTED_EPOCH}-$$-${RANDOM:-0}"
 CLAIMED=0
 ARCHIVED=0
 TRIGGER_TYPED=0
@@ -201,6 +214,12 @@ ARCHIVE_FILE=""
 rollback_unsubmitted_dispatch() {
   [ "$CLAIMED" -eq 1 ] || return 0
   [ "$TRIGGER_SUBMITTED" -eq 0 ] || return 0
+  # Recovery may already have fenced this claim as delivery-uncertain. In that
+  # case touching either the pane input or the archive could race a human/manual
+  # resolution, so the stale dispatcher must stop without side effects.
+  "$WORKERS_UPDATE" --path "$WORKERS_PATH" check-claim \
+    "$R_TMUX_WIN" "$CURRENT_POD" "$TASK_ID" "$CLAIM_TOKEN" \
+    >/dev/null 2>&1 || return 0
   if [ "$TRIGGER_TYPED" -eq 1 ]; then
     "$T" send-keys -t "$R_TMUX_WIN" C-u >/dev/null 2>&1 || true
   fi
@@ -208,12 +227,13 @@ rollback_unsubmitted_dispatch() {
     mv "$ARCHIVE_FILE" "$QUEUE_FILE" >/dev/null 2>&1 || true
   fi
   "$WORKERS_UPDATE" --path "$WORKERS_PATH" release \
-    "$R_TMUX_WIN" "$CURRENT_POD" "$TASK_ID" >/dev/null 2>&1 || true
+    "$R_TMUX_WIN" "$CURRENT_POD" "$TASK_ID" "$CLAIM_TOKEN" >/dev/null 2>&1 || true
 }
 trap rollback_unsubmitted_dispatch EXIT
 trap 'exit 130' HUP INT TERM
 
-"$WORKERS_UPDATE" --path "$WORKERS_PATH" claim "$R_TMUX_WIN" "$CURRENT_POD" "$TASK_ID" "$NOW" || {
+"$WORKERS_UPDATE" --path "$WORKERS_PATH" claim \
+  "$R_TMUX_WIN" "$CURRENT_POD" "$TASK_ID" "$NOW" "$STARTED_EPOCH" "$CLAIM_TOKEN" || {
   echo "ERROR: ${R_TMUX_WIN} was claimed by another dispatcher" >&2
   exit 1
 }
@@ -221,6 +241,8 @@ CLAIMED=1
 # Move the queue record to its in-flight archive BEFORE sending. The rename is the
 # atomic task claim: if two dispatchers selected the same queue file, exactly one move
 # succeeds and the loser frees its worker without ever typing the trigger.
+"$WORKERS_UPDATE" --path "$WORKERS_PATH" check-claim \
+  "$R_TMUX_WIN" "$CURRENT_POD" "$TASK_ID" "$CLAIM_TOKEN" >/dev/null
 mkdir -p "$DISPATCHED"
 ARCHIVE_FILE="${DISPATCHED}/${TASK_ID}.json"
 if ! mv "$QUEUE_FILE" "$ARCHIVE_FILE"; then
@@ -228,19 +250,49 @@ if ! mv "$QUEUE_FILE" "$ARCHIVE_FILE"; then
   exit 1
 fi
 ARCHIVED=1
+# Recovery may have fenced a long-paused dispatcher immediately after its pre-move
+# claim check. If so, put back the record we just moved before exiting. A SIGKILL in
+# this tiny gap is handled by mgr-poll's queued-archive orphan recovery.
+if ! "$WORKERS_UPDATE" --path "$WORKERS_PATH" check-claim \
+    "$R_TMUX_WIN" "$CURRENT_POD" "$TASK_ID" "$CLAIM_TOKEN" >/dev/null 2>&1; then
+  if mv "$ARCHIVE_FILE" "$QUEUE_FILE" >/dev/null 2>&1; then
+    ARCHIVED=0
+  fi
+  echo "ERROR: dispatch claim was fenced before archive commit" >&2
+  exit 1
+fi
 
 # Record the pre-delivery transaction durably. If this process is SIGKILLed, a later
 # mgr-poll can distinguish a stale half-dispatch from an ordinary in-flight task.
 archive_tmp="${ARCHIVE_FILE}.tmp.$$"
-if ! jq --arg pod "$CURRENT_POD" --arg target "$R_TMUX_WIN" \
+if ! jq --arg pod "$CURRENT_POD" --arg target "$R_TMUX_WIN" --arg token "$CLAIM_TOKEN" \
     --arg started "$NOW" --argjson epoch "$STARTED_EPOCH" \
     '. + {status:"dispatching", pod:$pod, target:$target,
-          dispatch_started_at:$started, dispatch_started_epoch:$epoch}' \
+          dispatch_started_at:$started, dispatch_started_epoch:$epoch,
+          claim_token:$token}' \
     "$ARCHIVE_FILE" > "$archive_tmp" || ! mv "$archive_tmp" "$ARCHIVE_FILE"; then
   rm -f "$archive_tmp" 2>/dev/null || true
   echo "ERROR: could not persist dispatch transaction for ${TASK_ID}" >&2
   exit 1
 fi
+# Fence a dispatcher that was paused while recovery took ownership. The check is
+# claim-token exact, so an old process can never type into a worker that has since
+# been reassigned to the same task id.
+"$WORKERS_UPDATE" --path "$WORKERS_PATH" check-claim \
+  "$R_TMUX_WIN" "$CURRENT_POD" "$TASK_ID" "$CLAIM_TOKEN" >/dev/null
+
+# Record the ambiguous input-buffer boundary BEFORE typing. If the process dies from
+# here through Enter, mgr-poll will never blindly requeue onto a live pane.
+archive_tmp="${ARCHIVE_FILE}.tmp.$$"
+if ! jq '. + {status:"typing"}' "$ARCHIVE_FILE" > "$archive_tmp" ||
+    ! mv "$archive_tmp" "$ARCHIVE_FILE"; then
+  rm -f "$archive_tmp" 2>/dev/null || true
+  echo "ERROR: could not persist typing phase for ${TASK_ID}" >&2
+  exit 1
+fi
+"$WORKERS_UPDATE" --path "$WORKERS_PATH" check-claim \
+  "$R_TMUX_WIN" "$CURRENT_POD" "$TASK_ID" "$CLAIM_TOKEN" >/dev/null
+
 # type the trigger literally, then submit with Enter. The gap lets the REPL
 # register the text before the submit so Enter can't race ahead of it (a race
 # that was observed historically — hence the guard). Measured against a live
@@ -252,7 +304,16 @@ if ! "$T" send-keys -t "$R_TMUX_WIN" -l "$TRIGGER"; then
   exit 1
 fi
 TRIGGER_TYPED=1
+archive_tmp="${ARCHIVE_FILE}.tmp.$$"
+if ! jq '. + {status:"typed"}' "$ARCHIVE_FILE" > "$archive_tmp" ||
+    ! mv "$archive_tmp" "$ARCHIVE_FILE"; then
+  rm -f "$archive_tmp" 2>/dev/null || true
+  echo "ERROR: could not persist typed phase for ${TASK_ID}" >&2
+  exit 1
+fi
 sleep 0.1
+"$WORKERS_UPDATE" --path "$WORKERS_PATH" check-claim \
+  "$R_TMUX_WIN" "$CURRENT_POD" "$TASK_ID" "$CLAIM_TOKEN" >/dev/null
 if ! "$T" send-keys -t "$R_TMUX_WIN" Enter; then
   # The literal trigger may be sitting unsubmitted in the input buffer. Clear it
   # before restoring the durable queue record so a later human Enter cannot create
@@ -261,8 +322,8 @@ if ! "$T" send-keys -t "$R_TMUX_WIN" Enter; then
 fi
 TRIGGER_SUBMITTED=1
 
-# Commit immediately after Enter. A failure here leaves status=dispatching; mgr-poll
-# heals it once the live worker reports busy/wait instead of requeueing blindly.
+# Commit immediately after Enter. A failure leaves the durable typed phase, which
+# mgr-poll withholds on a live pane until delivery is proven.
 archive_tmp="${ARCHIVE_FILE}.tmp.$$"
 if jq --arg sent "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '. + {status:"dispatched", dispatched_at:$sent}' "$ARCHIVE_FILE" > "$archive_tmp"; then
@@ -270,6 +331,11 @@ if jq --arg sent "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 else
   rm -f "$archive_tmp" 2>/dev/null || true
 fi
+# Enter is the authoritative delivery boundary. A poller may have fenced the claim
+# as uncertain in the tiny interval after our last pre-Enter check; reconcile that
+# exact token now. mgr-poll repeats this for crash safety if this process dies first.
+"$WORKERS_UPDATE" --path "$WORKERS_PATH" confirm-delivery \
+  "$R_TMUX_WIN" "$CURRENT_POD" "$TASK_ID" "$CLAIM_TOKEN" >/dev/null 2>&1 || true
 
 # Stamp the live board immediately: the REAL task headline (@work), plus an
 # instant busy dot so the strip and roster flip the moment the task is fired

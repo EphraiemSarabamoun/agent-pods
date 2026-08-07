@@ -80,8 +80,10 @@ python3 modules/mcp/pod_manager_server.py
 
 ## Register with an MCP client
 
-The server speaks MCP over **stdio**. Point your client at `uv` plus this checkout and
-pass the `POD_*` env so it resolves the same paths as the rest of the pod.
+The server speaks MCP over **stdio**. Point your client at `uv` plus this checkout. The
+`POD_*` env below only names the checkout — the runtime tree (inbox, state, comms) is
+resolved by sourcing `bin/_pod-paths.sh`, so a `POD_TMP` override in
+`~/.config/pod/config.sh` is honored without repeating it here.
 
 Example (Claude Code's `~/.claude.json` / a project `.mcp.json`; the shape is the same
 for any client that takes a `command` + `args` + `env`):
@@ -117,20 +119,31 @@ interpreter form instead:
 
 ## Environment variables
 
-All are read at import time, with the fallbacks shown. Normally `_pod-paths.sh` (sourced
-by the pod scripts) exports the first group for you; pass them through to the MCP client
-env so the server resolves the same tree.
+**You normally need to set none of the runtime-path vars.** At import the server sources
+`bin/_pod-paths.sh` in a subshell and reads `POD_TMP` / `POD_STATE` / `POD_INBOX` /
+`POD_COMMS` / `POD_TMUX` back out, then pins them into the environment of every helper
+it shells out to. That is deliberate: `_pod-paths.sh` also sources
+`~/.config/pod/config.sh`, so a `POD_TMP` relocated there is picked up here too, and the
+server can never end up operating on a different state tree than `mgr-*`, `pod-launch`
+and the strip. Only `POD_REPO` (which checkout) is worth passing, and only when the
+server file is not inside the checkout you mean.
+
+The vars below are read at import time as **overrides**, with the fallbacks shown. The
+runtime-path group is only consulted when the shell layer is unreachable — the shell's
+answer wins, because it already folded in both the environment and `config.sh`.
 
 | Var | Purpose | Fallback |
 | --- | --- | --- |
 | `POD_REPO` | Repo root (for repo-relative path resolution) | this file's `../..` |
-| `POD_BIN` | The `bin/` dir (pod-launch, pod-name, pod-adapter) | `$POD_REPO/bin` |
+| `POD_BIN` | The `bin/` dir (`_pod-paths.sh`, pod-launch, pod-name, pod-adapter) | `$POD_REPO/bin` |
 | `POD_MODULES` | Modules root (mgr-* + templates live under `queue/`) | `$POD_REPO/modules` |
+| `POD_TMP` | Runtime root holding `state/`, `inbox/`, `comms/` | `_pod-paths.sh`, else `/tmp/agent-pods-<uid>` |
 | `POD_INBOX` | Inbox tree (`<task-id>/{prompt.txt,result.json,DONE}`, `_queue/<pod>/`, `_templates/`) | `$POD_TMP/inbox` |
 | `POD_STATE` | State dir (`workers.json`, `tmux_group.json`, `log.jsonl`, `dispatched/<pod>/`, `completed/<pod>/`) | `$POD_TMP/state` |
+| `POD_COMMS` | Comms tree (`pod-tell` / `pod-mail`); passed through to helpers | `$POD_TMP/comms` |
 | `POD_PALETTE` | Worker color palette (shared with `pod-add-worker`) | `$POD_REPO/lib/palette` |
 | `POD_ADAPTER` | Path to the catalog reader | `$POD_BIN/pod-adapter` |
-| `POD_TMUX` | tmux binary | resolved on `PATH` / `tmux_group.json` |
+| `POD_TMUX` | tmux binary (agent-pods runs on a dedicated socket by default) | `tmux_group.json` / `_pod-paths.sh` / `PATH` |
 | `HOME` | Default cd target for spawned workers | the process's `$HOME` |
 | `TMUX_PANE` | Set automatically when the server runs inside a tmux pane; used to resolve the manager's own pod | — |
 
@@ -141,3 +154,12 @@ env so the server resolves the same tree.
 - `pod_spawn_window` accepts `agent_id`, `model`, and `effort`. A default
   **generic-shell** worker is interactive only and is deliberately ineligible for queue
   dispatch; pass an installed agent id for a dispatchable worker.
+- **FULL AUTO is respected.** `pod_dispatch` with no `tmux_window` picks a worker
+  automatically, so it is held while the pod's switch is off (the strip's ✋ MAN), same
+  as `pod_pick_next`. Passing `tmux_window` dispatches by hand and is always allowed.
+  `pod_group_status` reports the switch as `full_auto` (`on` / `off` / `none`, where
+  `none` means "not a stamped pod" and is unrestricted).
+- **`pod_send_input` flattens newlines and tabs to spaces** before typing. `send-keys -l`
+  writes bytes literally, and a literal newline IS Enter to the pane — a multi-line
+  message would otherwise submit itself line by line. `submit=True` is the only way to
+  send Return.

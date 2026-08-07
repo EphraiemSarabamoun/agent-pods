@@ -40,9 +40,15 @@ if [ -z "$MANAGER_CMD" ]; then
     margs=()
     [ -n "$dm" ] && margs+=(--model "$dm")
     [ -n "$de" ] && margs+=(--effort "$de")
-    MANAGER_CMD="$("$ADAPTER" launch "$cand" "${margs[@]}" 2>/dev/null)"
+    # ${margs[@]+"${margs[@]}"} (same guard as modules/queue/bin/mgr-pick-next): bash
+    # 3.2 — the macOS system bash — treats "${arr[@]}" on an EMPTY array as an unbound
+    # variable under `set -u`. An adapter with no model_arg and no default effort
+    # leaves margs empty, and the error killed the command substitution, so
+    # MANAGER_CMD came back empty and the requested agent was silently downgraded to
+    # the plain shell seat — on macOS only, from a config that works on bash 5.
+    MANAGER_CMD="$("$ADAPTER" launch "$cand" ${margs[@]+"${margs[@]}"} 2>/dev/null)"
     [ -n "$MANAGER_CMD" ] || continue
-    MGRCARD="$("$ADAPTER" card "$cand" "${margs[@]}" --suffix manager 2>/dev/null)"
+    MGRCARD="$("$ADAPTER" card "$cand" ${margs[@]+"${margs[@]}"} --suffix manager 2>/dev/null)"
     [ -n "$MGRCARD" ] || MGRCARD="$POD_MANAGER_CARD"
     MGRAGENT="$cand"; MGRMODEL="$dm"; MGREFFORT="$de"
     break
@@ -111,27 +117,41 @@ fi
 "$POD_BIN/pod-mail-gc" >/dev/null 2>&1 || true
 
 # --- create: window 0 = manager ---
-# -e POD_SESSION here is load-bearing: window 0 is created BEFORE the set-environment
-# below, so without -e the manager's OWN pane never learns its pod name (only later
-# windows inherit the session env), and its CLI (pod-add-worker etc.) would default to
-# the wrong pod. `; kill-session` ties the pod's life to its manager: EXITING the
+# EVERY -e here is load-bearing for the same reason: window 0 is created BEFORE the
+# set-environment calls below, and tmux copies its global environment into a pane at
+# pane-CREATION time, so anything set afterwards reaches later windows (the workers)
+# and never the manager. Without -e POD_SESSION the manager's own pane never learns its
+# pod name and its CLI (pod-add-worker etc.) targets the wrong pod. The four path roots
+# are worse: the manager would fall back to _pod-paths.sh's defaults resolved against
+# whatever environment the tmux SERVER happens to carry (a server someone else started,
+# a config the manager can't see), quietly running the deck against a DIFFERENT state
+# tree than its own workers — pod-tell writing mailboxes nobody reads, mgr-poll
+# sweeping an inbox no worker writes to, `pod` reporting an empty deck. tmux accepts
+# repeated -e; these become session env, so later windows inherit them too.
+# `; kill-session` ties the pod's life to its manager: EXITING the
 # manager (Ctrl-D / the agent quitting) tears the whole pod down instead of leaving a
 # zombie. A mere DETACH (closing the window) leaves the pod running for reattach.
 # The kill-session is deliberately BARE (no -t): it resolves the session from the
 # pane's own $TMUX at exit time, so it still kills the right pod after a RENAME —
 # a baked-in "-t =$S" targets the launch-time name and leaves a zombie session.
-# The POD_WINDOW/POD_AGENT_ID prefix mirrors pod-worker-bootstrap's export for
-# workers: the manager seat too gets its identity as ENVIRONMENT, resolved by the
-# pane's own (unsandboxed) shell, so hooks running under a command sandbox —
-# where the tmux socket is connect-blocked — can still identify themselves.
-MGRENV="POD_WINDOW=\"\$(\"$T\" display-message -p -t \"\$TMUX_PANE\" '#{window_id}' 2>/dev/null)\"; POD_AGENT_ID=\"$MGRAGENT\"; POD_ROLE=manager; export POD_WINDOW POD_AGENT_ID POD_ROLE; "
-"$T" new-session -d -s "$S" -n "$MGRNAME" -e "POD_SESSION=$S" "${MGRENV}$MANAGER_CMD; $T kill-session"
+"$T" new-session -d -s "$S" -n "$MGRNAME" -e "POD_SESSION=$S" \
+  -e "POD_TMP=$POD_TMP" -e "POD_CONFIG_DIR=$POD_CONFIG_DIR" \
+  -e "POD_INBOX=$POD_INBOX" -e "POD_COMMS=$POD_COMMS" -e "POD_TMUX=$T" \
+  "$MANAGER_CMD; '$T' kill-session"
 
-# server-level rendering (harmless on a fresh tmux server)
-"$T" set -g  default-terminal "tmux-256color" 2>/dev/null || true
-"$T" set -ga terminal-overrides ",xterm-256color:Tc" 2>/dev/null || true
-# Close index gaps left by killed agents (0,1,2,3,5 -> 0,1,2,3,4) durably.
-"$T" set -g renumber-windows on
+# Server-level rendering. These are SERVER options (tmux has no session-scoped
+# equivalent), so they are applied only on our OWN server — the dedicated socket
+# _pod-paths.sh selects by default. On a shared server (POD_TMUX_SOCKET= opt-out) they
+# would silently rewrite the terminal setup of sessions the user is already working in,
+# and someone who deliberately shares a server already has a terminal config they like.
+if [ "${POD_TMUX_DEDICATED:-0}" = "1" ]; then
+  "$T" set -g  default-terminal "tmux-256color" 2>/dev/null || true
+  "$T" set -ga terminal-overrides ",xterm-256color:Tc" 2>/dev/null || true
+fi
+# Close index gaps left by killed agents (0,1,2,3,5 -> 0,1,2,3,4) durably. Session-
+# scoped: renumber-windows is a session option, so there is no reason to reach for -g
+# and renumber the windows of every other session on the server.
+"$T" set -t "$S" renumber-windows on
 
 # session UX + the colored status strip
 "$T" set  -t "$S" mouse on
@@ -156,9 +176,20 @@ MGRENV="POD_WINDOW=\"\$(\"$T\" display-message -p -t \"\$TMUX_PANE\" '#{window_i
 # needs these resolved in its environment to write the DONE sentinel to the right place.
 "$T" set-environment -g POD_INBOX "$POD_INBOX" 2>/dev/null || true
 "$T" set-environment -g POD_COMMS "$POD_COMMS" 2>/dev/null || true
+# POD_TMUX too: hot-path hooks like pod-state read it straight from the environment
+# instead of sourcing _pod-paths.sh, and on the dedicated socket the plain `tmux` on
+# PATH would talk to the WRONG server.
+"$T" set-environment -g POD_TMUX "$T" 2>/dev/null || true
 # prefix moved to C-a (screen-style) so bare C-b is free to cycle pod windows.
 "$T" set      -t "$S" prefix C-a
-"$T" bind-key -n C-b next-window
+# ...but ONLY on our own server. Key tables are per-SERVER in tmux, and C-b is tmux's
+# DEFAULT PREFIX: binding it in the root table on a shared server takes the prefix key
+# away from every session that user already had open, for work that has nothing to do
+# with any pod. On the dedicated socket (the default) nothing else lives here, so the
+# convenience binding is free. POD_BIND_CTRL_B=1 forces it on a shared server.
+if [ "${POD_TMUX_DEDICATED:-0}" = "1" ] || [ "${POD_BIND_CTRL_B:-0}" = "1" ]; then
+  "$T" bind-key -n C-b next-window
+fi
 "$T" bind-key    C-a send-prefix
 "$T" set  -t "$S" status on
 "$T" set  -t "$S" status-position bottom
@@ -181,40 +212,50 @@ MGRENV="POD_WINDOW=\"\$(\"$T\" display-message -p -t \"\$TMUX_PANE\" '#{window_i
 # the range in bash (captured at click time as argv, no fragile format re-eval).
 # run-shell -b backgrounds it so the handler's stdout can't pop a copy-mode overlay.
 # SERVER-GLOBAL (bind-key -n): we pass #{session_name} so the action hits the CLICKED
-# pod when several run at once.
+# pod when several run at once. Key tables are per-SERVER in tmux — there is no
+# session-scoped table — which is exactly why _pod-paths.sh puts pods on their own tmux
+# server by default; these bindings must not land on somebody's unrelated sessions.
+#
+# QUOTING, here and in every run-shell string below: tmux hands the expanded string to
+# /bin/sh, which word-splits it. An install path containing a space ("~/My Projects/
+# agent-pods", a /Volumes/... checkout) therefore made every button, chord and hook a
+# silent no-op — run-shell -b swallows the failure, so the deck looked perfectly
+# healthy while nothing worked. Single-quoting the executable (as bin/pod-star-menu
+# already did) keeps it one sh word; tmux preserves inner single quotes untouched. The
+# #{...} arguments are quoted for the same reason.
 "$T" bind-key -n MouseDown1Status if-shell -F "#{?#{==:#{mouse_status_range},window},0,#{?#{==:#{mouse_status_range},},0,1}}" \
-  "run-shell -b \"$POD_BIN/pod-status-action #{mouse_status_range} #{session_name} #{client_name}\"" \
+  "run-shell -b \"'$POD_BIN/pod-status-action' '#{mouse_status_range}' '#{session_name}' '#{client_name}'\"" \
   "select-window -t="
 # double-click a strip entry to rename it; the window-renamed hook (pod-sync-label)
 # pushes the new name into the worker registry's `label`. -b so stdout can't pop an overlay.
 "$T" bind-key -n DoubleClick1Status command-prompt -p "rename worker:" -I "#{window_name}" "rename-window -- '%%'"
-"$T" set-hook -g window-renamed "run-shell -b \"$POD_BIN/pod-sync-label '#{window_id}' '#{window_name}'\""
+"$T" set-hook -g window-renamed "run-shell -b \"'$POD_BIN/pod-sync-label' '#{window_id}' '#{window_name}'\""
 # FULL AUTO switch: prefix chord C-a a, or the one-beat M-a. Both route through
 # pod-status-action (same code path as the ⚡/✋ pill click). -b so the handler's
 # stdout can't pop a copy-mode overlay; pod-status-action also redirects it.
 # Server-global (like send-prefix above); #{session_name} scopes the flip to the pod
 # the keypress came from, so it's multi-pod safe.
-"$T" bind-key    a   run-shell -b "$POD_BIN/pod-status-action fullauto '#{session_name}' '#{client_name}'"
-"$T" bind-key -n M-a run-shell -b "$POD_BIN/pod-status-action fullauto '#{session_name}' '#{client_name}'"
+"$T" bind-key    a   run-shell -b "'$POD_BIN/pod-status-action' fullauto '#{session_name}' '#{client_name}'"
+"$T" bind-key -n M-a run-shell -b "'$POD_BIN/pod-status-action' fullauto '#{session_name}' '#{client_name}'"
 # Gold star picker: prefix chord C-a *, or one-beat M-g / M-* (human-only; pod-star
 # refuses agent callers). The picker is keyed by tab index, so C-a * <digit> works.
-"$T" bind-key    '*'   run-shell -b "$POD_BIN/pod-status-action star '#{session_name}' '#{client_name}'"
-"$T" bind-key -n M-g   run-shell -b "$POD_BIN/pod-status-action star '#{session_name}' '#{client_name}'"
-"$T" bind-key -n 'M-*' run-shell -b "$POD_BIN/pod-status-action star '#{session_name}' '#{client_name}'"
+"$T" bind-key    '*'   run-shell -b "'$POD_BIN/pod-status-action' star '#{session_name}' '#{client_name}'"
+"$T" bind-key -n M-g   run-shell -b "'$POD_BIN/pod-status-action' star '#{session_name}' '#{client_name}'"
+"$T" bind-key -n 'M-*' run-shell -b "'$POD_BIN/pod-status-action' star '#{session_name}' '#{client_name}'"
 # The rest of the button chords: prefix C-a <key> + one-beat M-<key>, all routed
 # through pod-status-action (the same backend as the mouse buttons — ONE code path per
 # action). s = ☰ summary (shadows tmux's prefix-s session chooser; choose-tree is on
 # prefix-w) · + / d = spawn agent · g / f = ⚙ settings · X / x = kill focused.
-"$T" bind-key    s   run-shell -b "$POD_BIN/pod-status-action summary  '#{session_name}' '#{client_name}'"
-"$T" bind-key -n M-s run-shell -b "$POD_BIN/pod-status-action summary  '#{session_name}' '#{client_name}'"
-"$T" bind-key    +   run-shell -b "$POD_BIN/pod-status-action newwin   '#{session_name}' '#{client_name}'"
-"$T" bind-key -n M-d run-shell -b "$POD_BIN/pod-status-action newwin   '#{session_name}' '#{client_name}'"
-"$T" bind-key    g   run-shell -b "$POD_BIN/pod-status-action settings '#{session_name}' '#{client_name}'"
-"$T" bind-key -n M-f run-shell -b "$POD_BIN/pod-status-action settings '#{session_name}' '#{client_name}'"
+"$T" bind-key    s   run-shell -b "'$POD_BIN/pod-status-action' summary  '#{session_name}' '#{client_name}'"
+"$T" bind-key -n M-s run-shell -b "'$POD_BIN/pod-status-action' summary  '#{session_name}' '#{client_name}'"
+"$T" bind-key    +   run-shell -b "'$POD_BIN/pod-status-action' newwin   '#{session_name}' '#{client_name}'"
+"$T" bind-key -n M-d run-shell -b "'$POD_BIN/pod-status-action' newwin   '#{session_name}' '#{client_name}'"
+"$T" bind-key    g   run-shell -b "'$POD_BIN/pod-status-action' settings '#{session_name}' '#{client_name}'"
+"$T" bind-key -n M-f run-shell -b "'$POD_BIN/pod-status-action' settings '#{session_name}' '#{client_name}'"
 # kill the FOCUSED worker (capital X in the prefix table so default kill-pane on x
 # survives; window 0 is refused by pod-kill-worker). #{window_id} expands at keypress.
-"$T" bind-key    X   run-shell -b "$POD_BIN/pod-status-action kill_#{window_id} '#{session_name}' '#{client_name}'"
-"$T" bind-key -n M-x run-shell -b "$POD_BIN/pod-status-action kill_#{window_id} '#{session_name}' '#{client_name}'"
+"$T" bind-key    X   run-shell -b "'$POD_BIN/pod-status-action' kill_#{window_id} '#{session_name}' '#{client_name}'"
+"$T" bind-key -n M-x run-shell -b "'$POD_BIN/pod-status-action' kill_#{window_id} '#{session_name}' '#{client_name}'"
 # C-a , renames the focused worker (tmux-native; the window-renamed hook syncs the registry)
 "$T" bind-key    ,   command-prompt -p "rename worker:" -I "#{window_name}" "rename-window -- '%%'"
 # Tab navigation + reorder. M-c/M-v CYCLE the focused tab left/right (bare C-b
@@ -224,27 +265,27 @@ MGRENV="POD_WINDOW=\"\$(\"$T\" display-message -p -t \"\$TMUX_PANE\" '#{window_i
 # immovable, pods only, per-pod lock).
 "$T" bind-key -n M-c previous-window
 "$T" bind-key -n M-v next-window
-"$T" bind-key -n M-C run-shell -b "$POD_BIN/pod-drag-reorder --left '#{session_name}'"
-"$T" bind-key -n M-V run-shell -b "$POD_BIN/pod-drag-reorder --right '#{session_name}'"
+"$T" bind-key -n M-C run-shell -b "'$POD_BIN/pod-drag-reorder' --left '#{session_name}'"
+"$T" bind-key -n M-V run-shell -b "'$POD_BIN/pod-drag-reorder' --right '#{session_name}'"
 # MouseDrag1Status: swap the HOVERED non-active tab with the dragged (active) one.
 # The if-shell gates on range==window AND window_active==0 (skip the ✕/+/⚙/☰/⭐
 # ranges + the dense "still over the dragged tab" events) without forking a shell;
 # the FALSE branch is a deliberate no-op so dragging through gaps never jumps focus.
 "$T" bind-key -n MouseDrag1Status if-shell -F "#{?#{==:#{mouse_status_range},window},#{?#{window_active},0,1},0}" \
-  "run-shell -b \"$POD_BIN/pod-drag-reorder '#{window_id}' '#{session_name}'\"" ""
+  "run-shell -b \"'$POD_BIN/pod-drag-reorder' '#{window_id}' '#{session_name}'\"" ""
 # Auto-dock the summary pane on the pod's FIRST client attach (not at creation): a
 # detached new-session has the default 80-col width, so docking then would mis-size
 # the pane — client-attached fires once a real terminal is attached. Self-unsets so
 # later reattaches don't force the pane back after a manual q/undock.
-"$T" set-hook -t "$S" client-attached "run-shell -b \"$POD_BIN/pod-summary-pane on $S; $T set-hook -u -t $S client-attached\""
+"$T" set-hook -t "$S" client-attached "run-shell -b \"'$POD_BIN/pod-summary-pane' on '$S'; '$T' set-hook -u -t '$S' client-attached\""
 # Pods are renamable like workers: double-click the pod badge (status-left), or M-r
 # (C-a $ is tmux-native too). All end in rename-session; the session-renamed hook
 # (pod-sync-pod-name) migrates the per-pod comms subtree + group record behind it.
 "$T" bind-key -n DoubleClick1StatusLeft command-prompt -p "rename pod:" -I "#S" "rename-session -- '%%'"
 "$T" bind-key -n M-r command-prompt -p "rename pod:" -I "#S" "rename-session -- '%%'"
-"$T" set-hook -g session-renamed "run-shell -b \"$POD_BIN/pod-sync-pod-name '#{hook_session_name}'\""
+"$T" set-hook -g session-renamed "run-shell -b \"'$POD_BIN/pod-sync-pod-name' '#{hook_session_name}'\""
 # When a pod closes, delete its pod-comms subtree so logs die WITH the pod.
-"$T" set-hook -g session-closed "run-shell -b \"$POD_BIN/pod-mail-gc '#{hook_session_name}'\""
+"$T" set-hook -g session-closed "run-shell -b \"'$POD_BIN/pod-mail-gc' '#{hook_session_name}'\""
 # Leading STATE DOT per tab: idle=green ● busy=orange ◐ wait=yellow ◆ unset=grey ○.
 # Each window stamps #{@cc_state} (hook agents via pod-state; others via pod-foreign-state).
 # Style blocks are split (#[noreverse]#[fg=..]) NOT comma-joined: a comma inside #[..]

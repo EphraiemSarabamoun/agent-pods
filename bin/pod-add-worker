@@ -15,9 +15,6 @@ POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
 T="$POD_TMUX"
 S="${POD_SESSION:-$POD_SESSION_PREFIX}"
 
-# spawning a worker is a deck change (new-window + coloring) — needs the socket.
-pod_require_socket "spawning a worker" || exit 1
-
 # WORKER palette — SINGLE SOURCE is lib/palette (read by the MCP too). code + name per line.
 COLORS=(); NAMES=()
 while read -r code name _; do
@@ -49,6 +46,32 @@ done
 if [ -n "${TMUX_PANE:-}" ]; then
   live_session="$("$T" display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null || true)"
   [ -n "$live_session" ] && S="$live_session"
+fi
+
+# ADOPT path guards (mirror pod-kill-worker's, which has had both since the start).
+# Window ids are server-global, so a stale/typo'd @id copied off a roster can point at
+# ANOTHER pod's seat — and registering it is destructive, not merely wrong: the shared
+# registry drops a same-window row belonging to a different session as a stale
+# generation, so the rightful pod loses its worker row while the window keeps living
+# there. Window 0 is the manager and must never be re-registered as a worker (that also
+# repaints its home-base grey tab and overwrites its card). Checked BEFORE the adapter
+# resolution below, so a refusal is instant instead of waiting on model discovery.
+if [ -n "$win" ]; then
+  # A dead window id makes display-message exit 0 with EMPTY output, so test the OUTPUT.
+  wsess="$("$T" display-message -p -t "$win" '#{session_name}' 2>/dev/null || true)"
+  widx="$("$T" display-message -p -t "$win" '#{window_index}' 2>/dev/null || true)"
+  if [ -z "$wsess" ] || [ -z "$widx" ]; then
+    echo "pod-add-worker: no such window '$win'" >&2
+    exit 1
+  fi
+  if [ "$wsess" != "$S" ]; then
+    echo "pod-add-worker: refusing cross-pod target '$win' (caller=$S, target=$wsess)" >&2
+    exit 1
+  fi
+  if [ "$widx" = "0" ]; then
+    echo "pod-add-worker: refusing to register the manager (window 0) as a worker" >&2
+    exit 1
+  fi
 fi
 
 # A bare spawn is a generic shell. A named agent, however, must be launched through
@@ -94,6 +117,23 @@ if [ -z "$win" ]; then
   [ -n "$last" ] && tgt="${S}:${last}" || tgt="$S"
   win="$("$T" new-window -a -t "$tgt" -n "$wname" -P -F '#{window_id}' "cd \"\$HOME\" && $launch")"
   [ -n "$win" ] && SPAWNED=1
+  # pod-name draws from a SNAPSHOT of the tabs taken before this window existed, so a
+  # burst of concurrent spawns can hand two live seats the same name. tmux is the
+  # arbiter once the window exists: suffix ours if the name is now taken, because
+  # name-based targeting (pod-kill-worker/pod-tell "Ivy") resolves the FIRST match and
+  # would otherwise silently act on the wrong seat.
+  if [ -n "$win" ]; then
+    dupes="$("$T" list-windows -t "$S" -F '#{window_id}|#{window_name}' 2>/dev/null \
+             | awk -F'|' -v w="$win" -v n="$wname" '$1!=w && $2==n{c++} END{print c+0}')"
+    if [ "${dupes:-0}" != "0" ]; then
+      k=2
+      while [ "$k" -lt 50 ] && "$T" list-windows -t "$S" -F '#{window_name}' 2>/dev/null \
+              | grep -qxF "${wname}-${k}"; do
+        k=$((k + 1))
+      done
+      "$T" rename-window -t "$win" "${wname}-${k}" 2>/dev/null || true
+    fi
+  fi
 fi
 
 # EMPTY-TARGET FOOTGUN guard: with no window id, every `setw -t "$win"` below would

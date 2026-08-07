@@ -44,7 +44,20 @@ state_is_mine() {
 }
 
 if [ "$("$T" show-options -t "=${sess}:" -qv @full_auto 2>/dev/null)" = "1" ]; then
-  emit_ctx "[full-auto] This pod's FULL AUTO switch is ON (the ⚡ pill). You are the autonomous pod manager: if this prompt is a work objective, run it through the fire-and-poll loop (decompose it into self-contained chunks → mgr-stage + mgr-queue each one → mgr-pick-next --all-idle to dispatch to idle workers → arm pod-task-wait in the background and repeat on each wake — see docs/autonomy.md) without asking for permission to manage. Conversational questions and status checks are answered normally — don't spin up workers for those."
+  # Only promise the mgr-* loop when those commands can actually run. The queue is an
+  # OPTIONAL module: an install predating the module shims (or a repo run straight from
+  # the tree with $LOCAL_BIN off PATH) leaves mgr-stage unresolvable, and an agent told
+  # to run a command that answers `command not found` improvises — usually by doing the
+  # work in its own context, the exact anti-pattern FULL AUTO exists to prevent. Describe
+  # the reachable dispatch path instead, so the brief is never a lie.
+  if command -v mgr-stage >/dev/null 2>&1; then
+    loop="decompose it into self-contained chunks → mgr-stage + mgr-queue each one → mgr-pick-next --all-idle to dispatch to idle workers → arm pod-task-wait in the background and repeat on each wake — see docs/autonomy.md"
+  elif [ -x "${POD_MODULES:-}/queue/bin/mgr-stage" ]; then
+    loop="decompose it into self-contained chunks and dispatch them with the queue commands in ${POD_MODULES}/queue/bin (mgr-stage → mgr-queue → mgr-pick-next --all-idle). They are NOT on your PATH, so call them by that full path (or add the dir to PATH first) — see docs/autonomy.md"
+  else
+    loop="decompose it into self-contained chunks and hand them to idle workers with pod-tell, then poll their replies. The queue module (mgr-stage / mgr-queue / mgr-pick-next) is not installed here, so do NOT try those commands"
+  fi
+  emit_ctx "[full-auto] This pod's FULL AUTO switch is ON (the ⚡ pill). You are the autonomous pod manager: if this prompt is a work objective, run it through the fire-and-poll loop (${loop}) without asking for permission to manage. Conversational questions and status checks are answered normally — don't spin up workers for those."
 fi
 
 # switch is OFF — surface a paused loop so it isn't forgotten, else stay silent

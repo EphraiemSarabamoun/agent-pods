@@ -25,6 +25,24 @@ set -u
 prov="${1:-}"
 keydir="${POD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/pod}/keys"
 
+# curl has NO overall time limit by default, and these are the only network calls in
+# the repo. A transparent proxy / TLS-inspection appliance / captive portal that
+# completes the handshake and then never answers made `pod-login` hang forever with no
+# output (it calls this script directly, outside pod-adapter's discovery timeout, and
+# stock macOS has no `timeout` binary to wrap it in). Bounded here instead. Raise
+# POD_HTTP_TIMEOUT on a slow corporate egress path.
+# A typo'd override must not turn into a confusing "the proxy stalled us" report: curl
+# rejects a non-numeric --max-time outright, so fall back to the default and say why.
+_seconds_or() {  # <value> <fallback> <var name>
+  case "$1" in
+    ''|*[!0-9.]*|*.*.*|.) [ -z "$1" ] || echo "pod-discover-api: ignoring non-numeric $3='$1'; using $2s." >&2
+                          printf '%s' "$2" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+HTTP_CONNECT_TIMEOUT="$(_seconds_or "${POD_HTTP_CONNECT_TIMEOUT:-5}" 5 POD_HTTP_CONNECT_TIMEOUT)"
+HTTP_TIMEOUT="$(_seconds_or "${POD_HTTP_TIMEOUT:-20}" 20 POD_HTTP_TIMEOUT)"
+
 _read_keyfile() { [ -f "$1" ] && tr -d ' \t\r\n' < "$1"; }
 
 resolve_key() {
@@ -62,15 +80,17 @@ fi
 case "$prov" in
   anthropic)
     body="$(printf 'header = "x-api-key: %s"\nheader = "anthropic-version: 2023-06-01"\n' "$key" \
-            | curl -fsS -K - "https://api.anthropic.com/v1/models?limit=1000" 2>/dev/null)" \
-      || { echo "pod-discover-api: anthropic /v1/models call failed (bad/expired key, or offline)." >&2; exit 3; }
+            | curl -fsS -K - --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$HTTP_TIMEOUT" \
+                   "https://api.anthropic.com/v1/models?limit=1000" 2>/dev/null)" \
+      || { echo "pod-discover-api: anthropic /v1/models call failed (bad/expired key, offline, or a proxy stalled the request past ${HTTP_TIMEOUT}s)." >&2; exit 3; }
     # API already returns newest-first; id + human display_name.
     printf '%s' "$body" | jq -r '.data[]? | "\(.id) - \(.display_name)"'
     ;;
   openai)
     body="$(printf 'header = "Authorization: Bearer %s"\n' "$key" \
-            | curl -fsS -K - "https://api.openai.com/v1/models" 2>/dev/null)" \
-      || { echo "pod-discover-api: openai /v1/models call failed (bad key, or offline)." >&2; exit 3; }
+            | curl -fsS -K - --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$HTTP_TIMEOUT" \
+                   "https://api.openai.com/v1/models" 2>/dev/null)" \
+      || { echo "pod-discover-api: openai /v1/models call failed (bad key, offline, or a proxy stalled the request past ${HTTP_TIMEOUT}s)." >&2; exit 3; }
     # /v1/models also lists embeddings/tts/whisper/image models — keep only the
     # chat/reasoning/codex families a coding agent would actually run. No display
     # names on this endpoint, so the id doubles as the label.

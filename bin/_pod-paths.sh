@@ -29,15 +29,53 @@ POD_REPO="$(cd -P "$POD_BIN/.." 2>/dev/null && pwd)"
 unset __pp __d
 
 # --- defaults (overridable by config + environment) -----------------------------
+# uid, resolved ONCE. It scopes the runtime root AND backs the ownership check below,
+# so "cannot resolve" must never be mistaken for a value: absolute path first (a
+# minimal or hostile PATH can't redirect it), then PATH (NixOS/Termux ship no
+# /usr/bin/id), then bash's own $EUID, which needs no binary at all.
+__pod_uid="$(/usr/bin/id -u 2>/dev/null || id -u 2>/dev/null || printf '%s' "${EUID:-${UID:-}}")"
+
 # tmux binary. Empty config -> resolve on PATH (no platform-specific hardcode).
-POD_TMUX="${POD_TMUX:-$(command -v tmux 2>/dev/null || echo tmux)}"
+# A CALLER-PINNED POD_TMUX opts out of the dedicated-socket shim below (that is how
+# the test harnesses aim every "$T" call at an isolated server), so record the fact
+# that it was pinned rather than inferring it from the value later: a pinned path can
+# legitimately be identical to the one on PATH, and wrapping that in `-L` would hand
+# the caller a different server than the one they asked for. $__pod_tmux_bin is the
+# auto-resolved binary, kept because the shim must exec THAT, never itself.
+case "${POD_TMUX:-}" in "") __pod_tmux_pinned=0 ;; *) __pod_tmux_pinned=1 ;; esac
+__pod_tmux_bin="$(command -v tmux 2>/dev/null || echo tmux)"
+POD_TMUX="${POD_TMUX:-$__pod_tmux_bin}"
 
 # tmp roots: one tree, three subdirs.
 #   state/  workers.json, tmux_group.json, log.jsonl, dispatched/<pod>/,
 #           completed/<pod>/, *.pid, *.log
 #   inbox/  <task-id>/{prompt.txt,result.json,DONE}, _queue/<pod>/, _templates/
 #   comms/  <pod>/{channel.log, <wid>.mbox, <wid>.read, work/}            (pod-comms)
-POD_TMP="${POD_TMP:-${TMPDIR:-/tmp}/agent-pods-$(/usr/bin/id -u)}"
+#
+# The root is deliberately NOT derived from $TMPDIR. TMPDIR is per-CONTEXT: on macOS a
+# GUI terminal gets /var/folders/<hash>/T/ while ssh/cron/launchd get none (-> /tmp),
+# and a command sandbox can hand every single command its own scratch TMPDIR. A
+# TMPDIR-derived root therefore forks one pod into two disjoint state trees — pod-tell
+# reports delivery into a mailbox the recipient never reads and the registry looks empty
+# from the other context — while the tmux deck keeps rendering as if all were well,
+# because the SOCKET path never moved with it.
+# A fixed /tmp path is the same choice tmux itself makes for its sockets
+# (/tmp/tmux-<uid>): identical in every context, on local disk (flock is reliable,
+# unlike a $HOME on NFS), and cleared on reboot — the exact lifetime this state wants.
+# Privacy does not come from the location but from 0700 + the ownership and symlink
+# checks below, again exactly as for /tmp/tmux-<uid>.
+if [ -n "$__pod_uid" ]; then
+  __pod_tmp_default="/tmp/agent-pods-$__pod_uid"
+elif [ -n "${HOME:-}" ]; then
+  # No uid from anywhere: an unscoped /tmp/agent-pods- would be a path SHARED by every
+  # user on the host (and the ownership check would then reject whoever arrived
+  # second). Scope to $HOME instead — private by construction.
+  __pod_tmp_default="$HOME/.agent-pods"
+else
+  __pod_tmp_default=""
+fi
+POD_TMP="${POD_TMP:-$__pod_tmp_default}"
+unset __pod_tmp_default
 
 # deck identity (agent-agnostic: the manager defaults to a plain shell, not any one agent).
 POD_SESSION_PREFIX="${POD_SESSION_PREFIX:-pod}"
@@ -90,7 +128,11 @@ if [ -L "$POD_TMP" ]; then
   printf 'pod: refusing symlink runtime root: %s\n' "$POD_TMP" >&2
   return 1 2>/dev/null || exit 1
 fi
-/bin/mkdir -p "$POD_TMP" "$POD_STATE" "$POD_INBOX" "$POD_COMMS" 2>/dev/null || {
+# Absolute path first (a minimal or hostile PATH can't redirect it), then PATH: on
+# NixOS /bin holds only sh and on Termux neither /bin nor /usr/bin exists, and a hard
+# failure here takes out EVERY pod command plus the hooks that source this file.
+/bin/mkdir -p "$POD_TMP" "$POD_STATE" "$POD_INBOX" "$POD_COMMS" 2>/dev/null || \
+mkdir -p "$POD_TMP" "$POD_STATE" "$POD_INBOX" "$POD_COMMS" 2>/dev/null || {
   printf 'pod: cannot create runtime root: %s\n' "$POD_TMP" >&2
   return 1 2>/dev/null || exit 1
 }
@@ -115,17 +157,87 @@ POD_STATE="$__pod_state_real"
 POD_INBOX="$__pod_inbox_real"
 POD_COMMS="$__pod_comms_real"
 unset __pod_tmp_real __pod_state_real __pod_inbox_real __pod_comms_real __pod_child
-case "$(/usr/bin/uname -s 2>/dev/null)" in
-  Darwin) __pod_owner="$(/usr/bin/stat -f '%u' "$POD_TMP" 2>/dev/null || true)" ;;
-  *)      __pod_owner="$(/usr/bin/stat -c '%u' "$POD_TMP" 2>/dev/null || true)" ;;
+case "$(/usr/bin/uname -s 2>/dev/null || uname -s 2>/dev/null)" in
+  Darwin) __pod_owner="$(/usr/bin/stat -f '%u' "$POD_TMP" 2>/dev/null || stat -f '%u' "$POD_TMP" 2>/dev/null || true)" ;;
+  *)      __pod_owner="$(/usr/bin/stat -c '%u' "$POD_TMP" 2>/dev/null || stat -c '%u' "$POD_TMP" 2>/dev/null || true)" ;;
 esac
-if [ -n "$__pod_owner" ] && [ "$__pod_owner" != "$(/usr/bin/id -u)" ]; then
-  printf 'pod: runtime root is owned by uid %s, not %s: %s\n' "$__pod_owner" "$(/usr/bin/id -u)" "$POD_TMP" >&2
+# An unreadable owner or an unresolvable uid means CANNOT VERIFY, never MISMATCH. An
+# empty $(id -u) used to compare unequal to a root this user genuinely owns, aborting
+# every pod command — and since the hooks source this file with `|| exit 0`, the whole
+# awareness/comms tier went silently blind while the deck kept rendering. Only a
+# KNOWN-different owner aborts.
+if [ -n "$__pod_owner" ] && [ -n "$__pod_uid" ] && [ "$__pod_owner" != "$__pod_uid" ]; then
+  printf 'pod: runtime root is owned by uid %s, not %s: %s\n' "$__pod_owner" "$__pod_uid" "$POD_TMP" >&2
   unset __pod_owner
   return 1 2>/dev/null || exit 1
 fi
-/bin/chmod 700 "$POD_TMP" "$POD_STATE" "$POD_INBOX" "$POD_COMMS" 2>/dev/null || true
-unset __pod_owner
+/bin/chmod 700 "$POD_TMP" "$POD_STATE" "$POD_INBOX" "$POD_COMMS" 2>/dev/null || \
+  chmod 700 "$POD_TMP" "$POD_STATE" "$POD_INBOX" "$POD_COMMS" 2>/dev/null || true
+unset __pod_owner __pod_uid
+
+# --- dedicated tmux server (default) ------------------------------------------------
+# pod-launch configures a deck with SERVER-GLOBAL tmux state: the window-status
+# formats, renumber-windows, the window-renamed / session-closed hooks, and a table of
+# root-key bindings. tmux has no per-session key table and no per-session default for
+# window options, so on a SHARED server all of that lands on the sessions someone was
+# already using for unrelated work — up to and including rebinding bare C-b, which IS
+# the default prefix. agent-pods therefore runs on its OWN tmux server by default: same
+# binary, different socket, and `tmux ls` on the user's server never changes. Set
+# POD_TMUX_SOCKET= (empty) to opt back into the default server; set it to another name
+# to keep separate decks apart.
+#
+# The socket is selected with `tmux -L <name>`, but POD_TMUX must stay ONE WORD: every
+# consumer runs it as "$POD_TMUX" (pod-primer even tests it with -x, pod-settings-menu
+# and pod-spawn-menu-build exec it from python, and pod-launch records it in
+# tmux_group.json as `tmux_bin`, which is how the MCP inherits the socket with no env
+# at all). So POD_TMUX points at a one-line exec shim — the same trick
+# test/parity-sandbox.sh already uses — instead of word-splitting POD_TMUX at ~30 call
+# sites. Living under POD_TMP means the shim's lifetime matches the state it serves.
+POD_TMUX_SOCKET="${POD_TMUX_SOCKET-agent-pods}"
+POD_TMUX_DEDICATED=0
+if [ -n "$POD_TMUX_SOCKET" ]; then
+  __pod_sock="$(LC_ALL=C printf '%s' "$POD_TMUX_SOCKET" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
+  __pod_shim="$POD_TMP/tmux-$__pod_sock"
+  # A seat that is ALREADY inside a pod pane talks to the server it actually lives on,
+  # never to a socket named by config: plain tmux honors $TMUX, so leaving POD_TMUX
+  # alone here is what keeps a pod launched on another server (one started before this
+  # default existed, or a deliberate POD_TMUX_SOCKET= deck) fully working from inside
+  # its own panes instead of silently losing its socket mid-flight. A pane in a NON-pod
+  # tmux carries no POD_SESSION, so `pod-launch` typed in the user's own tmux still gets
+  # the dedicated server rather than dropping a deck into their session list.
+  __pod_seat=0
+  if [ -n "${TMUX:-}" ] && [ -n "${POD_SESSION:-}" ]; then __pod_seat=1; fi
+  # Honor a POD_TMUX pinned by the caller (env) or by config.sh (which can only have
+  # moved it off the auto-resolved binary): only an untouched default gets the shim.
+  # The last arm is the normal pane case — every seat of a dedicated-socket pod
+  # inherits POD_TMUX=<shim> from the pod's own tmux environment, and that must still
+  # count as "ours" so a shim someone deleted gets rebuilt instead of skipped.
+  if { [ "$__pod_tmux_pinned" = 0 ] && [ "$__pod_seat" = 0 ] && [ "$POD_TMUX" = "$__pod_tmux_bin" ]; } \
+     || [ "$POD_TMUX" = "$__pod_shim" ]; then
+    if [ ! -x "$__pod_shim" ]; then
+      # write-then-rename: a concurrent seat must never exec a half-written shim.
+      __pod_new="$__pod_shim.$$"
+      if printf "#!/bin/sh\nexec '%s' -L %s \"\$@\"\n" "$__pod_tmux_bin" "$__pod_sock" >"$__pod_new" 2>/dev/null; then
+        /bin/chmod 700 "$__pod_new" 2>/dev/null || chmod 700 "$__pod_new" 2>/dev/null || true
+        # Verify ONCE, at creation: a 0700 file on a noexec mount passes -x and still
+        # fails to run, and a POD_TMUX that cannot exec takes the whole deck down.
+        if "$__pod_new" -V >/dev/null 2>&1; then
+          mv -f "$__pod_new" "$__pod_shim" 2>/dev/null || rm -f "$__pod_new" 2>/dev/null || true
+        else
+          rm -f "$__pod_new" 2>/dev/null || true
+        fi
+      else
+        rm -f "$__pod_new" 2>/dev/null || true
+      fi
+      unset __pod_new
+    fi
+    # An unwritable or noexec runtime root falls back to the shared server rather than
+    # to a dead command: degraded isolation beats a deck that cannot call tmux at all.
+    if [ -x "$__pod_shim" ]; then POD_TMUX="$__pod_shim"; POD_TMUX_DEDICATED=1; fi
+  fi
+  unset __pod_sock __pod_shim __pod_seat
+fi
+unset __pod_tmux_bin __pod_tmux_pinned
 
 # adapters: repo defaults, then user overrides (~/.config/pod/adapters/*.toml win by
 # basename — handled by pod-adapter, which globs both with user last).
@@ -146,7 +258,7 @@ POD_PRIMER_DIR="${POD_PRIMER_DIR:-$POD_REPO/lib/primer}"
 # single source of the color palette (pod-add-worker + the MCP both read it)
 POD_PALETTE="${POD_PALETTE:-$POD_REPO/lib/palette}"
 
-export POD_BIN POD_REPO POD_TMUX POD_TMP POD_STATE POD_INBOX POD_COMMS \
+export POD_BIN POD_REPO POD_TMUX POD_TMUX_SOCKET POD_TMUX_DEDICATED POD_TMP POD_STATE POD_INBOX POD_COMMS \
   POD_SESSION_PREFIX POD_CITIES POD_MANAGER_NAME POD_MANAGER_NAME_AUTO POD_MANAGER_CARD POD_MANAGER_CMD POD_STAR_AWARDER \
   POD_FOREIGN_INTERVAL POD_FOREIGN_TRIM POD_CONFIG_DIR POD_CONFIG \
   POD_ADAPTERS_DIR POD_USER_ADAPTERS POD_SLOTS POD_MODULES POD_PALETTE \
@@ -155,53 +267,6 @@ export POD_BIN POD_REPO POD_TMUX POD_TMP POD_STATE POD_INBOX POD_COMMS \
 # convenience: pod-adapter is the single TOML query tool; everything else calls it.
 POD_ADAPTER="${POD_ADAPTER:-$POD_BIN/pod-adapter}"
 export POD_ADAPTER
-
-# --- sandbox portability: the tmux socket is an UPGRADE, files are the truth --------
-# Some environments run the agent's subprocesses in a command sandbox that denies
-# unix-socket connect (CI runners, containers, restricted shells). There the tmux
-# client->server socket is unreachable from hook subprocesses (connect() -> EPERM)
-# even though the server is alive and the pane is genuinely in a pod. Every fallback
-# below gates on this ONE probe: socket reachable -> behave exactly as always (zero
-# behavior change); socket unreachable -> the file paths take over.
-# Memoized per process so hot-path hooks probe at most once.
-pod_socket_ok() {
-  if [ -z "${__POD_SOCKET_OK:-}" ]; then
-    __POD_SOCKET_OK=0
-    if [ -n "${TMUX:-}" ]; then
-      if [ -n "${TMUX_PANE:-}" ]; then
-        "$POD_TMUX" display-message -p -t "$TMUX_PANE" ok >/dev/null 2>&1 && __POD_SOCKET_OK=1
-      else
-        "$POD_TMUX" display-message -p ok >/dev/null 2>&1 && __POD_SOCKET_OK=1
-      fi
-    fi
-  fi
-  [ "$__POD_SOCKET_OK" = 1 ]
-}
-
-# pod_require_socket [<action name>] — a REACTIVE sandbox notice for commands that
-# genuinely change the tmux deck (spawn/kill a worker, toggle FULL AUTO). When the
-# socket is reachable it's a silent pass; when it's blocked it explains, to stderr,
-# that this action needs the socket the sandbox denies and what still works instead,
-# then returns 1 so the caller can bail with a clear message rather than a cryptic
-# tmux error. Read/exchange commands (pod, pod-tell, pod-mail, pod-note) do NOT call
-# this — they work from files and must stay silent.
-pod_require_socket() {
-  # Probe SERVER reachability, pane-INDEPENDENTLY — deliberately NOT via pod_socket_ok
-  # (which is keyed to $TMUX_PANE, for in-pane hooks). External callers — a script, the
-  # MCP, the test harness — target a pod by session name from outside any pane, where
-  # $TMUX_PANE belongs to a different server or is unset; they must NOT trip this. A
-  # reachable server (list-sessions succeeds) means proceed, in every one of those cases.
-  "$POD_TMUX" list-sessions >/dev/null 2>&1 && return 0
-  # Unreachable AND we're inside a tmux pane -> a command sandbox is blocking connect().
-  # (Outside tmux with no reachable server isn't the sandbox case: let the command's own
-  # tmux call error naturally rather than blaming a sandbox.)
-  [ -n "${TMUX:-}" ] || return 0
-  printf 'pod: %s needs the tmux socket, which is blocked in this command sandbox.\n' "${1:-this action}" >&2
-  printf '     Deck-changing features (spawn/kill workers, send keys to a pane, toggle FULL AUTO)\n' >&2
-  printf '     are unavailable from a sandboxed seat. What DOES work here: pod (roster), pod-tell /\n' >&2
-  printf '     pod-mail, pod-note, and your own state dots. Run pod-doctor for the full picture.\n' >&2
-  return 1
-}
 
 # one safe path component (mirrors _pod-common.sh's pod_sanitize; duplicated here so
 # path-only consumers don't have to pull in the comms layer).
@@ -217,14 +282,6 @@ pod_valid_component() {
   case "$1" in *[!A-Za-z0-9._-]*) return 1 ;; esac
   [ "${#1}" -le 128 ]
 }
-
-# where a sandboxed seat's hooks MIRROR the per-window state they cannot stamp onto
-# tmux ( <win> = "state ts agent_id" · <win>.work = "ts\ttext" · <win>.last =
-# "ts\tdigest\ttranscript" ). The unsandboxed pod-foreign-state poller reconciles
-# these files back onto the real tmux options, so the strip/roster/badge render
-# paths stay untouched. Data flows agent -> file -> poller -> tmux, never
-# sandboxed-agent -> socket.
-pod_mirror_dir() { printf '%s/mirror/%s' "$POD_STATE" "$(pod_path_component "${1:-${POD_SESSION:-}}")"; }
 
 # --- portability helpers (jq is OPTIONAL on every model-facing path) ---------------
 # pod_json_get <file> <key> — one top-level field from a small JSON file. jq when

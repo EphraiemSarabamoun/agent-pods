@@ -94,7 +94,8 @@ When you click *into* the docked summary pane it becomes interactive (see
 
 | Key | Action |
 | --- | --- |
-| `j` / `k` or arrows | move the card cursor (popup mode) / scroll the chat (pane mode) |
+| `j` / `k` | move the card cursor (both modes) |
+| arrows | move the card cursor (popup mode) / scroll the chat (pane mode) |
 | digit | jump the cursor to that window index |
 | `⏎` / `o` | open (switch to) the selected agent's window |
 | `x` | terminate the selected worker (inline `y/n`; window 0 refused) |

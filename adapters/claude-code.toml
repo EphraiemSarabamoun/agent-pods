@@ -27,6 +27,8 @@ mode            = "hooks"
 installer       = "hooks/claude-code/install.sh"
 native_delivery = true
 state_source    = "hooks"
+prompt_line_regex  = '^❯'
+empty_prompt_regex = '^❯[ \t\u00a0]*Try[ \t\u00a0]+".*"[ \t\u00a0]*$'
 
 # Query the locally installed Claude Code /model menu in a disposable tmux session.
 # That menu incorporates admin policy, provider configuration, account entitlements,

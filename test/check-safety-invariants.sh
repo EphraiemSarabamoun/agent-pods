@@ -88,6 +88,48 @@ check "concurrent registry claims lose no rows" test "$(jq '[.workers[]|select(.
 check "exact release frees its own claim" test "$(jq -r '.workers[]|select(.tmux_window=="@1")|.status' "$TMP/state/workers.json")" = idle
 check "exact release leaves another claim busy" test "$(jq -r '.workers[]|select(.tmux_window=="@2")|.status' "$TMP/state/workers.json")" = busy
 
+printf '%s\n' '{"workers":[{"tmux_session":"Alpha","tmux_window":"@cas","status":"idle","current_task_id":null}]}' \
+  > "$TMP/state/claim-cas.json"
+"$REPO/bin/pod-workers-json" --path "$TMP/state/claim-cas.json" \
+  claim @cas Alpha same-task old 1 old-token
+"$REPO/bin/pod-workers-json" --path "$TMP/state/claim-cas.json" \
+  release @cas Alpha same-task old-token
+"$REPO/bin/pod-workers-json" --path "$TMP/state/claim-cas.json" \
+  claim @cas Alpha same-task new 2 new-token
+if "$REPO/bin/pod-workers-json" --path "$TMP/state/claim-cas.json" \
+    release @cas Alpha same-task old-token >/dev/null 2>&1; then
+  bad "stale recovery token cannot release a newer same-task claim"
+else
+  ok "stale recovery token cannot release a newer same-task claim"
+fi
+check "newer same-task claim survives stale release" sh -c \
+  'jq -e '\''.workers[]|select(.claim_token=="new-token" and .status=="busy")'\'' "$1" >/dev/null' \
+  sh "$TMP/state/claim-cas.json"
+
+# Killing and dispatching race through one locked compare-and-delete. Exactly one
+# operation may win: either the claim survives, or the idle row is removed before it
+# can be claimed. A successful claim must never disappear.
+drop_race_ok=1
+for i in $(seq 1 12); do
+  printf '%s\n' '{"workers":[{"tmux_session":"Alpha","tmux_window":"@race","status":"idle","current_task_id":null}]}' \
+    > "$TMP/state/drop-race.json"
+  "$REPO/bin/pod-workers-json" --path "$TMP/state/drop-race.json" \
+    claim @race Alpha race-task now 1 >/dev/null 2>&1 & claim_pid=$!
+  "$REPO/bin/pod-workers-json" --path "$TMP/state/drop-race.json" \
+    drop-if-unassigned @race Alpha >/dev/null 2>&1 & drop_pid=$!
+  claim_rc=0; wait "$claim_pid" || claim_rc=$?
+  drop_rc=0; wait "$drop_pid" || drop_rc=$?
+  if [ "$claim_rc" -eq 0 ] && [ "$drop_rc" -ne 0 ]; then
+    jq -e '.workers[]|select(.current_task_id=="race-task")' \
+      "$TMP/state/drop-race.json" >/dev/null || drop_race_ok=0
+  elif [ "$drop_rc" -eq 0 ] && [ "$claim_rc" -ne 0 ]; then
+    [ "$(jq '.workers|length' "$TMP/state/drop-race.json")" -eq 0 ] || drop_race_ok=0
+  else
+    drop_race_ok=0
+  fi
+done
+check "assigned-worker drop is one locked compare-and-delete" test "$drop_race_ok" -eq 1
+
 printf '%s\n' "{\"workers\":[{\"tmux_session\":\"Alpha\",\"tmux_window\":\"$AW\",\"status\":\"idle\"},{\"tmux_session\":\"Alpha\",\"tmux_window\":\"@99999\",\"status\":\"idle\"}]}" > "$TMP/state/prune.json"
 "$REPO/bin/pod-workers-json" --path "$TMP/state/prune.json" prune "$PT"
 check "registry prune preserves a live row" sh -c \
@@ -176,6 +218,15 @@ check "sibling pod sees its own empty queue" grep -q "queue empty" <<<"$beta_pic
 check "sibling dispatch leaves Alpha queue untouched" sh -c \
   'ls "$1"/*alpha-only* >/dev/null 2>&1' sh "$TMP/runtime/inbox/_queue/Alpha"
 
+# A brand-new pod has no scoped queue/archive directories yet. Status must still be
+# valid JSON instead of failing under set -e/pipefail on an `ls` of a missing path.
+mkdir -p "$TMP/empty-status/state"
+printf '%s\n' '{"workers":[]}' > "$TMP/empty-status/state/workers.json"
+empty_status="$(env -u TMUX -u TMUX_PANE POD_TMP="$TMP/empty-status" POD_SESSION=EmptyPod \
+  "$REPO/modules/queue/bin/mgr-status" --json)"
+check "empty pod status is valid and scoped" jq -e \
+  '.pod=="EmptyPod" and .workers==[] and .queue_files==[]' <<<"$empty_status"
+
 # The watcher sees DONE from the scoped dispatch archive, then keeps seeing the same
 # task through the durable completion marker after mgr-poll removes that archive.
 "$PT" set -t Alpha @full_auto 1
@@ -189,13 +240,14 @@ wait_reason="$(POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
   POD_TASK_WAIT_POLL=0.05 "$REPO/bin/pod-task-wait" 1)"
 check "completion marker prevents a duplicate wake" test "$wait_reason" = timeout
 
-# Turning AUTO back on must wake a paused manager only through pod-deliver's idle
-# gates. Its high-water file proves the durable mailbox line was safely submitted.
+# Turning AUTO back on may wake a paused manager only when its adapter proves the
+# visible input is an empty placeholder. Stable human draft text must remain untouched.
 mkdir -p "$TMP/runtime/state/pod-tasks"
 printf '%s\n' '{"pod":"Alpha","status":"paused"}' > "$TMP/runtime/state/pod-tasks/Alpha.json"
 "$PT" set -t Alpha @full_auto 0
 "$PT" set-option -w -t "$AM" @cc_state idle
 "$PT" set-option -w -t "$AM" @agent_id claude-code
+"$PT" respawn-pane -k -t "$AM" "printf '%s\n' '❯ Try \"resume work\"'; sleep 100"
 POD_AUTO_ANIM=0 POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
   "$REPO/bin/pod-auto" on --pod Alpha >/dev/null
 manager_mail="$TMP/runtime/comms/Alpha/${AM}.mbox"
@@ -203,6 +255,59 @@ manager_hw="$TMP/runtime/comms/Alpha/${AM}.hw"
 check "AUTO resume writes durable manager mail" grep -q "resume the paused pod-task" "$manager_mail"
 check "AUTO resume nudges an idle manager" test \
   "$(cat "$manager_hw" 2>/dev/null)" = "$(awk 'END{print NR+0}' "$manager_mail")"
+old_hw="$(cat "$manager_hw")"
+printf '[00:00] full-auto switch: second safe test\n' >> "$manager_mail"
+"$PT" respawn-pane -k -t "$AM" "printf '%s\n' '❯ human draft'; sleep 100"
+POD_DELIVER_REQUIRE_EMPTY=1 POD_TMUX="$PT" POD_TMP="$TMP/runtime" \
+  "$REPO/bin/pod-deliver" "$AM" --mode submit >/dev/null
+check "AUTO resume does not submit over a stable human draft" test \
+  "$(cat "$manager_hw")" = "$old_hw"
+
+# Recover both SIGKILL windows before the archived dispatching marker exists.
+POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
+  "$REPO/modules/queue/bin/mgr-stage" execute --id claim-before-move context=x task_body=x \
+  constraints= output_schema= rollback_plan= scope= >/dev/null
+POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
+  "$REPO/modules/queue/bin/mgr-queue" claim-before-move >/dev/null
+premarker_worker="$(jq -r '.workers[]|select(.status=="idle")|.tmux_window' "$TMP/runtime/state/workers.json" | head -1)"
+"$REPO/bin/pod-workers-json" --path "$TMP/runtime/state/workers.json" \
+  claim "$premarker_worker" Alpha claim-before-move old 1 claim-before-token
+MGR_DISPATCH_RECOVERY_SECONDS=0 MGR_REAP_FINISHED_WORKERS=0 POD_TMUX="$PT" \
+  POD_TMP="$TMP/runtime" POD_SESSION=Alpha "$REPO/modules/queue/bin/mgr-poll" >/dev/null
+check "stale claim before queue move is released" test \
+  "$(jq -r --arg w "$premarker_worker" '.workers[]|select(.tmux_window==$w)|.status' "$TMP/runtime/state/workers.json")" = idle
+check "stale claim leaves its queued task intact" sh -c \
+  'ls "$1"/*claim-before-move* >/dev/null 2>&1' sh "$TMP/runtime/inbox/_queue/Alpha"
+
+POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
+  "$REPO/modules/queue/bin/mgr-stage" execute --id move-before-marker context=x task_body=x \
+  constraints= output_schema= rollback_plan= scope= >/dev/null
+move_queue="$(POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
+  "$REPO/modules/queue/bin/mgr-queue" move-before-marker)"
+"$REPO/bin/pod-workers-json" --path "$TMP/runtime/state/workers.json" \
+  claim "$premarker_worker" Alpha move-before-marker old 1 move-before-token
+mkdir -p "$TMP/runtime/state/dispatched/Alpha"
+mv "$move_queue" "$TMP/runtime/state/dispatched/Alpha/move-before-marker.json"
+MGR_DISPATCH_RECOVERY_SECONDS=0 MGR_REAP_FINISHED_WORKERS=0 POD_TMUX="$PT" \
+  POD_TMP="$TMP/runtime" POD_SESSION=Alpha "$REPO/modules/queue/bin/mgr-poll" >/dev/null
+check "stale queue move before marker is restored" sh -c \
+  'ls "$1"/*move-before-marker* >/dev/null 2>&1' sh "$TMP/runtime/inbox/_queue/Alpha"
+check "stale queue move releases its exact claim" test \
+  "$(jq -r --arg w "$premarker_worker" '.workers[]|select(.tmux_window==$w)|.status' "$TMP/runtime/state/workers.json")" = idle
+
+# A fenced dispatcher can wake late and move the queue record after recovery has
+# already released its row. The status is still queued and no delivery was possible,
+# so the orphan archive must be restored without needing a worker claim.
+POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
+  "$REPO/modules/queue/bin/mgr-stage" execute --id orphan-queued context=x task_body=x \
+  constraints= output_schema= rollback_plan= scope= >/dev/null
+orphan_queue="$(POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
+  "$REPO/modules/queue/bin/mgr-queue" orphan-queued)"
+mv "$orphan_queue" "$TMP/runtime/state/dispatched/Alpha/orphan-queued.json"
+MGR_REAP_FINISHED_WORKERS=0 POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
+  "$REPO/modules/queue/bin/mgr-poll" >/dev/null
+check "orphan queued archive is restored after a late stale move" sh -c \
+  'ls "$1"/*orphan-queued* >/dev/null 2>&1' sh "$TMP/runtime/inbox/_queue/Alpha"
 
 # Simulate SIGKILL between archive and delivery commit. An old dispatching record on
 # an idle worker is restored to this pod's queue and its exact claim is released.
@@ -220,12 +325,123 @@ jq '.status="dispatching" | .dispatch_started_epoch=1' "$recover_archive" > "$TM
 mv "$TMP/recover.json" "$recover_archive"
 "$PT" set-option -w -t "$recover_worker" @cc_state idle
 "$PT" set-option -w -t "$recover_worker" @work ""
+"$PT" set-option -w -t "$recover_worker" @work_at ""
 MGR_DISPATCH_RECOVERY_SECONDS=0 MGR_REAP_FINISHED_WORKERS=0 POD_TMUX="$PT" \
   POD_TMP="$TMP/runtime" POD_SESSION=Alpha "$REPO/modules/queue/bin/mgr-poll" >/dev/null
 check "stale half-dispatch is requeued" sh -c \
   'ls "$1"/*recover-task* >/dev/null 2>&1' sh "$TMP/runtime/inbox/_queue/Alpha"
 check "stale half-dispatch releases exact worker" test \
   "$(jq -r --arg w "$recover_worker" '.workers[]|select(.tmux_window==$w)|.status' "$TMP/runtime/state/workers.json")" = idle
+
+# Recovery never races a dispatcher process that is still alive. The claim token
+# carries its owner pid; even an ancient phase remains untouched until that owner exits.
+POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
+  "$REPO/modules/queue/bin/mgr-stage" execute --id live-dispatcher context=x task_body=x \
+  constraints= output_schema= rollback_plan= scope= >/dev/null
+live_queue="$(POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
+  "$REPO/modules/queue/bin/mgr-queue" live-dispatcher)"
+live_token="1-$$-live"
+"$REPO/bin/pod-workers-json" --path "$TMP/runtime/state/workers.json" \
+  claim "$recover_worker" Alpha live-dispatcher old 1 "$live_token"
+live_archive="$TMP/runtime/state/dispatched/Alpha/live-dispatcher.json"
+mv "$live_queue" "$live_archive"
+jq --arg w "$recover_worker" --arg token "$live_token" \
+  '. + {status:"dispatching",target:$w,claim_token:$token,dispatch_started_epoch:1}' \
+  "$live_archive" > "$TMP/live-dispatcher.json"
+mv "$TMP/live-dispatcher.json" "$live_archive"
+MGR_DISPATCH_RECOVERY_SECONDS=0 MGR_REAP_FINISHED_WORKERS=0 POD_TMUX="$PT" \
+  POD_TMP="$TMP/runtime" POD_SESSION=Alpha "$REPO/modules/queue/bin/mgr-poll" >/dev/null
+check "live dispatcher ownership defers stale recovery" test -f "$live_archive"
+check "live dispatcher claim remains assigned" test \
+  "$(jq -r --arg w "$recover_worker" '.workers[]|select(.tmux_window==$w)|.status' "$TMP/runtime/state/workers.json")" = busy
+"$REPO/bin/pod-workers-json" --path "$TMP/runtime/state/workers.json" \
+  release "$recover_worker" Alpha live-dispatcher "$live_token"
+mv "$live_archive" "$live_queue"
+
+# If a dispatcher dies after touching the live input buffer but before Enter, idle
+# is ambiguous: the trigger may still be executable. Fence the live worker instead
+# of requeueing, then recover only after the pane (and its stale input) is gone.
+uncertain_worker="$("$PT" new-window -d -t Alpha -n uncertain -P -F '#{window_id}' 'sleep 100')"
+"$PT" set-option -w -t "$uncertain_worker" @cc_state idle
+"$PT" set-option -w -t "$uncertain_worker" @agent_id claude-code
+uncertain_entry="$(jq -nc --arg pod Alpha --arg win "$uncertain_worker" \
+  '{tmux_session:$pod,tmux_window:$win,agent_id:"claude-code",status:"idle",
+    current_task_id:null,registered_at:"now"}')"
+"$REPO/bin/pod-workers-json" --path "$TMP/runtime/state/workers.json" \
+  register "$uncertain_entry"
+POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
+  "$REPO/modules/queue/bin/mgr-stage" execute --id typed-gap context=x task_body=x \
+  constraints= output_schema= rollback_plan= scope= >/dev/null
+POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
+  "$REPO/modules/queue/bin/mgr-queue" typed-gap >/dev/null
+POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
+  "$REPO/modules/queue/bin/mgr-dispatch" --task typed-gap \
+    --tmux-window "$uncertain_worker" >/dev/null
+uncertain_archive="$TMP/runtime/state/dispatched/Alpha/typed-gap.json"
+uncertain_token="$(jq -r '.claim_token' "$uncertain_archive")"
+jq '.status="typed" | .dispatch_started_epoch=1' "$uncertain_archive" > "$TMP/typed-gap.json"
+mv "$TMP/typed-gap.json" "$uncertain_archive"
+"$PT" set-option -w -t "$uncertain_worker" @cc_state idle
+"$PT" set-option -w -t "$uncertain_worker" @work ""
+"$PT" set-option -w -t "$uncertain_worker" @work_at ""
+MGR_DISPATCH_RECOVERY_SECONDS=0 MGR_REAP_FINISHED_WORKERS=0 POD_TMUX="$PT" \
+  POD_TMP="$TMP/runtime" POD_SESSION=Alpha "$REPO/modules/queue/bin/mgr-poll" >/dev/null
+check "typed-but-unsubmitted dispatch is fenced, not requeued" test \
+  "$(jq -r '.status' "$uncertain_archive")" = delivery_uncertain
+check "ambiguous live worker is marked uncertain" test \
+  "$(jq -r --arg w "$uncertain_worker" '.workers[]|select(.tmux_window==$w)|.status' "$TMP/runtime/state/workers.json")" = uncertain
+if "$REPO/bin/pod-workers-json" --path "$TMP/runtime/state/workers.json" \
+    check-claim "$uncertain_worker" Alpha typed-gap "$uncertain_token" >/dev/null 2>&1; then
+  bad "uncertainty fence stops a paused dispatcher before Enter"
+else
+  ok "uncertainty fence stops a paused dispatcher before Enter"
+fi
+check "ambiguous typed task is absent from queue" sh -c \
+  '! ls "$1"/*typed-gap* >/dev/null 2>&1' sh "$TMP/runtime/inbox/_queue/Alpha"
+# If Enter won the race after the fence, its terminal archive phase restores the
+# exact claim to busy so DONE processing cannot strand a delivered task.
+jq '.status="dispatched"' "$uncertain_archive" > "$TMP/typed-gap-dispatched.json"
+mv "$TMP/typed-gap-dispatched.json" "$uncertain_archive"
+MGR_REAP_FINISHED_WORKERS=0 POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
+  "$REPO/modules/queue/bin/mgr-poll" >/dev/null
+check "submitted dispatch reconciles an uncertainty fence" test \
+  "$(jq -r --arg w "$uncertain_worker" '.workers[]|select(.tmux_window==$w)|.status' "$TMP/runtime/state/workers.json")" = busy
+check "reconciled delivery makes the exact claim live again" \
+  "$REPO/bin/pod-workers-json" --path "$TMP/runtime/state/workers.json" \
+    check-claim "$uncertain_worker" Alpha typed-gap "$uncertain_token"
+"$PT" kill-window -t "$uncertain_worker"
+MGR_DISPATCH_RECOVERY_SECONDS=0 MGR_REAP_FINISHED_WORKERS=0 POD_TMUX="$PT" \
+  POD_TMP="$TMP/runtime" POD_SESSION=Alpha "$REPO/modules/queue/bin/mgr-poll" >/dev/null
+check "ambiguous task requeues after its pane dies" sh -c \
+  'ls "$1"/*typed-gap* >/dev/null 2>&1' sh "$TMP/runtime/inbox/_queue/Alpha"
+check "dead ambiguous worker is pruned after recovery" sh -c \
+  '! jq -e --arg w "$1" '\''.workers[]|select(.tmux_window==$w)'\'' "$2" >/dev/null' \
+  sh "$uncertain_worker" "$TMP/runtime/state/workers.json"
+
+# DONE is authoritative even if the runtime hook never reported busy after an
+# uncertain/manual delivery. Completion must release that exact claim.
+done_worker="$("$PT" new-window -d -t Alpha -n done-uncertain -P -F '#{window_id}' 'sleep 100')"
+"$PT" set-option -w -t "$done_worker" @cc_state idle
+done_entry="$(jq -nc --arg pod Alpha --arg win "$done_worker" \
+  '{tmux_session:$pod,tmux_window:$win,agent_id:"claude-code",status:"idle",
+    current_task_id:null,registered_at:"now"}')"
+"$REPO/bin/pod-workers-json" --path "$TMP/runtime/state/workers.json" register "$done_entry"
+"$REPO/bin/pod-workers-json" --path "$TMP/runtime/state/workers.json" \
+  claim "$done_worker" Alpha done-uncertain old 1 done-token
+"$REPO/bin/pod-workers-json" --path "$TMP/runtime/state/workers.json" \
+  mark-uncertain "$done_worker" Alpha done-uncertain done-token
+mkdir -p "$TMP/runtime/inbox/done-uncertain"
+touch "$TMP/runtime/inbox/done-uncertain/DONE"
+jq -nc --arg w "$done_worker" \
+  '{task_id:"done-uncertain",status:"delivery_uncertain",target:$w,
+    claim_token:"done-token",priority:100}' \
+  > "$TMP/runtime/state/dispatched/Alpha/done-uncertain.json"
+MGR_REAP_FINISHED_WORKERS=0 POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
+  "$REPO/modules/queue/bin/mgr-poll" >/dev/null
+check "DONE releases an uncertain exact claim" test \
+  "$(jq -r --arg w "$done_worker" '.workers[]|select(.tmux_window==$w)|.status' "$TMP/runtime/state/workers.json")" = idle
+check "DONE clears an uncertain dispatch archive" test \
+  ! -e "$TMP/runtime/state/dispatched/Alpha/done-uncertain.json"
 
 # Hook uninstallers remove only exact owned entries and preserve source permissions.
 mkdir -p "$TMP/home/.claude" "$TMP/home/.codex"
@@ -242,14 +458,25 @@ HOME="$TMP/home" CODEX_HOME="$TMP/home/.codex" \
   "$REPO/hooks/codex/uninstall.sh" >/dev/null
 check "Claude uninstaller preserves unrelated lookalike" grep -q pod-mail-check-health "$TMP/home/.claude/settings.json"
 check "Codex uninstaller preserves unrelated lookalike" grep -q pod-codex-state-health "$TMP/home/.codex/hooks.json"
+# Permission bits, BSD and GNU. Branch on uname — do NOT use the obvious
+# `stat -f '%Lp' x || stat -c '%a' x` chain: on GNU coreutils -f is --file-system, so
+# it SUCCEEDS (exit 0) and prints a filesystem dump, the fallback never fires, and the
+# comparison below silently reads `File: "..."` instead of a mode. Same trap
+# _pod-common.sh's pod_file_mtime documents for the -f %m / -c %Y pair.
+file_mode() {
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) stat -f '%Lp' "${1:-}" 2>/dev/null ;;
+    *)      stat -c '%a'  "${1:-}" 2>/dev/null ;;
+  esac
+}
 mode_ok=1
 for backup in "$TMP/home/.claude/settings.json".pod-bak.* "$TMP/home/.codex/hooks.json".pod-bak.*; do
-  mode="$(stat -f '%Lp' "$backup" 2>/dev/null || stat -c '%a' "$backup")"
+  mode="$(file_mode "$backup")"
   [ "$mode" = 600 ] || { bad "backup mode preserved at 0600 ($backup was $mode)"; mode_ok=0; }
 done
 [ "$mode_ok" = 1 ] && ok "hook backups preserve 0600 mode"
 for config in "$TMP/home/.claude/settings.json" "$TMP/home/.codex/hooks.json"; do
-  mode="$(stat -f '%Lp' "$config" 2>/dev/null || stat -c '%a' "$config")"
+  mode="$(file_mode "$config")"
   check "hook rewrite preserves 0600 mode ($(basename "$config"))" test "$mode" = 600
 done
 

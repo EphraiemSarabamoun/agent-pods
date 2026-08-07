@@ -5,12 +5,9 @@
 #   2. the user's own operator memory (~/.config/pod/operator-memory.md), if present,
 #      which pod-remember appends to (durable, cross-session — distinct from the
 #      ephemeral per-pod journal)
-#   3. a PROACTIVE sandbox notice when this seat's tmux socket is blocked, so the agent
-#      knows up front that deck-changing features (spawn/kill/send-keys/toggle) are
-#      unavailable from here while reads + comms still work.
 #
-# All of this rides the same additionalContext path the roster does, so it works
-# identically for a sandboxed seat (pod_emit_ctx falls back jq -> python3 -> stdout).
+# All of this rides the same additionalContext path the roster does (pod_emit_ctx
+# falls back jq -> python3 -> stdout).
 # Silent outside a pod, and when POD_PRIMER=0. Never fails a hook -> always exits 0.
 # bash 3.2 safe.
 set -u
@@ -21,34 +18,17 @@ POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null
 [ -n "${TMUX:-}" ] || exit 0
 T="$POD_TMUX"
 
-# --- am I in a pod, and which window am I? (socket-first, env fallback) ------------
-GRP="$POD_STATE/tmux_group.json"
+# --- am I in a pod, and which window am I? -----------------------------------------
 me=""; sess="${POD_SESSION:-}"
-if pod_socket_ok; then
-  me="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null)"
-  [ -n "$sess" ] || sess="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{session_name}' 2>/dev/null)"
-  # only real pods (the awareness hook uses the same @is_pod gate)
-  [ "$("$T" show-options -t "=${sess}:" -qv @is_pod 2>/dev/null)" = "1" ] || exit 0
-else
-  # sandbox: no socket. Being spawned by pod-launch/bootstrap set POD_WINDOW +
-  # POD_SESSION in the env — their presence is our "we're in a pod" signal.
-  me="${POD_WINDOW:-}"
-  { [ -n "$me" ] && [ -n "$sess" ]; } || exit 0
-fi
+me="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null)"
+[ -n "$sess" ] || sess="$("$T" display-message -p -t "${TMUX_PANE:-}" '#{session_name}' 2>/dev/null)"
+# only real pods (the awareness hook uses the same @is_pod gate)
+[ "$("$T" show-options -t "=${sess}:" -qv @is_pod 2>/dev/null)" = "1" ] || exit 0
 
 # --- role: manager iff my window is THIS pod's manager ---------------------------
-# The global group file intentionally describes only the primary pod. Socket-capable
-# seats read the per-session option; sandboxed seats use the role exported at pane
-# bootstrap. The group file is only a legacy fallback for the recorded primary.
-role="${POD_ROLE:-worker}"
-if pod_socket_ok; then
-  mgrwin="$("$T" show-options -t "$sess" -qv @pod_manager_win 2>/dev/null || true)"
-  role="worker"
-  [ -n "$mgrwin" ] && [ "$me" = "$mgrwin" ] && role="manager"
-elif [ -z "${POD_ROLE:-}" ] && [ "$(pod_json_get "$GRP" session)" = "$sess" ]; then
-  mgrwin="$(pod_json_get "$GRP" manager_window)"
-  [ -n "$mgrwin" ] && [ "$me" = "$mgrwin" ] && role="manager"
-fi
+mgrwin="$("$T" show-options -t "$sess" -qv @pod_manager_win 2>/dev/null || true)"
+role="worker"
+[ -n "$mgrwin" ] && [ "$me" = "$mgrwin" ] && role="manager"
 
 # --- assemble the injection -------------------------------------------------------
 primer_file="$POD_PRIMER_DIR/$role.md"
@@ -69,18 +49,6 @@ if [ -s "$POD_OPERATOR_MEMORY" ]; then
 
 Your operator memory (from \`pod-remember\`):
 ${mem}"
-fi
-
-# proactive sandbox notice
-if ! pod_socket_ok; then
-  msg="${msg}
-
-⚠ This seat is in a command sandbox: the tmux socket is unreachable from here. Pod
-features that READ or EXCHANGE work normally via the filesystem — the roster (\`pod\`),
-the journal, sending and receiving pod-mail (\`pod-tell\` / \`pod-mail\`), and your own
-state dots. Features that CHANGE the deck are blocked from this seat: spawning or
-killing workers, sending keystrokes to another pane, reading another agent's screen,
-and toggling FULL AUTO. Run \`pod-doctor\` for the full breakdown."
 fi
 
 pod_emit_ctx "SessionStart" "$msg"

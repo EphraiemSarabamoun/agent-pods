@@ -56,40 +56,209 @@ done
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 NOW_EPOCH=$(date +%s)
 mkdir -p "$QUEUE_DIR" "$DISPATCHED" "$COMPLETED"
-
-# ---- interrupted-dispatch recovery -------------------------------------------
-# mgr-dispatch archives a task as status=dispatching before it types anything and
-# flips it to dispatched immediately after Enter. A killed dispatcher therefore
-# leaves an explicit transaction to heal. After a grace period: a live busy/wait
-# worker means delivery happened (commit the archive); an idle/dead worker means it
-# did not (atomically restore the queue record and release only that exact claim).
 RECOVERY_AFTER="${MGR_DISPATCH_RECOVERY_SECONDS:-30}"
 case "$RECOVERY_AFTER" in ''|*[!0-9]*) RECOVERY_AFTER=30 ;; esac
+if [ "$RECOVERY_AFTER" -eq 0 ] && [ "${MGR_DISPATCH_ALLOW_ZERO_RECOVERY:-0}" != "1" ]; then
+  RECOVERY_AFTER=1
+fi
+
+# After a recovery owner atomically fences a claim, re-read the archive phase.
+# A dispatcher that passed its previous claim check may have advanced the phase
+# before observing the fence. `typing`/`typed` on a live pane is ambiguous and
+# must stay withheld; `dispatched` proves Enter landed and cancels recovery.
+# Return 0 when the recovery has been resolved/withheld, 1 when moving the
+# archive back to the queue is still safe.
+recheck_fenced_delivery() {
+  local wid="$1" tid="$2" archive="$3" recovery="$4" phase live tmp
+  phase="$(jq -r '.status // empty' "$archive" 2>/dev/null || true)"
+  live="$("$T" display-message -p -t "$wid" '#{session_name}' 2>/dev/null || true)"
+  case "$phase" in
+    dispatched)
+      "$WORKERS_UPDATE" --path "$WORKERS_PATH" cancel-recovery \
+        "$wid" "$CURRENT_POD" "$tid" "$recovery" >/dev/null 2>&1 || true
+      return 0
+      ;;
+    typing|typed|delivery_uncertain)
+      if [ "$live" = "$CURRENT_POD" ]; then
+        "$WORKERS_UPDATE" --path "$WORKERS_PATH" fence-recovery \
+          "$wid" "$CURRENT_POD" "$tid" "$recovery" >/dev/null 2>&1 || return 0
+        tmp="${archive}.tmp.$$"
+        if jq -e --arg fenced "$NOW" \
+            'if (.status=="typing" or .status=="typed"
+                 or .status=="delivery_uncertain")
+             then . + {status:"delivery_uncertain", delivery_uncertain_at:$fenced}
+             else empty end' \
+            "$archive" > "$tmp"; then
+          mv "$tmp" "$archive"
+          jq -nc --arg ts "$NOW" --arg tid "$tid" --arg tgt "$wid" \
+            --arg pod "$CURRENT_POD" \
+            '{ts:$ts,event:"delivery_uncertain",task_id:$tid,target:$tgt,pod:$pod,
+              reason:"delivery phase advanced while recovery fenced claim"}' >> "$LOG_PATH"
+        else
+          rm -f "$tmp" 2>/dev/null || true
+        fi
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
+recovery_owner_alive() {
+  local token="$1" owner
+  owner="$(printf '%s' "$token" | awk -F- '{print $2}')"
+  case "$owner" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$owner" 2>/dev/null
+}
+
+claim_owner_alive() {
+  local token="$1" owner
+  owner="$(printf '%s' "$token" | awk -F- '{print $2}')"
+  case "$owner" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$owner" 2>/dev/null
+}
+
+# ---- pre-marker dispatch recovery --------------------------------------------
+# There are two tiny SIGKILL windows before mgr-dispatch can stamp an archived
+# record as status=dispatching:
+#   1. the worker was claimed but the queue file has not moved yet;
+#   2. the queue file moved, but it still says status=queued.
+# Claims carry a monotonic-enough wall-clock epoch specifically so a later poll can
+# distinguish those abandoned transitions from a dispatcher still inside the normal
+# millisecond-scale critical section. In both cases delivery has NOT begun, so after
+# the grace period it is safe to restore/release without risking duplicate execution.
+premarker_rows="$(jq -r --arg pod "$CURRENT_POD" '.workers[]
+  | select(.tmux_session==$pod and ((.current_task_id // "") != ""))
+  | (.tmux_window // "") + "|" + (.current_task_id // "") + "|"
+    + ((.started_epoch // 0)|tostring) + "|" + (.status // "") + "|"
+    + (.claim_token // "") + "|" + (.recovery_token // "")' \
+  "$WORKERS_PATH" 2>/dev/null || true)"
+if [ -n "$premarker_rows" ]; then
+  while IFS='|' read -r wid tid claim_epoch claim_status claim_token recovery_token; do
+    [ -n "$wid" ] || continue
+    pod_valid_component "$tid" || continue
+    case "$claim_epoch" in ''|*[!0-9]*) claim_epoch=0 ;; esac
+    [ "$claim_epoch" -gt 0 ] || continue
+    [ $((NOW_EPOCH - claim_epoch)) -ge "$RECOVERY_AFTER" ] || continue
+
+    archive="${DISPATCHED}/${tid}.json"
+    archive_status=""
+    [ ! -f "$archive" ] || archive_status="$(jq -r '.status // empty' "$archive" 2>/dev/null || true)"
+    queued=""
+    for qf in "$QUEUE_DIR"/*-"${tid}".json; do
+      [ -e "$qf" ] || continue
+      [ "$(jq -r '.task_id // empty' "$qf" 2>/dev/null)" = "$tid" ] || continue
+      queued="$qf"; break
+    done
+
+    recovered=""
+    if [ -z "$archive_status" ] && [ -n "$queued" ]; then
+      # SIGKILL after the worker claim, before the queue-file move.
+      recovered="claim-before-move"
+    elif [ "$archive_status" = "queued" ] && [ -z "$queued" ]; then
+      # SIGKILL after the move, before the dispatching marker rewrite.
+      recovered="move-before-marker"
+    fi
+
+    if [ -n "$recovered" ]; then
+      if [ "$claim_status" = "recovering" ]; then
+        active_recovery="$recovery_token"
+        [ -n "$active_recovery" ] || continue
+        recovery_owner_alive "$active_recovery" && continue
+      else
+        [ -n "$claim_token" ] || continue
+        claim_owner_alive "$claim_token" && continue
+        active_recovery="${NOW_EPOCH}-$$-${RANDOM:-0}"
+        "$WORKERS_UPDATE" --path "$WORKERS_PATH" begin-recovery \
+          "$wid" "$CURRENT_POD" "$tid" "$claim_token" "$active_recovery" \
+          >/dev/null 2>&1 || continue
+      fi
+
+      # The still-queued task can be claimed by another worker while this stale
+      # pre-move claim is being recovered. Never mistake that newer archive for
+      # the stale dispatch just fenced.
+      archive_token=""
+      [ ! -f "$archive" ] ||
+        archive_token="$(jq -r '.claim_token // empty' "$archive" 2>/dev/null || true)"
+      other_claim="$(jq -r --arg pod "$CURRENT_POD" --arg tid "$tid" \
+        --arg token "$claim_token" \
+        'first(.workers[] | select(.tmux_session==$pod and .current_task_id==$tid
+          and ((.claim_token // "") != $token)) | .tmux_window) // empty' \
+        "$WORKERS_PATH" 2>/dev/null || true)"
+      if { [ -n "$archive_token" ] && [ "$archive_token" != "$claim_token" ]; } ||
+         [ -n "$other_claim" ]; then
+        "$WORKERS_UPDATE" --path "$WORKERS_PATH" finish-recovery \
+          "$wid" "$CURRENT_POD" "$tid" "$active_recovery" >/dev/null 2>&1 || true
+        jq -nc --arg ts "$NOW" --arg tid "$tid" --arg tgt "$wid" \
+          --arg pod "$CURRENT_POD" \
+          '{ts:$ts,event:"dispatch_recovered",task_id:$tid,target:$tgt,pod:$pod,
+            reason:"stale pre-marker claim superseded"}' >> "$LOG_PATH"
+        continue
+      fi
+
+      if recheck_fenced_delivery "$wid" "$tid" "$archive" "$active_recovery"; then
+        continue
+      fi
+      if [ -f "$archive" ]; then
+        priority="$(jq -r '.priority // 100' "$archive" 2>/dev/null || echo 100)"
+        case "$priority" in ''|*[!0-9]*) priority=100 ;; esac
+        queued_at="$(jq -r '.queued_at // empty' "$archive" 2>/dev/null || true)"
+        [ -n "$queued_at" ] || queued_at="$NOW"
+        stamp="$(printf '%s' "$queued_at" | tr ':+' '--')"
+        restored="${QUEUE_DIR}/$(printf '%03d' "$priority")-${stamp}-${tid}.json"
+        mv "$archive" "$restored" 2>/dev/null || continue
+        tmp="${restored}.tmp.$$"
+        if jq '. + {status:"queued"} | del(.target, .dispatch_started_at,
+          .dispatch_started_epoch, .dispatched_at, .claim_token,
+          .delivery_uncertain_at)' "$restored" > "$tmp"; then
+          mv "$tmp" "$restored"
+        else
+          rm -f "$tmp" 2>/dev/null || true
+        fi
+        [ "$recovered" = "move-before-marker" ] ||
+          recovered="${recovered}+late-archive"
+      elif [ -z "$queued" ] || [ ! -f "$queued" ]; then
+        "$WORKERS_UPDATE" --path "$WORKERS_PATH" cancel-recovery \
+          "$wid" "$CURRENT_POD" "$tid" "$active_recovery" >/dev/null 2>&1 || true
+        continue
+      fi
+
+      "$WORKERS_UPDATE" --path "$WORKERS_PATH" finish-recovery \
+        "$wid" "$CURRENT_POD" "$tid" "$active_recovery" >/dev/null 2>&1 || continue
+      if [ "$("$T" display-message -p -t "$wid" '#{session_name}' 2>/dev/null || true)" != "$CURRENT_POD" ]; then
+        "$WORKERS_UPDATE" --path "$WORKERS_PATH" prune "$T" >/dev/null 2>&1 || true
+      fi
+      jq -nc --arg ts "$NOW" --arg tid "$tid" --arg tgt "$wid" \
+        --arg pod "$CURRENT_POD" --arg reason "$recovered" \
+        '{ts:$ts,event:"dispatch_recovered",task_id:$tid,target:$tgt,pod:$pod,reason:$reason}' \
+        >> "$LOG_PATH"
+    fi
+  done <<< "$premarker_rows"
+fi
+
+# A dispatcher paused after recovery released its claim can still wake and move the
+# queue record before noticing that its claim was fenced. Such an archive is still
+# status=queued and has no matching worker assignment. Delivery cannot have begun, so
+# restoring it is unambiguous. Active and recovering dispatchers retain a registry row
+# and are left to the pre-marker recovery above.
 for archive in "$DISPATCHED"/*.json; do
   [ -e "$archive" ] || continue
-  [ "$(jq -r '.status // empty' "$archive" 2>/dev/null)" = "dispatching" ] || continue
-  started_epoch="$(jq -r '.dispatch_started_epoch // 0' "$archive" 2>/dev/null || echo 0)"
-  case "$started_epoch" in ''|*[!0-9]*) started_epoch=0 ;; esac
-  [ $((NOW_EPOCH - started_epoch)) -ge "$RECOVERY_AFTER" ] || continue
+  [ "$(jq -r '.status // empty' "$archive" 2>/dev/null || true)" = "queued" ] || continue
   tid="$(jq -r '.task_id // empty' "$archive" 2>/dev/null || true)"
-  wid="$(jq -r '.target // empty' "$archive" 2>/dev/null || true)"
   pod_valid_component "$tid" || continue
-  if [ -f "$INBOX_ROOT/$tid/DONE" ] || [ -f "$INBOX_ROOT/$tid/EXECUTED" ]; then
+  if jq -e --arg pod "$CURRENT_POD" --arg tid "$tid" \
+      '.workers[] | select(.tmux_session==$pod and .current_task_id==$tid)' \
+      "$WORKERS_PATH" >/dev/null 2>&1; then
     continue
   fi
-  live_session="$("$T" display-message -p -t "$wid" '#{session_name}' 2>/dev/null || true)"
-  live_state="$("$T" show-options -w -t "$wid" -qv @cc_state 2>/dev/null || true)"
-  live_work="$("$T" show-options -w -t "$wid" -qv @work 2>/dev/null || true)"
-  if [ "$live_session" = "$CURRENT_POD" ] && { [ "$live_state" = busy ] || [ "$live_state" = wait ] || [ -n "$live_work" ]; }; then
-    tmp="${archive}.tmp.$$"
-    if jq --arg healed "$NOW" '. + {status:"dispatched", dispatch_recovered_at:$healed}' \
-        "$archive" > "$tmp"; then
-      mv "$tmp" "$archive"
-    else
-      rm -f "$tmp" 2>/dev/null || true
-    fi
-    continue
-  fi
+  already_queued=0
+  for qf in "$QUEUE_DIR"/*-"${tid}".json; do
+    [ -e "$qf" ] || continue
+    [ "$(jq -r '.task_id // empty' "$qf" 2>/dev/null || true)" = "$tid" ] || continue
+    already_queued=1
+    break
+  done
+  [ "$already_queued" -eq 0 ] || continue
   priority="$(jq -r '.priority // 100' "$archive" 2>/dev/null || echo 100)"
   case "$priority" in ''|*[!0-9]*) priority=100 ;; esac
   queued_at="$(jq -r '.queued_at // empty' "$archive" 2>/dev/null || true)"
@@ -97,15 +266,163 @@ for archive in "$DISPATCHED"/*.json; do
   stamp="$(printf '%s' "$queued_at" | tr ':+' '--')"
   restored="${QUEUE_DIR}/$(printf '%03d' "$priority")-${stamp}-${tid}.json"
   if mv "$archive" "$restored" 2>/dev/null; then
+    jq -nc --arg ts "$NOW" --arg tid "$tid" --arg pod "$CURRENT_POD" \
+      '{ts:$ts,event:"dispatch_recovered",task_id:$tid,pod:$pod,
+        reason:"orphan queued archive"}' >> "$LOG_PATH"
+  fi
+done
+
+# Enter may have landed just as another poll fenced the worker as uncertain.
+# `dispatched` is authoritative, so reconcile the exact claim token before the
+# DONE sweep; otherwise a completed task could remain permanently quarantined.
+for archive in "$DISPATCHED"/*.json; do
+  [ -e "$archive" ] || continue
+  [ "$(jq -r '.status // empty' "$archive" 2>/dev/null || true)" = "dispatched" ] ||
+    continue
+  tid="$(jq -r '.task_id // empty' "$archive" 2>/dev/null || true)"
+  wid="$(jq -r '.target // empty' "$archive" 2>/dev/null || true)"
+  claim_token="$(jq -r '.claim_token // empty' "$archive" 2>/dev/null || true)"
+  pod_valid_component "$tid" || continue
+  [ -n "$wid" ] && [ -n "$claim_token" ] || continue
+  "$WORKERS_UPDATE" --path "$WORKERS_PATH" confirm-delivery \
+    "$wid" "$CURRENT_POD" "$tid" "$claim_token" >/dev/null 2>&1 || true
+done
+
+# ---- interrupted-dispatch recovery -------------------------------------------
+# mgr-dispatch archives explicit dispatching/typing/typed phases around pane input
+# and flips to dispatched immediately after Enter. A killed dispatcher therefore
+# leaves a transaction whose phase defines the safe recovery: dispatching is
+# pre-delivery, typing/typed are withheld on a live pane, and a dead pane is safe to
+# restore because its input buffer died with it.
+for archive in "$DISPATCHED"/*.json; do
+  [ -e "$archive" ] || continue
+  dispatch_phase="$(jq -r '.status // empty' "$archive" 2>/dev/null)"
+  case "$dispatch_phase" in
+    dispatching|typing|typed|delivery_uncertain) ;;
+    *) continue ;;
+  esac
+  started_epoch="$(jq -r '.dispatch_started_epoch // 0' "$archive" 2>/dev/null || echo 0)"
+  case "$started_epoch" in ''|*[!0-9]*) started_epoch=0 ;; esac
+  [ $((NOW_EPOCH - started_epoch)) -ge "$RECOVERY_AFTER" ] || continue
+  tid="$(jq -r '.task_id // empty' "$archive" 2>/dev/null || true)"
+  wid="$(jq -r '.target // empty' "$archive" 2>/dev/null || true)"
+  archive_claim_token="$(jq -r '.claim_token // empty' "$archive" 2>/dev/null || true)"
+  pod_valid_component "$tid" || continue
+  if [ -f "$INBOX_ROOT/$tid/DONE" ] || [ -f "$INBOX_ROOT/$tid/EXECUTED" ]; then
+    continue
+  fi
+  live_session="$("$T" display-message -p -t "$wid" '#{session_name}' 2>/dev/null || true)"
+  live_state="$("$T" show-options -w -t "$wid" -qv @cc_state 2>/dev/null || true)"
+  live_claim="$(jq -r --arg w "$wid" --arg pod "$CURRENT_POD" --arg tid "$tid" \
+    --arg token "$archive_claim_token" \
+    'first(.workers[] | select(.tmux_window==$w and .tmux_session==$pod
+      and .current_task_id==$tid and ($token=="" or .claim_token==$token))
+      | (.status // "")) // empty' \
+    "$WORKERS_PATH" 2>/dev/null || true)"
+  live_claim_status="$live_claim"
+  # Once typing might have touched a live input buffer, idle is no longer proof
+  # that delivery did not happen. Fence the worker and retain the archive instead
+  # of requeueing executable text. If the agent later reports busy/wait, Enter did
+  # land and the transaction can be committed normally. A dead pane is safe to
+  # recover because its stale input buffer died with it.
+  case "$dispatch_phase" in
+    typing|typed|delivery_uncertain)
+      if [ "$live_session" = "$CURRENT_POD" ] &&
+         { [ "$live_state" = busy ] || [ "$live_state" = wait ]; } &&
+         { [ "$live_claim_status" = "busy" ] ||
+           [ "$live_claim_status" = "uncertain" ]; }; then
+        tmp="${archive}.tmp.$$"
+        if jq --arg healed "$NOW" \
+            '. + {status:"dispatched", dispatch_recovered_at:$healed}
+             | del(.delivery_uncertain_at)' "$archive" > "$tmp"; then
+          mv "$tmp" "$archive"
+          if [ "$live_claim_status" = "uncertain" ]; then
+            "$WORKERS_UPDATE" --path "$WORKERS_PATH" resume-uncertain \
+              "$wid" "$CURRENT_POD" "$tid" "$archive_claim_token" \
+              >/dev/null 2>&1 || true
+          fi
+        else
+          rm -f "$tmp" 2>/dev/null || true
+        fi
+        continue
+      fi
+      if [ "$live_session" = "$CURRENT_POD" ]; then
+        should_fence=0
+        if [ "$dispatch_phase" != "delivery_uncertain" ]; then
+          if [ "$live_claim_status" = "uncertain" ]; then
+            # A paused dispatcher may have overwritten delivery_uncertain with
+            # its older "typed" phase after recovery fenced the claim. Repair
+            # the archive marker without weakening the worker fence.
+            should_fence=1
+          elif [ "$live_claim_status" = "busy" ] &&
+               "$WORKERS_UPDATE" --path "$WORKERS_PATH" mark-uncertain \
+                 "$wid" "$CURRENT_POD" "$tid" "$archive_claim_token" \
+                 >/dev/null 2>&1; then
+            should_fence=1
+          fi
+        fi
+        if [ "$should_fence" -eq 1 ]; then
+          tmp="${archive}.tmp.$$"
+          if jq -e --arg fenced "$NOW" \
+              'if (.status=="typing" or .status=="typed"
+                   or .status=="delivery_uncertain")
+               then . + {status:"delivery_uncertain", delivery_uncertain_at:$fenced}
+               else empty end' \
+              "$archive" > "$tmp"; then
+            mv "$tmp" "$archive"
+            jq -nc --arg ts "$NOW" --arg tid "$tid" --arg tgt "$wid" \
+              --arg pod "$CURRENT_POD" \
+              '{ts:$ts,event:"delivery_uncertain",task_id:$tid,target:$tgt,pod:$pod,
+                reason:"trigger may be buffered without submission"}' >> "$LOG_PATH"
+          else
+            rm -f "$tmp" 2>/dev/null || true
+          fi
+        fi
+        continue
+      fi
+      ;;
+  esac
+  priority="$(jq -r '.priority // 100' "$archive" 2>/dev/null || echo 100)"
+  case "$priority" in ''|*[!0-9]*) priority=100 ;; esac
+  queued_at="$(jq -r '.queued_at // empty' "$archive" 2>/dev/null || true)"
+  [ -n "$queued_at" ] || queued_at="$NOW"
+  stamp="$(printf '%s' "$queued_at" | tr ':+' '--')"
+  restored="${QUEUE_DIR}/$(printf '%03d' "$priority")-${stamp}-${tid}.json"
+  worker_recovery="$(jq -r --arg w "$wid" --arg pod "$CURRENT_POD" --arg tid "$tid" \
+    --arg token "$archive_claim_token" \
+    'first(.workers[] | select(.tmux_window==$w and .tmux_session==$pod
+      and .current_task_id==$tid and ($token=="" or .claim_token==$token))
+      | [(.status // ""), (.claim_token // ""), (.recovery_token // "")] | @tsv) // empty' \
+    "$WORKERS_PATH" 2>/dev/null || true)"
+  IFS=$'\t' read -r worker_status worker_claim_token active_recovery <<<"$worker_recovery"
+  if [ "$worker_status" = "recovering" ]; then
+    [ -n "$active_recovery" ] || continue
+    recovery_owner_alive "$active_recovery" && continue
+  else
+    [ -n "$archive_claim_token" ] || archive_claim_token="$worker_claim_token"
+    [ -n "$archive_claim_token" ] || continue
+    claim_owner_alive "$archive_claim_token" && continue
+    active_recovery="${NOW_EPOCH}-$$-${RANDOM:-0}"
+    "$WORKERS_UPDATE" --path "$WORKERS_PATH" begin-recovery \
+      "$wid" "$CURRENT_POD" "$tid" "$archive_claim_token" "$active_recovery" \
+      >/dev/null 2>&1 || continue
+  fi
+  if recheck_fenced_delivery "$wid" "$tid" "$archive" "$active_recovery"; then
+    continue
+  fi
+  if mv "$archive" "$restored" 2>/dev/null; then
     tmp="${restored}.tmp.$$"
     if jq '. + {status:"queued"} | del(.target, .dispatch_started_at,
-      .dispatch_started_epoch, .dispatched_at)' "$restored" > "$tmp"; then
+      .dispatch_started_epoch, .dispatched_at, .claim_token)' "$restored" > "$tmp"; then
       mv "$tmp" "$restored"
     else
       rm -f "$tmp" 2>/dev/null || true
     fi
-    "$WORKERS_UPDATE" --path "$WORKERS_PATH" release \
-      "$wid" "$CURRENT_POD" "$tid" >/dev/null 2>&1 || true
+    "$WORKERS_UPDATE" --path "$WORKERS_PATH" finish-recovery \
+      "$wid" "$CURRENT_POD" "$tid" "$active_recovery" >/dev/null 2>&1 || true
+    if [ "$live_session" != "$CURRENT_POD" ]; then
+      "$WORKERS_UPDATE" --path "$WORKERS_PATH" prune "$T" >/dev/null 2>&1 || true
+    fi
     jq -nc --arg ts "$NOW" --arg tid "$tid" --arg tgt "$wid" --arg pod "$CURRENT_POD" \
       '{ts:$ts,event:"dispatch_recovered",task_id:$tid,target:$tgt,pod:$pod,
         reason:"stale pre-delivery transaction"}' >> "$LOG_PATH"
@@ -149,7 +466,15 @@ if [ -n "$assigned" ]; then
         [ -n "$queued_at" ] || queued_at="$NOW"
         stamp="$(printf '%s' "$queued_at" | tr ':+' '--')"
         mkdir -p "$QUEUE_DIR"
-        mv "$archive" "${QUEUE_DIR}/$(printf '%03d' "$priority")-${stamp}-${tid}.json"
+        restored="${QUEUE_DIR}/$(printf '%03d' "$priority")-${stamp}-${tid}.json"
+        mv "$archive" "$restored"
+        tmp="${restored}.tmp.$$"
+        if jq '. + {status:"queued"} | del(.target, .dispatch_started_at,
+          .dispatch_started_epoch, .dispatched_at, .claim_token)' "$restored" > "$tmp"; then
+          mv "$tmp" "$restored"
+        else
+          rm -f "$tmp" 2>/dev/null || true
+        fi
       else
         # No durable task record to restore. Leave the row in place so the
         # assignment never disappears from both the queue and the registry.
@@ -169,20 +494,26 @@ if [ -n "$assigned" ]; then
 fi
 
 # ---- DONE sweep ---------------------------------------------------------------
-# Read currently-busy rows from workers.json, keeping the window handle per task
-# so the freed loop below can clear the board and the reaper can find it.
-busy_rows=$(jq -r --arg pod "$CURRENT_POD" '.workers[] | select(.tmux_session == $pod and .status=="busy")
-  | (.tmux_window // "") + "|" + (.current_task_id // "")' "$WORKERS_PATH" 2>/dev/null || true)
+# DONE/EXECUTED is stronger delivery proof than a lagging runtime hook. Include
+# exact in-flight claims that are still uncertain/recovering so a fast completion
+# cannot remain fenced forever.
+busy_rows=$(jq -r --arg pod "$CURRENT_POD" '.workers[]
+  | select(.tmux_session == $pod
+      and (.status=="busy" or .status=="uncertain" or .status=="recovering"))
+  | (.tmux_window // "") + "|" + (.current_task_id // "") + "|" + (.claim_token // "")' \
+  "$WORKERS_PATH" 2>/dev/null || true)
 
 freed=()
 freed_wins=()
+freed_tokens=()
 if [ -n "$busy_rows" ]; then
-  while IFS='|' read -r wid tid; do
+  while IFS='|' read -r wid tid claim_token; do
     [ -z "$tid" ] && continue
     pod_valid_component "$tid" || continue
     if [ -f "${INBOX_ROOT}/${tid}/DONE" ] || [ -f "${INBOX_ROOT}/${tid}/EXECUTED" ]; then
       freed+=("$tid")
       freed_wins+=("$wid")
+      freed_tokens+=("$claim_token")
     fi
   done <<< "$busy_rows"
 fi
@@ -193,8 +524,33 @@ if [ "${#freed[@]}" -eq 0 ] && [ "${#requeued[@]}" -eq 0 ]; then
   exit 0
 fi
 
+# Claim-token CAS prevents a second concurrent poll from freeing a newer assignment
+# that happens to reuse the same task id after the first poll completed it.
 if [ "${#freed[@]}" -gt 0 ]; then
-  "$WORKERS_UPDATE" --path "$WORKERS_PATH" free "$CURRENT_POD" "${freed[@]}"
+  confirmed=(); confirmed_wins=(); confirmed_tokens=()
+  i=0
+  while [ "$i" -lt "${#freed[@]}" ]; do
+    tid="${freed[$i]}"; wid="${freed_wins[$i]}"; token="${freed_tokens[$i]}"
+    if [ -n "$token" ]; then
+      "$WORKERS_UPDATE" --path "$WORKERS_PATH" release \
+        "$wid" "$CURRENT_POD" "$tid" "$token" >/dev/null 2>&1 || { i=$((i + 1)); continue; }
+    else
+      "$WORKERS_UPDATE" --path "$WORKERS_PATH" release \
+        "$wid" "$CURRENT_POD" "$tid" >/dev/null 2>&1 || { i=$((i + 1)); continue; }
+    fi
+    confirmed+=("$tid"); confirmed_wins+=("$wid"); confirmed_tokens+=("$token")
+    i=$((i + 1))
+  done
+  # Guarded expansion, not a bare "${confirmed[@]}": when EVERY release above loses
+  # its CAS these three arrays are still empty, and bash 3.2 (what macOS ships)
+  # treats an empty "${arr[@]}" as an unbound variable under set -u — so the plain
+  # form aborted the whole sweep exactly when two polls raced, skipping the
+  # completion markers, the archive cleanup and the reap. Same idiom as
+  # mgr-pick-next's dispatch_args. bash >= 4.4 tolerates the bare form, which is
+  # why only macOS ever saw the crash.
+  freed=(${confirmed[@]+"${confirmed[@]}"})
+  freed_wins=(${confirmed_wins[@]+"${confirmed_wins[@]}"})
+  freed_tokens=(${confirmed_tokens[@]+"${confirmed_tokens[@]}"})
 fi
 
 # Append completion events, clear the board headline, and remove the now-stale

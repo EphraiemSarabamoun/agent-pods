@@ -14,9 +14,6 @@ T="$POD_TMUX"
 S="${POD_SESSION:-$POD_SESSION_PREFIX}"
 WORKERS="$POD_STATE/workers.json"
 
-# killing a worker is a deck change (kill-window) — needs the socket.
-pod_require_socket "killing a worker" || exit 1
-
 arg="${1:-}"
 win="${arg#kill_}"                       # accept the click range form "kill_@7" or a bare id/name
 [ -n "$win" ] || { echo "usage: pod-kill-worker <window_id|name>"; exit 1; }
@@ -55,36 +52,43 @@ if [ "$widx" = "0" ]; then
 fi
 
 wname="$("$T" display-message -p -t "$win" '#{window_name}' 2>/dev/null || echo "$win")"
+worker_snapshot=""
+[ ! -f "$WORKERS" ] || worker_snapshot="$(jq -c --arg tw "$win" --arg pod "$S" \
+  'first(.workers[] | select(.tmux_window==$tw and .tmux_session==$pod)) // empty' \
+  "$WORKERS" 2>/dev/null || true)"
 
-# An assigned worker is part of the queue's durable task state. Removing its row
-# before mgr-poll can restore/complete the task strands the dispatched archive with
-# no owner. Refuse the destructive click while an assignment exists; completion or
-# dead-worker recovery clears it through the queue protocol first.
+# An assignment check followed by an unconditional drop has a TOCTOU hole: a
+# dispatcher can claim the worker between those operations. Make the check+drop one
+# locked compare-and-delete instead. Once this succeeds, no later dispatcher can
+# claim the absent row, so killing the window cannot orphan a task.
 if [ -f "$WORKERS" ]; then
-  assigned_tid="$(jq -r --arg tw "$win" --arg pod "$S" \
-    'first(.workers[] | select(.tmux_window==$tw and .tmux_session==$pod)
-      | .current_task_id) // empty' "$WORKERS" 2>/dev/null || true)"
-  if [ -n "$assigned_tid" ]; then
-    echo "pod-kill-worker: refusing to terminate assigned worker $S/$win (task $assigned_tid); run mgr-poll after completion or let dead-worker recovery requeue it" >&2
+  drop_err="$(mktemp "${POD_STATE}/.kill-worker.XXXXXX")" || exit 1
+  if ! "$POD_BIN/pod-workers-json" --path "$WORKERS" \
+      drop-if-unassigned "$win" "$S" 2>"$drop_err"; then
+    detail="$(cat "$drop_err" 2>/dev/null || true)"
+    rm -f "$drop_err"
+    "$T" display-message -d 5000 -t "$S" \
+      "Cannot close $wname: it has an assigned task (run mgr-poll after it finishes)" \
+      2>/dev/null || true
+    echo "${detail:-pod-kill-worker: registry update failed}; refusing to orphan $S/$win" >&2
     exit 1
   fi
+  rm -f "$drop_err"
 fi
-
-# Deregister through the shared locked/atomic registry mutator.
-if [ -f "$WORKERS" ]; then
-  "$POD_BIN/pod-workers-json" --path "$WORKERS" drop "$win" "$S" || {
-    echo "pod-kill-worker: registry update failed; refusing to orphan $S/$win" >&2
-    exit 1
-  }
-fi
-
-# log the termination to the KILLED window's pod channel so it shows in that pod's
-# summary-pane feed. Resolve the pod from the window itself — POD_SESSION isn't set in
-# the tmux run-shell context the ✕ button fires from, and the message belongs to the
-# target's pod, not whatever pod happened to invoke this.
-CHAN="$(pod_chan_for "$wsess")"; mkdir -p "$(dirname "$CHAN")"
-echo "[$(date +%H:%M)] (system): terminated pod agent $wname ($win)" >> "$CHAN" 2>/dev/null || true
 
 # kill the window LAST (this SIGHUPs the pane, ending the agent process in it)
-"$T" kill-window -t "$win" 2>/dev/null
+if ! "$T" kill-window -t "$win" 2>/dev/null; then
+  # The locked delete made the row temporarily undispatchable. If tmux refused
+  # the actual kill, restore the exact snapshot so a live worker is never orphaned
+  # from the registry.
+  [ -z "$worker_snapshot" ] || "$POD_BIN/pod-workers-json" --path "$WORKERS" \
+    register "$worker_snapshot" >/dev/null 2>&1 || true
+  echo "pod-kill-worker: tmux refused to terminate $S/$win; registry restored" >&2
+  exit 1
+fi
+
+# log only after the window actually died. Resolve the pod from the target itself,
+# not an inherited POD_SESSION from another pod.
+CHAN="$(pod_chan_for "$wsess")"; mkdir -p "$(dirname "$CHAN")"
+echo "[$(date +%H:%M)] (system): terminated pod agent $wname ($win)" >> "$CHAN" 2>/dev/null || true
 echo "terminated $wname ($win)"

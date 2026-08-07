@@ -9,9 +9,11 @@
 #   1. moves $POD_COMMS/<old> -> <new>  (chat feed, mailboxes, leases, work logs —
 #      everything _pod-common.sh keys by session name; without the move the pod's
 #      comms history would orphan and the launch-time gc would delete it)
-#   2. updates the session env POD_SESSION (future panes; running panes keep a stale
-#      copy, which is fine — pod_name()/mgr_current_pod/pod-add-worker resolve
-#      live-first and only trust POD_SESSION when that session exists)
+#   2. leaves a forwarding record ($POD_STATE/renames/<old> -> new), then updates the
+#      session env POD_SESSION. The env update only reaches panes created LATER; a
+#      RUNNING pane keeps the old value for life — so the forwarding record is what
+#      keeps those seats resolving the pod they are actually in (see
+#      pod_resolve_stale_pod in _pod-common.sh)
 #   3. rewrites tmux_group.json if this pod is the recorded PRIMARY (the MCP +
 #      headless mgr-* helpers follow that file)
 #   4. re-stamps @pod_name and logs the rename to the pod's channel feed
@@ -56,6 +58,16 @@ od="$(pod_dir_for "$old")"; nd="$(pod_dir_for "$new")"
 if [ -d "$od" ] && [ ! -e "$nd" ]; then
   mv "$od" "$nd" 2>/dev/null || true
 fi
+
+# 1b. forwarding record. Step 2 below updates the session env, but that only reaches
+# panes created LATER — every running pane keeps POD_SESSION=<old> for its whole life.
+# Without a trail those seats resolve the pre-rename pod forever: mail delivered to the
+# new comms dir is never read, and their own notes land in a resurrected old dir the
+# next launch sweeps.
+# pod_resolve_stale_pod (_pod-common.sh) follows this; pod-mail-gc drops a record whose
+# old name becomes a live session again.
+mkdir -p "$POD_STATE/renames" 2>/dev/null || true
+printf '%s\n' "$new" > "$POD_STATE/renames/$(pod_sanitize "$old")" 2>/dev/null || true
 
 # Queue ownership follows the pod too. Each namespace contains globally-unique task
 # ids, so a target collision is left untouched and reported instead of overwritten.

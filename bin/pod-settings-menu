@@ -70,11 +70,25 @@ def load_json(path):
         return json.load(f)
 
 
+# Every catalog read is BOUNDED. `models`/`efforts` can trigger live discovery, whose
+# worst case is the adapter's own timeout_s (35s for the bundled agents) — with no
+# timeout here a wedged CLI (not logged in, corporate proxy, wrong CLI version) froze
+# the gear menu open-ended with nothing on screen and no way to tell why. The ceiling
+# sits above the largest bundled timeout_s so a healthy-but-slow agent still answers.
+try:
+    ADAPTER_TIMEOUT = float(os.environ.get("POD_ADAPTER_TIMEOUT") or 45)
+    if ADAPTER_TIMEOUT <= 0:
+        raise ValueError
+except (TypeError, ValueError):    # a typo'd override must not brick the gear menu
+    ADAPTER_TIMEOUT = 45.0
+
+
 def _adapter(*args):
     """Run pod-adapter and return stdout (stripped). Empty string on any failure, so
     callers can treat a missing id/field as "nothing to show"."""
     try:
-        out = subprocess.run([ADAPTER, *args], capture_output=True, text=True)
+        out = subprocess.run([ADAPTER, *args], capture_output=True, text=True,
+                             timeout=ADAPTER_TIMEOUT)
     except Exception:
         return ""
     if out.returncode != 0:
@@ -181,6 +195,14 @@ def step_model(slot, agent_id):
     if not items:
         # an agent with no models (e.g. generic-shell) -> save with no model/effort.
         return step_save(slot, agent_id, "", "")
+    # An agent that DECLARES live discovery but offers only the inherited default has
+    # a discovery problem (logged out, wrong CLI version, proxy). Say so on the menu —
+    # a silent one-item list reads as "this agent has one model", which is a lie.
+    if len(items) == 1 and models[0][0] == "inherit" and _adapter("field", agent_id, "models_cmd"):
+        note = (f"{agent_label(agent_id)}: live model list unavailable — "
+                "check `pod-login`, or run `pod-adapter refresh`.")
+        items.append(("· live model list unavailable", "!",
+                      "display-message -d 6000 " + shlex.quote(note)))
     return run_menu(f"Slot {slot} — pick model ({agent_label(agent_id)})", items)
 
 

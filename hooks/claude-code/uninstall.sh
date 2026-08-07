@@ -2,7 +2,11 @@
 # uninstall.sh — remove the agent-pods Claude Code hook entries that install.sh added,
 # leaving every other hook intact. Atomic write; the prior file is backed up first.
 #
-# A hook command is "ours" only when it exactly matches a command this installer emits.
+# A hook command is "ours" when it exactly matches a command this installer emits, OR
+# when it structurally runs one of our hook scripts from some OTHER checkout (a repo that
+# was moved, or an install predating the logical/physical path fix). Without that second
+# rule those entries are unreachable forever: the string never matches the current paths,
+# so an uninstall from the new location leaves dead commands firing on every event.
 # After removing matching entries, any hook
 # group left with zero hooks is dropped, and any event left with zero groups is
 # dropped — so we don't leave empty scaffolding behind.
@@ -54,11 +58,11 @@ fi
 [ -f "$SETTINGS" ] || { echo "uninstall.sh: $SETTINGS does not exist — nothing to remove."; exit 0; }
 
 python3 - "$SETTINGS" "$POD_BIN" <<'PY'
-import json, os, shutil, sys, tempfile, datetime
+import json, os, shlex, shutil, sys, tempfile, datetime
 
 settings_path, pod_bin = sys.argv[1], sys.argv[2]
 
-# Match only exact commands the installer owns. Substring matching can delete an
+# Match exact commands the installer owns. Substring matching can delete an
 # unrelated command such as report-pod-state-metrics.
 awareness = os.path.join(os.path.dirname(pod_bin), "hooks", "claude-code", "pod-awareness.sh")
 OWNED = {
@@ -75,8 +79,42 @@ OWNED = {
     'bash "%s/pod-state" wait' % pod_bin,
     'bash "%s/pod-state" busy posttool' % pod_bin,
 }
+
+# Second rule: recognize a pod hook baked with ANY path prefix, so entries left behind by
+# a checkout that has since moved (or by an installer that wrote a logical path where the
+# rest used the physical one) are removable from here instead of stranded in the file.
+# Ownership is decided by the SCRIPT — argv[1]'s basename, required to sit under a `bin/`
+# or `hooks/claude-code/` parent — which is far tighter than substring matching: an
+# unrelated `echo pod-mail-check-health` or report-pod-state-metrics never matches.
+POD_BIN_SCRIPTS = {
+    "pod-state", "pod-brief", "pod-primer", "pod-mail-check",
+    "pod-work", "pod-auto-brief", "pod-last",
+}
+
+def pod_hook_script(cmd):
+    """The pod script this hook command runs, or None when the command isn't ours."""
+    if not isinstance(cmd, str):
+        return None
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        return None                       # unbalanced quotes: not something we wrote
+    if len(argv) < 2 or os.path.basename(argv[0]) not in ("bash", "sh"):
+        return None
+    path, parent = argv[1], os.path.dirname(argv[1])
+    if os.path.basename(path) == "pod-awareness.sh":
+        if os.path.basename(parent) == "claude-code" and \
+           os.path.basename(os.path.dirname(parent)) == "hooks":
+            return path
+        return None
+    if os.path.basename(path) in POD_BIN_SCRIPTS and os.path.basename(parent) == "bin":
+        return path
+    return None
+
 def is_ours(cmd):
-    return isinstance(cmd, str) and cmd in OWNED
+    if not isinstance(cmd, str):
+        return False
+    return cmd in OWNED or pod_hook_script(cmd) is not None
 
 try:
     with open(settings_path) as f:
@@ -136,14 +174,18 @@ except Exception as e:
     print("uninstall.sh: backup failed (%s); aborting" % e, file=sys.stderr)
     sys.exit(1)
 
-# atomic write
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(settings_path)), prefix=".settings.", suffix=".tmp")
+# atomic write — through the REALPATH, because os.replace() acts on the link itself and
+# would turn a dotfiles-managed symlink (~/.claude/settings.json -> ~/dotfiles/...) into a
+# regular file, orphaning the config the user actually edits. Resolving also puts the
+# tempfile on the real file's filesystem, which is what makes the rename atomic.
+real_path = os.path.realpath(settings_path)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real_path), prefix=".settings.", suffix=".tmp")
 try:
     os.fchmod(fd, os.stat(settings_path).st_mode & 0o777)
     with os.fdopen(fd, "w") as tf:
         json.dump(data, tf, indent=2)
         tf.write("\n")
-    os.replace(tmp, settings_path)
+    os.replace(tmp, real_path)
 except Exception:
     try: os.unlink(tmp)
     except OSError: pass

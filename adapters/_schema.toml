@@ -34,6 +34,12 @@ mode            = "poll"            # "hooks" = agent fires lifecycle events we 
 installer       = ""               # path (repo-relative) to a hook installer; only for mode="hooks"
 native_delivery = false            # true = agent surfaces pod-mail itself -> pod-deliver skips send-keys
 state_source    = "poll"           # "hooks" = agent stamps its own @cc_state; "poll" = the poller infers it
+# Optional conservative proof that this agent's visible input field is empty. The
+# FULL AUTO resume path may submit only when the LAST prompt-looking line matches
+# both expressions. Omit them when the TUI has no stable empty-prompt rendering;
+# the durable mailbox will then wait for the agent's next native prompt hook.
+prompt_line_regex  = ''             # identifies any input line in capture-pane output
+empty_prompt_regex = ''             # full-match for that agent's rendered placeholder
 
 # [discover] (OPTIONAL) — authoritative local model discovery. When the command exits
 # 0 with >=1 parsed model, those are the selectable models. If it is absent/fails, the
