@@ -40,6 +40,13 @@ state_source    = "poll"           # "hooks" = agent stamps its own @cc_state; "
 # the durable mailbox will then wait for the agent's next native prompt hook.
 prompt_line_regex  = ''             # identifies any input line in capture-pane output
 empty_prompt_regex = ''             # full-match for that agent's rendered placeholder
+# The agent's own "wipe this conversation" command (e.g. Claude Code's "/clear").
+# Consumed by the FULL AUTO fresh-crew reset (pod-auto): only a seat whose adapter
+# declares one is ever cleared; every other agent seat is reported by name instead
+# of guessed at, and plain shells are never typed into. Declare it only after
+# verifying the exact command in that agent's TUI — a wrong value is typed into a
+# live seat as if it were a prompt.
+clear_cmd = ''
 
 # [discover] (OPTIONAL) — authoritative local model discovery. When the command exits
 # 0 with >=1 parsed model, those are the selectable models. If it is absent/fails, the

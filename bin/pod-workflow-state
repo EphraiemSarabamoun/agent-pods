@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# pod-workflow-state — keep a seat's runtime dot ORANGE (busy) while a background
+# workflow it launched is still running, instead of letting the Stop hook stamp it
+# idle the moment the launching turn ends.
+#
+# WHY THIS EXISTS
+#   The runtime dot is driven by lifecycle hooks: UserPromptSubmit->busy, Stop->idle
+#   (see pod-state). Claude Code's Workflow tool RETURNS IMMEDIATELY with a runId and
+#   orchestrates its subagents in the background; they grind on for minutes after the
+#   launching turn ends. So Stop fires -> idle, and the seat reads as free (and becomes
+#   eligible for auto-dispatch, mail submits, and gold-star delivery) while a workflow
+#   is still churning. It should read busy until the workflow truly finishes.
+#
+#   The obvious trick (lsof the harness's task output file) was tried and REJECTED: a
+#   run_in_background Bash task holds that fd open while alive, but a Workflow is
+#   orchestrated IN-PROCESS by the agent's main loop, which keeps NO fd open during
+#   the run and writes the result only at completion. lsof is empty for a live run.
+#
+#   The signal that DOES exist: every workflow writes a journal.jsonl in a transcript
+#   dir (both appear in the launch tool-result). It logs one {"type":"started",...}
+#   per agent() call and one {"type":"result",...} when that agent returns. So:
+#       still running  <=>  some `started` has no matching `result` (an agent in
+#                           flight) OR the journal was touched within a short grace
+#                           window (bridges the quiet gap between phases).
+#       done           <=>  balanced AND the journal has gone stale, OR a hard TTL
+#                           elapsed (the crash backstop — never pin busy forever).
+#
+# ENTRY POINTS (wired by hooks/claude-code/install.sh):
+#   record    PostToolUse, matcher "Workflow". Reads the hook payload on stdin,
+#             extracts the runId + journal path, appends them to this window's
+#             registry. Cheap; stamps nothing (the seat is mid-turn = already busy).
+#   check     The PREDICATE, called by pod-state before it stamps idle. Prunes
+#             finished workflows, then exits 0 if any are still in flight (pod-state
+#             stamps busy instead of idle) or 1 if the window is clear. Stamps
+#             NOTHING itself — the caller owns the dot.
+#   reset     SessionStart. Drops the registry: a freshly started agent process
+#             provably owns no workflow launched by the process that preceded it in
+#             this window, so inherited entries must never pin the new seat busy.
+#
+# WHY THE CHECK LIVES INSIDE pod-state (not a second Stop hook)
+#   A second Stop hook that re-stamps busy after `pod-state idle` covers exactly one
+#   of the paths that stamp idle. Claude Code also fires an idle-prompt Notification
+#   ~60s after a turn ends, which pod-state remaps to idle — with no workflow check —
+#   so a seat with a live workflow reliably went green about a minute after launching
+#   it. Guarding inside pod-state covers Stop, the Notification remap, SessionStart,
+#   and any idle path added later, by construction rather than by wiring.
+#
+# The registry is one file per window under the pod's own comms subtree
+# ($POD_COMMS/<pod>/wf/<window>.list), so it is swept with the pod exactly like the
+# mailboxes. Observe-only contract (same as pod-state): never blocks, never errors
+# out a hook chain, every path exits 0, no-op outside tmux. bash 3.2 safe.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || exit 0
+T="$POD_TMUX"
+
+cmd="${1:-}"
+pane="${TMUX_PANE:-}"
+[ -n "$pane" ] || exit 0
+
+meta="$("$T" display-message -p -t "$pane" '#{window_id}|#{session_name}' 2>/dev/null)"
+win="${meta%%|*}"; sess="${meta#*|}"
+[ -n "$win" ] || exit 0
+# Same sanitizer class the comms layer uses (pod_sanitize), via _pod-paths' mirror —
+# writer and reader must agree byte-for-byte or a non-ASCII pod name splits the
+# registry into a path check reads and a path record writes.
+regdir="$POD_COMMS/$(pod_path_component "$sess")/wf"
+reg="$regdir/$(pod_path_component "$win").list"
+
+now="$(date +%s)"
+
+case "$cmd" in
+  record)
+    # Pull runId + transcript dir out of the PostToolUse payload. The hook delivers
+    # tool_response as a STRUCTURED dict for the Workflow tool, e.g.
+    #   {"status":"async_launched","runId":"wf_...","transcriptDir":"..."}
+    # (NOT the human-readable "Run ID: ..." text the agent sees in its own UI). Read
+    # the dict fields; fall back to regex if tool_response ever arrives as a string.
+    # Only read stdin when it's a pipe (the hook case), so a manual invocation from a
+    # terminal can never block on cat.
+    [ -t 0 ] && exit 0
+    payload="$(cat 2>/dev/null)"
+    [ -n "$payload" ] || exit 0
+    parsed="$(printf '%s' "$payload" | python3 -c '
+import sys, re, json
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except Exception:
+    d = {}
+tn = d.get("tool_name") or ""
+if tn and tn != "Workflow":
+    sys.exit(0)
+tr = d.get("tool_response")
+runid = ""; td = ""
+if isinstance(tr, dict):
+    runid = tr.get("runId") or ""
+    td = tr.get("transcriptDir") or ""
+elif isinstance(tr, str):
+    m = re.search(r"\"runId\"\s*:\s*\"(wf_[\w-]+)\"", tr) or re.search(r"Run ID:\s*(wf_[\w-]+)", tr)
+    if m: runid = m.group(1)
+    m = re.search(r"\"transcriptDir\"\s*:\s*\"([^\"\\\\]+)\"", tr) or re.search(r"Transcript dir:\s*([^\s\\\\\"]+)", tr)
+    if m: td = m.group(1)
+if not runid:                       # last-ditch: scan the whole blob
+    m = re.search(r"\"runId\"\s*:\s*\"(wf_[\w-]+)\"", raw)
+    if m: runid = m.group(1)
+if not td:
+    m = re.search(r"\"transcriptDir\"\s*:\s*\"([^\"\\\\]+)\"", raw)
+    if m: td = m.group(1)
+if not runid:
+    sys.exit(0)
+journal = (td.rstrip("/") + "/journal.jsonl") if td else ""
+print(runid + "\t" + journal)
+' 2>/dev/null)"
+    [ -n "$parsed" ] || exit 0
+    runid="${parsed%%	*}"
+    journal="${parsed#*	}"
+    mkdir -p "$regdir" 2>/dev/null || exit 0
+    # Dedupe by runId (a resumed run re-reports itself): drop any prior line for the
+    # same run, then append fresh with the current epoch.
+    if [ -f "$reg" ]; then
+      grep -v -F "$runid	" "$reg" > "$reg.tmp" 2>/dev/null || : > "$reg.tmp"
+      mv -f "$reg.tmp" "$reg" 2>/dev/null || true
+    fi
+    printf '%s\t%s\t%s\n' "$runid" "$journal" "$now" >> "$reg" 2>/dev/null || true
+    exit 0
+    ;;
+
+  check)
+    # Prune finished runs, then answer. Exit 0 = at least one run STILL IN FLIGHT
+    # (registry rewritten with just the survivors); exit 1 = window clear (registry
+    # removed). One python pass over the registry; constants inside.
+    [ -s "$reg" ] || exit 1
+    alive="$(python3 - "$reg" "$now" <<'PY' 2>/dev/null
+import sys, os, json
+reg, now = sys.argv[1], int(sys.argv[2])
+GRACE = 20          # journal quiescence that still counts as "between phases"
+STARTUP_GRACE = 45  # journal not written yet right after launch
+TTL = 7200          # hard crash backstop: never pin busy longer than this
+
+def alive(journal, recorded):
+    age = now - recorded
+    if age > TTL:
+        return False
+    if not journal or not os.path.exists(journal):
+        return age < STARTUP_GRACE          # just launched, journal pending
+    started, result = set(), set()
+    try:
+        with open(journal) as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    d = json.loads(ln)
+                except Exception:
+                    continue
+                aid = d.get("agentId")
+                t = d.get("type")
+                if t == "started" and aid:
+                    started.add(aid)
+                elif t == "result" and aid:
+                    result.add(aid)
+    except Exception:
+        # unreadable -> lean on file freshness so a crash cannot pin forever
+        try:
+            return (now - os.path.getmtime(journal)) < GRACE
+        except Exception:
+            return age < STARTUP_GRACE
+    if started - result:
+        return True                          # an agent is in flight
+    try:
+        return (now - os.path.getmtime(journal)) < GRACE
+    except Exception:
+        return False
+
+out = []
+try:
+    for ln in open(reg):
+        ln = ln.rstrip("\n")
+        if not ln:
+            continue
+        parts = ln.split("\t")
+        runid = parts[0] if parts else ""
+        journal = parts[1] if len(parts) > 1 else ""
+        try:
+            recorded = int(parts[2]) if len(parts) > 2 else now
+        except Exception:
+            recorded = now
+        if runid and alive(journal, recorded):
+            out.append(ln)
+except Exception:
+    pass
+sys.stdout.write("\n".join(out))
+PY
+)"
+    if [ -n "$alive" ]; then
+      # rewrite the registry with only the survivors (atomic)
+      printf '%s\n' "$alive" > "$reg.tmp" 2>/dev/null && mv -f "$reg.tmp" "$reg" 2>/dev/null || true
+      exit 0
+    fi
+    rm -f "$reg" 2>/dev/null || true         # all done -> clear registry, caller may idle
+    exit 1
+    ;;
+
+  reset)
+    # A brand-new agent process in this window cannot own anything its predecessor
+    # launched: the workflow died with that process. Clearing here stops a stale
+    # entry (e.g. a crashed run whose journal never balanced) from pinning the new
+    # seat busy for the TTL.
+    rm -f "$reg" 2>/dev/null || true
+    exit 0
+    ;;
+
+  *)
+    exit 0
+    ;;
+esac

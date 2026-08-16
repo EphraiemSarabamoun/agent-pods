@@ -121,6 +121,7 @@ mode            = "poll"   # "hooks" = agent fires lifecycle events we wired; "p
 installer       = ""       # repo-relative path to a hook installer; only for mode="hooks"
 native_delivery = false    # true = agent surfaces pod-mail itself -> pod-deliver skips send-keys
 state_source    = "poll"   # "hooks" = agent stamps its own @cc_state; "poll" = the poller infers it
+clear_cmd       = ""       # the agent's own "wipe this conversation" command (e.g. "/clear")
 ```
 
 This is the hooks-vs-poll distinction, the heart of "generic is first-class, hooks are an
@@ -149,6 +150,13 @@ type into its pane, since that would double-deliver and risk clobbering the agen
 When `false` (every poll agent), `pod-deliver` is the only delivery path and it uses
 send-keys. The detector caches this as `@pod_native_delivery` on the window; a
 hook-capable agent's own hook re-stamps it authoritatively once it's live.
+
+`clear_cmd` names the agent's own "wipe this conversation" command (Claude Code ships
+`/clear`). It is consumed by the FULL AUTO fresh-crew reset ([autonomy.md](autonomy.md)):
+only a seat whose adapter declares one is ever cleared; every other agent seat is skipped
+and reported by name, and plain shells are never typed into. Declare it only after
+verifying the exact command in that agent's TUI — a wrong value is typed into a live
+seat as if it were a prompt.
 
 ### `[discover]`: authoritative local models
 

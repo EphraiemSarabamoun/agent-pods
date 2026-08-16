@@ -1,5 +1,50 @@
 # Changelog
 
+## Workflow-aware state dots, the fresh-crew FULL AUTO reset, and pod-kill
+
+- **A seat that launched a background workflow no longer reads idle mid-run.** Claude
+  Code's Workflow tool returns immediately and its agents grind on in the background,
+  so the Stop hook stamped the seat green — and a "free" green seat is a legal target
+  for auto-dispatch, mail submits, and star delivery — while its workflow was still
+  churning. The new `pod-workflow-state` records each launch from the PostToolUse
+  payload (a matcher-scoped hook group, so ordinary tool calls pay nothing) and
+  `pod-state` now consults it before EVERY idle stamp: Stop, the idle-prompt
+  Notification remap, SessionStart, and any idle path added later, by construction.
+  Liveness comes from the workflow's own journal — an agent with a `started` and no
+  `result` is in flight — with a quiescence grace between phases, a startup grace
+  before the journal exists, and a hard TTL so a crash can never pin a seat busy
+  forever. A fresh process in the same window provably owns nothing its predecessor
+  launched, so SessionStart drops the registry outright. `test/check-workflow-state.sh`
+  covers the record/suppress/finish/reset/backstop cycle.
+
+- **A human flip to FULL AUTO now offers the pod as a fresh crew.** An auto-mode
+  manager that inherits a half-finished conversation manages around it, and idle seats
+  you were merely chatting with are legal dispatch targets — availability filters on
+  idle, not on ownership. So a human ON flip confirms first (tmux `confirm-before` on
+  the flipping client, or a TTY prompt), clears the manager and every agent seat, and
+  delivers a boot brief so the manager greets you and stands by owning the roster.
+  The guard that matters: **an agent's own `pod-auto on` never resets** — an
+  autonomous loop's first step is flipping this switch, and without the guard a
+  manager would clear itself the moment it started. Agent flips are told apart the
+  same way pod-star's human-only gate works, and programmatic flips stay
+  byte-identical to before. What gets cleared is adapter-scoped through a new
+  `lifecycle.clear_cmd` (Claude Code ships `/clear`): no clear command, no typing —
+  the seat is skipped and named, and plain shells are never touched. Queued tasks
+  survive and are named in the boot brief instead of silently ground through on a
+  cleared context. `--yes` / `--reset` / `--no-reset` make every path scriptable, and
+  `test/check-fullauto-reset.sh` proves the who-gets-typed-into matrix with capture
+  panes.
+
+- **`pod-kill` deliberately ends whole pods.** Closing the terminal window does NOT:
+  tmux is a server, so the X only detaches the viewing client while the session, every
+  seat REPL in it, and all their MCP subprocesses keep running headless — observed on
+  a live deck as two closed-but-unkilled pods idling for two days with 18 seats and
+  ~100 MCP processes. Containment over convenience: only `@is_pod`-stamped sessions
+  are killable (a shared server's unrelated sessions are never in scope, force or
+  not), busy seats and the pod you are running inside need `--force`, and every kill
+  is logged to `$POD_STATE/kill.log`. `--list` shows each session's windows, attach,
+  busy and pod state.
+
 ## The leak guard stops publishing its own denylist, and your manager gets a launcher
 
 - **`test/no-private-leaks.sh` no longer carries the private terms.** The guard exists so

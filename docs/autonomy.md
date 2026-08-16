@@ -57,6 +57,33 @@ input line is the agent's rendered empty placeholder. A stable human draft is no
 empty prompt and is never submitted. If the TUI changed or has no such proof, the
 durable mailbox resumes the loop through the manager's next native prompt hook instead.
 
+## A human flip to ON resets the pod (the fresh-crew reset)
+
+A **human** flip to ON — the pill, `C-a a`, `M-a`, or `pod-auto on` typed at a terminal —
+offers to hand the manager a **fresh crew**: it confirms first (a tmux `confirm-before`
+prompt on the flipping client, or a y/N prompt on a TTY), then clears the manager's
+context and every agent seat's context, then delivers a boot brief so the manager greets
+you and stands by owning the roster. The rationale: an auto-mode manager that inherits a
+half-finished conversation manages around it, and idle seats you were merely *chatting*
+with are legal dispatch targets (availability filters on idle, not on ownership).
+Resetting at the flip makes "every non-manager seat in an auto pod is a worker" true by
+construction.
+
+The guard that matters: **an agent's own `pod-auto on` never resets.** An autonomous
+loop's first step is flipping the switch, and without the guard a manager would clear
+itself the moment it started. Agent flips are detected the same way `pod-star`'s
+human-only gate works (the agent-tool environment marker, or a calling pane stamped with
+a real `@agent_id`); the tmux server's run-shell context carries neither, so pill clicks
+and key bindings read as human. Programmatic flips never confirm and never reset.
+
+What gets cleared is **adapter-scoped**: only a seat whose adapter declares a
+`lifecycle.clear_cmd` (Claude Code ships `/clear`) is ever typed into. A plain shell is
+never touched, and an agent whose adapter names no clear command is skipped and reported
+by name. Flags: `--yes` skips the confirmation (and, alone, skips the reset — the
+headless behavior), `--reset` forces it, `--no-reset` forbids it. Leftover queued tasks
+survive a reset and are named in the manager's boot brief instead of silently ground
+through on a cleared context.
+
 Two helpers keep the loop honest without you watching it:
 
 - **`pod-auto-brief`** (wired into the manager's per-prompt hook by the Claude Code hook

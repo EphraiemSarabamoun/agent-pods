@@ -248,8 +248,11 @@ printf '%s\n' '{"pod":"Alpha","status":"paused"}' > "$TMP/runtime/state/pod-task
 "$PT" set-option -w -t "$AM" @cc_state idle
 "$PT" set-option -w -t "$AM" @agent_id claude-code
 "$PT" respawn-pane -k -t "$AM" "printf '%s\n' '❯ Try \"resume work\"'; sleep 100"
+# --yes: this exercises the RESUME machinery, not the fresh-crew confirm flow
+# (which would otherwise prompt on an interactive developer TTY). No --reset, so
+# behavior is byte-identical to the pre-reset pod-auto.
 POD_AUTO_ANIM=0 POD_TMUX="$PT" POD_TMP="$TMP/runtime" POD_SESSION=Alpha \
-  "$REPO/bin/pod-auto" on --pod Alpha >/dev/null
+  "$REPO/bin/pod-auto" on --yes --pod Alpha >/dev/null
 manager_mail="$TMP/runtime/comms/Alpha/${AM}.mbox"
 manager_hw="$TMP/runtime/comms/Alpha/${AM}.hw"
 check "AUTO resume writes durable manager mail" grep -q "resume the paused pod-task" "$manager_mail"
@@ -508,6 +511,48 @@ if printf '%s' "$rendered" | LC_ALL=C grep -q ']52;'; then
 else
   ok "pod-feed strips terminal control payloads"
 fi
+
+# pod-kill ends whole pods but must stay inside its containment: never a plain
+# (un-stamped) session even with --force, never busy seats or the caller's own pod
+# without it.
+"$PT" new-session -d -s Gamma -n scratch 'sleep 100'   # NOT a stamped pod
+if POD_TMUX="$PT" POD_TMP="$TMP/runtime" "$REPO/bin/pod-kill" --force Gamma >/dev/null 2>&1; then
+  bad "pod-kill refuses a non-pod session even with --force"
+else
+  ok "pod-kill refuses a non-pod session even with --force"
+fi
+check "refused non-pod session remains alive" "$PT" has-session -t "=Gamma"
+
+BETA_PANE="$("$PT" display-message -p -t Beta:0 '#{pane_id}')"
+if TMUX=1 TMUX_PANE="$BETA_PANE" POD_TMUX="$PT" POD_TMP="$TMP/runtime" \
+    "$REPO/bin/pod-kill" Beta >/dev/null 2>&1; then
+  bad "pod-kill refuses the pod it is running inside"
+else
+  ok "pod-kill refuses the pod it is running inside"
+fi
+check "refused own pod remains alive" "$PT" has-session -t "=Beta"
+
+"$PT" set-option -w -t "$AW" @cc_state busy
+if POD_TMUX="$PT" POD_TMP="$TMP/runtime" "$REPO/bin/pod-kill" Alpha >/dev/null 2>&1; then
+  bad "pod-kill refuses a pod with a busy seat mid-turn"
+else
+  ok "pod-kill refuses a pod with a busy seat mid-turn"
+fi
+check "refused busy pod remains alive" "$PT" has-session -t "=Alpha"
+
+POD_TMUX="$PT" POD_TMP="$TMP/runtime" "$REPO/bin/pod-kill" Beta >/dev/null 2>&1
+if "$PT" has-session -t "=Beta" 2>/dev/null; then
+  bad "pod-kill ends an idle stamped pod"
+else
+  ok "pod-kill ends an idle stamped pod"
+fi
+POD_TMUX="$PT" POD_TMP="$TMP/runtime" "$REPO/bin/pod-kill" --force Alpha >/dev/null 2>&1
+if "$PT" has-session -t "=Alpha" 2>/dev/null; then
+  bad "pod-kill --force overrides the busy refusal"
+else
+  ok "pod-kill --force overrides the busy refusal"
+fi
+check "pod-kill logs what it ended" grep -q "ended pod Beta" "$TMP/runtime/state/kill.log"
 
 echo "check-safety-invariants: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

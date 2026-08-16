@@ -205,11 +205,13 @@ just the orientation.
 - `pod-add-worker`: the `+` action. Spawn a colored worker window, stamp its identity card, register it in `workers.json`.
 - `pod-name`: pick a friendly worker name not already on a tab in this pod.
 - `pod-kill-worker`: the `✕` action. Terminate a worker and unregister it.
+- `pod-kill`: deliberately END whole pod(s) — closing the terminal window only detaches the client; the session and every seat REPL keep running headless until this (or the last window's exit) actually ends them.
 - `pod-detect`: the one place "which agent is in this pane" is answered; caches `@agent_id` and friends on the window.
 - `pod-sync-label`: on a double-click rename, push the new name into the registry.
 
 **State and the strip**
-- `pod-state`: stamp this pane's idle/busy/wait (+ `@state_since`) onto its window (the strip dot); for hook agents. Also delivers any queued gold-star prompt when it flips to idle.
+- `pod-state`: stamp this pane's idle/busy/wait (+ `@state_since`) onto its window (the strip dot); for hook agents. Also delivers any queued gold-star prompt when it flips to idle. An idle stamp is conditional: it defers to `pod-workflow-state` first.
+- `pod-workflow-state`: track background workflows a seat launched (Claude Code's Workflow tool) so the dot stays busy until they truly finish — a seat reading busy over a quiet screen is usually waiting on its own workflow, not wedged.
 - `pod-foreign-state`: the singleton poller that infers state, scrapes cards, clears unread pills, and delivers mail/stars for hookless agents.
 - `pod-status-action`: route a status-strip button click (`fullauto` / `star` / `summary` / `newwin` / `settings` / `kill_*`).
 - `pod-spawn-menu-build`: build the `+` agent/model picker from the catalog.

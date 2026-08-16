@@ -101,6 +101,8 @@ jobs:
             check-context-emit \
             check-primer \
             test-adapter-discovery-timeout \
+            check-workflow-state \
+            check-fullauto-reset \
             check-safety-invariants
           do
             printf '\n===== %s =====\n' "$t"
