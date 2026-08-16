@@ -7,6 +7,9 @@
 # and pod-mail surfaced as additionalContext. The wiring:
 #
 #   SessionStart     -> pod-awareness.sh   (roster + stamp this window as claude-code)
+#                       pod-workflow-state reset  (a fresh process owns no workflow —
+#                                           clear inherited registry entries FIRST so
+#                                           they can't pin the new seat busy)
 #                       pod-state idle      (back at the prompt)
 #                       pod-brief boot      (inject the pod journal tail)
 #                       pod-primer          (role primer + operator memory)
@@ -20,6 +23,9 @@
 #   Notification     -> pod-state wait      (a permission/attention prompt)
 #   PostToolUse      -> pod-state busy posttool  (rescue a stuck wait dot only;
 #                       a one-read no-op on every ordinary tool call)
+#   PostToolUse [matcher=Workflow] -> pod-workflow-state record  (a background
+#                       workflow just launched: register it so pod-state suppresses
+#                       the idle dot until it finishes)
 #
 # Idempotent: a pod hook is added only if an identical command isn't already present,
 # so re-running is safe. Existing non-pod hooks (e.g. a TTS Stop hook) are left intact.
@@ -77,6 +83,10 @@ settings_path, pod_bin, awareness = sys.argv[1], sys.argv[2], sys.argv[3]
 WIRING = {
     "SessionStart": [
         'bash "%s"' % awareness,
+        # reset BEFORE the idle stamp: pod-state consults the workflow registry on
+        # every idle, and a stale entry inherited from this window's previous
+        # process must not flip the brand-new seat busy.
+        'bash "%s/pod-workflow-state" reset' % pod_bin,
         'bash "%s/pod-state" idle' % pod_bin,
         'bash "%s/pod-brief" boot' % pod_bin,
         'bash "%s/pod-primer"' % pod_bin,
@@ -110,6 +120,17 @@ TIMEOUTS = {
     'bash "%s/pod-brief" refresh UserPromptSubmit' % pod_bin: 6,
     'bash "%s/pod-last"' % pod_bin: 5,
     'bash "%s/pod-primer"' % pod_bin: 6,
+    'bash "%s/pod-workflow-state" record' % pod_bin: 5,
+}
+
+# Hooks that must fire for ONE tool only get a matcher group of their own. A
+# matcher-less PostToolUse group fires on EVERY tool call, and `record` pays a
+# python parse of the payload — scoping it to the Workflow tool keeps the ordinary
+# tool path exactly as cheap as before. event -> (matcher, [commands]).
+MATCHED_WIRING = {
+    "PostToolUse": ("Workflow", [
+        'bash "%s/pod-workflow-state" record' % pod_bin,
+    ]),
 }
 def timeout_for(cmd):
     return TIMEOUTS.get(cmd, 3)
@@ -157,7 +178,7 @@ def existing_commands(event):
 # entries from any prior checkout.
 POD_BIN_SCRIPTS = {
     "pod-state", "pod-brief", "pod-primer", "pod-mail-check",
-    "pod-work", "pod-auto-brief", "pod-last",
+    "pod-work", "pod-auto-brief", "pod-last", "pod-workflow-state",
 }
 
 def pod_hook_script(cmd):
@@ -227,6 +248,21 @@ for event, cmds in WIRING.items():
         "hooks": [{"type": "command", "command": c, "timeout": timeout_for(c)} for c in missing]
     })
     added.extend(["%s: %s" % (event, c) for c in missing])
+
+for event, (matcher, cmds) in MATCHED_WIRING.items():
+    have = existing_commands(event)
+    missing = [c for c in cmds if c not in have]
+    if not missing:
+        continue
+    groups = hooks.setdefault(event, [])
+    if not isinstance(groups, list):
+        print("install.sh: settings.hooks.%s is not an array; refusing to touch it" % event, file=sys.stderr)
+        sys.exit(1)
+    groups.append({
+        "matcher": matcher,
+        "hooks": [{"type": "command", "command": c, "timeout": timeout_for(c)} for c in missing]
+    })
+    added.extend(["%s[%s]: %s" % (event, matcher, c) for c in missing])
 
 if not added and not pruned:
     print("install.sh: all agent-pods Claude Code hooks already present in %s — nothing to do." % settings_path)

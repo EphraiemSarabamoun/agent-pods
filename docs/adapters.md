@@ -121,6 +121,7 @@ mode            = "poll"   # "hooks" = agent fires lifecycle events we wired; "p
 installer       = ""       # repo-relative path to a hook installer; only for mode="hooks"
 native_delivery = false    # true = agent surfaces pod-mail itself -> pod-deliver skips send-keys
 state_source    = "poll"   # "hooks" = agent stamps its own @cc_state; "poll" = the poller infers it
+clear_cmd       = ""       # the agent's own "wipe this conversation" command (e.g. "/clear")
 ```
 
 This is the hooks-vs-poll distinction, the heart of "generic is first-class, hooks are an
@@ -150,6 +151,13 @@ When `false` (every poll agent), `pod-deliver` is the only delivery path and it 
 send-keys. The detector caches this as `@pod_native_delivery` on the window; a
 hook-capable agent's own hook re-stamps it authoritatively once it's live.
 
+`clear_cmd` names the agent's own "wipe this conversation" command (Claude Code ships
+`/clear`). It is consumed by the FULL AUTO fresh-crew reset ([autonomy.md](autonomy.md)):
+only a seat whose adapter declares one is ever cleared; every other agent seat is skipped
+and reported by name, and plain shells are never typed into. Declare it only after
+verifying the exact command in that agent's TUI — a wrong value is typed into a live
+seat as if it were a prompt.
+
 ### `[discover]`: authoritative local models
 
 Model availability is derived from the agent/provider on the current device. A
@@ -164,6 +172,7 @@ models_regex = '^(\S+)\s+-\s+(.+?)(?:\s+\(current\))?$'  # grp1 = id, grp2 = lab
 timeout_s    = 8                                      # kill discovery after N seconds
 ttl_s        = 300                                    # short cache; refresh on demand
 efforts      = []                                     # ladder applied to every model
+effort_suffixes = []                                  # fold baked-effort ids into families
 ```
 
 `models_cmd` runs through the shell, so it can invoke the same agent wrapper on another
@@ -172,10 +181,20 @@ matched by `models_regex`: group 1
 is the model id (used as both the `{model}` value and the slug), an optional group 2
 is the pretty label, and non-matching lines (headers, blanks) are skipped. Only models
 are discovered — effort ladders aren't enumerable from any CLI, so `[discover].efforts`
-declares the ladder applied to every discovered model (empty = no effort axis; cursor,
-for instance, bakes effort into the model slug). Results cache under
-`$POD_STATE/discover/<id>.json`; `pod-adapter refresh [id]` busts the cache and
-re-queries.
+declares the ladder applied to every discovered model (empty = no effort axis). Results
+cache under `$POD_STATE/discover/<id>.json`; `pod-adapter refresh [id]` busts the cache
+and re-queries.
+
+Some CLIs bake reasoning effort INTO the model id instead of taking a flag — Cursor
+serves `grok-4.6-low` … `grok-4.6-xhigh` as separate "models". `effort_suffixes` folds
+those into one family per base id with a real effort ladder built from exactly the
+rungs discovery proved: pick `grok-4.6` + `xhigh` and the seat launches with the full
+baked id. A discovered bare base id becomes a leading `default` rung; suffixes are
+matched longest-first (so `extra-high` never mis-splits as `…-extra` + `high`); ids
+matching no suffix pass through untouched; and the collapse never mints an id
+discovery didn't return — an unproven rung is rejected at launch. List the suffixes
+best-first (that's the display order) and keep `effort_arg = []`, since the effort
+lives inside `{model}`.
 
 Commands can also emit explicit tab-separated rows by setting
 `models_format = "tsv"`; each row is `slug<TAB>label<TAB>launch-value`. The bundled

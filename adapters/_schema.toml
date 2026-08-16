@@ -40,6 +40,13 @@ state_source    = "poll"           # "hooks" = agent stamps its own @cc_state; "
 # the durable mailbox will then wait for the agent's next native prompt hook.
 prompt_line_regex  = ''             # identifies any input line in capture-pane output
 empty_prompt_regex = ''             # full-match for that agent's rendered placeholder
+# The agent's own "wipe this conversation" command (e.g. Claude Code's "/clear").
+# Consumed by the FULL AUTO fresh-crew reset (pod-auto): only a seat whose adapter
+# declares one is ever cleared; every other agent seat is reported by name instead
+# of guessed at, and plain shells are never typed into. Declare it only after
+# verifying the exact command in that agent's TUI — a wrong value is typed into a
+# live seat as if it were a prompt.
+clear_cmd = ''
 
 # [discover] (OPTIONAL) — authoritative local model discovery. When the command exits
 # 0 with >=1 parsed model, those are the selectable models. If it is absent/fails, the
@@ -63,6 +70,13 @@ auth         = ""                       # "" | "anthropic" | "openai" | <your pr
 # Effort ladder applied to EVERY discovered model (efforts aren't CLI-enumerable, so
 # they stay declarative here). Empty [] = the agent has no effort axis.
 efforts = []
+# For CLIs that bake effort INTO the model id instead of taking a flag (Cursor's
+# grok-4.6-xhigh): discovered ids ending in "-<suffix>" fold into ONE family per
+# base id, whose effort ladder is exactly the rungs discovery proved; a chosen rung
+# launches as its full baked id. Listed best-first (that is the display order);
+# longer suffixes match first, so "extra-high" is safe alongside "high". Empty = no
+# collapsing. Keep effort_arg = [] with this — the effort lives inside {model}.
+effort_suffixes = []
 
 # Optional annotations for discovered slugs. These can improve labels or effort
 # ladders, but they NEVER make a model available if discovery did not return it.

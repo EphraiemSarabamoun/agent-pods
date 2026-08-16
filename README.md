@@ -259,6 +259,15 @@ first broken link. It's read-only. Common causes it catches:
   awareness still works, but `pod-doctor` flags it (a login shell having jq doesn't put
   it on the agent process's PATH).
 
+Two non-failures worth knowing before you "fix" them:
+
+- **A busy dot over a quiet screen** is usually a seat waiting on a background workflow
+  it launched, not a wedged agent — the idle stamp is deliberately suppressed until the
+  workflow finishes (`pod-workflow-state`).
+- **Closing the terminal window does not end a pod.** tmux is a server: the X detaches
+  the viewing client while every seat REPL keeps running headless. `pod-launch` (or your
+  manager-name launcher) reattaches it; `pod-kill <pod>` actually ends it.
+
 ## Add your agent
 
 Teaching agent-pods a new agent is a TOML file: how to launch it, how to recognize it in

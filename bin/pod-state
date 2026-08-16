@@ -19,6 +19,10 @@
 # The strip reads #{@cc_state} per window: idle=green ● busy=orange ◐ wait=yellow ◆
 # unset=grey ○. Agents WITHOUT hooks get this dot from pod-foreign-state instead.
 #
+# An idle stamp is CONDITIONAL: while a background workflow this seat launched is
+# still running (pod-workflow-state check), idle is suppressed to busy — so a seat
+# reading busy over a quiet screen is usually waiting on its own workflow, not wedged.
+#
 # No-op outside tmux. MUST never fail a hook, so every path exits 0.
 set -u
 POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh" 2>/dev/null || true
@@ -46,7 +50,9 @@ print("idle" if nt == "idle_prompt" or "waiting for your input" in msg else "wai
   [ "$decided" = "idle" ] && state="idle"
 fi
 
-win="$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
+# window + session in ONE round-trip (session scopes the workflow registry below)
+meta="$("$T" display-message -p -t "$pane" '#{window_id}|#{session_name}' 2>/dev/null)"
+win="${meta%%|*}"; sess="${meta#*|}"
 [ -n "$win" ] || exit 0
 # Stamp @state_since (epoch) ONLY on a real transition, so the summary pane's activity
 # timer ("busy 12m") measures the current state, not the last hook fire.
@@ -55,6 +61,20 @@ prev="$("$T" show-options -w -t "$win" -qv @cc_state 2>/dev/null)"
 # waiting, do nothing — a one-read no-op on every ordinary tool call.
 if [ "$source" = "posttool" ]; then
   [ "$prev" = "wait" ] || exit 0
+fi
+# A seat that launched a background workflow (Claude Code's Workflow tool) is NOT free
+# the moment its turn ends: the workflow grinds on for minutes after. Every path that
+# stamps idle must therefore ask first — Stop, the Notification idle_prompt remap
+# above, SessionStart. Guarding HERE instead of bolting a second hook onto Stop is
+# what makes that true by construction: the Notification path had no such hook, so a
+# seat went green ~60s after launching a workflow. Cost when nothing is in flight:
+# one [ -s ] test. pod-workflow-state check prunes finished runs and exits 0 only
+# while one is genuinely still running.
+if [ "$state" = "idle" ] && [ -n "${POD_COMMS:-}" ]; then
+  wfreg="$POD_COMMS/$(pod_path_component "$sess")/wf/$(pod_path_component "$win").list"
+  if [ -s "$wfreg" ] && "$POD_BIN/pod-workflow-state" check >/dev/null 2>&1; then
+    state=busy
+  fi
 fi
 "$T" set-option -w -t "$win" @cc_state "$state" 2>/dev/null || true
 [ "$prev" = "$state" ] || "$T" set-option -w -t "$win" @state_since "$(date +%s)" 2>/dev/null || true

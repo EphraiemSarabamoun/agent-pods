@@ -78,6 +78,8 @@ OWNED = {
     'bash "%s/pod-last"' % pod_bin,
     'bash "%s/pod-state" wait' % pod_bin,
     'bash "%s/pod-state" busy posttool' % pod_bin,
+    'bash "%s/pod-workflow-state" reset' % pod_bin,
+    'bash "%s/pod-workflow-state" record' % pod_bin,
 }
 
 # Second rule: recognize a pod hook baked with ANY path prefix, so entries left behind by
@@ -88,7 +90,7 @@ OWNED = {
 # unrelated `echo pod-mail-check-health` or report-pod-state-metrics never matches.
 POD_BIN_SCRIPTS = {
     "pod-state", "pod-brief", "pod-primer", "pod-mail-check",
-    "pod-work", "pod-auto-brief", "pod-last",
+    "pod-work", "pod-auto-brief", "pod-last", "pod-workflow-state",
 }
 
 def pod_hook_script(cmd):
