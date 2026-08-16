@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# pod-kill — deliberately END whole pod(s): the session, every seat REPL in it.
+#
+# Closing the terminal window does NOT do this: tmux is a server, so the X only
+# detaches the viewing client — the session, every agent REPL in it, and all their
+# MCP subprocesses keep running headless, now invisible. On a busy machine that
+# adds up fast (observed on a live deck: two closed-but-unkilled pods sat unnoticed
+# for two days — 18 seats and ~100 MCP processes still grinding). The window's X
+# means "stop looking at it"; THIS command means "end it".
+#
+# Usage:
+#   pod-kill <pod> [<pod>...]     end these pods
+#   pod-kill --list               live sessions with attached/busy state
+#   pod-kill --force <pod>        also allow: busy seats mid-turn, and the pod you
+#                                 are running inside (this command dies with it)
+#
+# Containment: only sessions stamped @is_pod are killable, force or not — on a
+# shared tmux server (POD_TMUX_SOCKET=) your own unrelated sessions are never in
+# scope; plain `tmux kill-session` exists for those. Ended pods are logged to
+# $POD_STATE/kill.log, the one place that answers "who ended this pod". Killing is
+# recoverable in the way that matters: agent transcripts persist to disk
+# continuously — you lose the live REPLs, not the work. The session-closed hook
+# sweeps the pod's comms subtree; a belt-and-braces pod-mail-gc runs here too for
+# pods launched before that hook existed. bash 3.2 safe.
+set -u
+POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+T="$POD_TMUX"
+
+usage() { echo "usage: pod-kill [--list] [--force] <pod> [<pod>...]" >&2; }
+
+FORCE=0; LIST=0; TARGETS=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --force) FORCE=1; shift ;;
+    --list)  LIST=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --*) usage; exit 2 ;;
+    *) TARGETS="$TARGETS$1
+"; shift ;;
+  esac
+done
+
+# One pass over every window on the server: session -> windows/attached/busy/pod.
+# (@cc_state is per-window; session_attached and @is_pod repeat on each row.)
+# awk-parsed on purpose: tab is IFS-whitespace, so a `read`-based parse would drop
+# the empty @cc_state field of a freshly spawned seat (docs/gotchas.md); awk keeps
+# empty tab-separated fields intact.
+rows="$("$T" list-windows -a -F '#{session_name}	#{@cc_state}	#{session_attached}	#{@is_pod}' 2>/dev/null)"
+[ -n "$rows" ] || { echo "pod-kill: no tmux sessions on this server"; exit 0; }
+
+session_stat() {  # $1=session  -> "windows busy attached is_pod" (space-separated)
+  printf '%s\n' "$rows" | awk -F'\t' -v s="$1" '
+    $1==s { w++; if ($2=="busy") b++; a=$3; p=$4 }
+    END { if (w) printf "%d %d %s %s", w, b+0, (a=="0"?"no":"yes"), (p=="1"?"yes":"no") }'
+}
+
+if [ "$LIST" = "1" ] || [ -z "$TARGETS" ]; then
+  printf '%-20s %-8s %-9s %-6s %s\n' "SESSION" "WINDOWS" "ATTACHED" "BUSY" "POD"
+  printf '%s\n' "$rows" | awk -F'\t' '{ print $1 }' | sort -u | while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    # shellcheck disable=SC2086
+    set -- $(session_stat "$s")
+    printf '%-20s %-8s %-9s %-6s %s\n' "$s" "${1:-0}" "${3:-no}" "${2:-0}" "${4:-no}"
+  done
+  if [ -z "$TARGETS" ] && [ "$LIST" != "1" ]; then echo; usage; fi
+  exit 0
+fi
+
+# The pod this command is running inside, if any (refused without --force: killing
+# it kills this very process mid-loop, which is occasionally exactly what you want).
+own=""
+if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+  own="$("$T" display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null)"
+fi
+
+log_kill() {
+  mkdir -p "$POD_STATE" 2>/dev/null || return 0
+  printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$POD_STATE/kill.log" 2>/dev/null || true
+}
+
+killed=0; refused=0
+while IFS= read -r sess; do
+  [ -n "$sess" ] || continue
+  stat="$(session_stat "$sess")"
+  if [ -z "$stat" ]; then
+    echo "pod-kill: no such session '$sess'"
+    refused=$((refused + 1)); continue
+  fi
+  # shellcheck disable=SC2086
+  set -- $stat
+  wins="$1"; busy="$2"; ispod="$4"
+  if [ "$ispod" != "yes" ]; then
+    echo "pod-kill: REFUSING '$sess' — not a stamped pod (@is_pod); use tmux kill-session for plain sessions"
+    refused=$((refused + 1)); continue
+  fi
+  if [ "$sess" = "$own" ] && [ "$FORCE" != "1" ]; then
+    echo "pod-kill: REFUSING '$sess' — you are running inside it (--force to override; this command dies with it)"
+    refused=$((refused + 1)); continue
+  fi
+  if [ "$busy" -gt 0 ] && [ "$FORCE" != "1" ]; then
+    echo "pod-kill: REFUSING '$sess' — $busy busy seat(s) mid-turn (--force to override)"
+    refused=$((refused + 1)); continue
+  fi
+  echo "pod-kill: ending '$sess' ($wins window(s))"
+  log_kill "ended pod $sess ($wins windows, busy=$busy, force=$FORCE)"
+  "$T" kill-session -t "=$sess" 2>/dev/null || true
+  # The session-closed hook normally sweeps comms; cover pods launched before it.
+  [ -x "$POD_BIN/pod-mail-gc" ] && "$POD_BIN/pod-mail-gc" "$sess" >/dev/null 2>&1 || true
+  killed=$((killed + 1))
+done <<EOF
+$TARGETS
+EOF
+
+[ "$killed" -gt 0 ] || exit 1
+exit 0

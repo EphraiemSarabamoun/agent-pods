@@ -17,8 +17,31 @@
 #
 # Usage:
 #   pod-auto [on|off|toggle|status] [--pod <name>] [--client <name>]
+#            [--yes] [--reset|--no-reset]
 #   pod-auto install --pod <name>        # retrofit the pill onto a LIVE pod that
 #                                        # was launched before the pill existed
+#
+# THE FRESH-CREW RESET. A HUMAN flip to ON hands the whole pod to the manager as a
+# fresh crew: it confirms first (tmux confirm-before on the flipping client, or a
+# TTY prompt), then clears the manager's context AND every agent seat's context
+# (each adapter's own lifecycle.clear_cmd, e.g. Claude Code's "/clear"), then
+# briefs the manager so it greets the operator and stands by owning the roster.
+# Rationale: an auto-mode manager that inherits a half-finished conversation
+# manages around it, and idle seats the operator was CHATTING with are legal
+# dispatch targets (availability filters on idle, not on ownership). Resetting at
+# the flip makes "every non-manager seat in an auto pod is a worker" true by
+# construction, which is why no per-seat do-not-dispatch marker exists.
+#
+# WHO GETS RESET, and the guard that matters: reset happens only when the flip was
+# confirmed interactively, or when --reset is passed explicitly. An agent running
+# `pod-auto on` from inside its own tool shell (exactly what an autonomous loop's
+# step 0 does) is detected the same way pod-star's human-only gate works —
+# CLAUDECODE in the environment, or a calling pane stamped with a real @agent_id;
+# the tmux server's run-shell context carries neither, so pill clicks and key
+# bindings read as human. Without that guard a manager would clear ITSELF the
+# moment it armed its own loop. Programmatic flips therefore never confirm and
+# never reset: behavior there is byte-identical to before this feature. Fail-SAFE:
+# a misread signal costs a skipped reset, never a self-clear.
 #
 # Flip side effects (transitions only — repeat flips are idempotent no-ops):
 #   - ON only: a short celebration popup on the flipping client (pod-auto-anim).
@@ -46,6 +69,7 @@ MGR_NAME_MANUAL="$POD_MANAGER_NAME"
 MGR_NAME_AUTO="${POD_MANAGER_NAME_AUTO:-$POD_MANAGER_NAME}"
 
 ACTION=""; POD_ARG=""; CLIENT=""
+ASSUME_YES=0; RESET=0; RESET_FORCED=""; RESET_SKIPPED=""
 while [ $# -gt 0 ]; do
   case "$1" in
     on|off|toggle|status|install) ACTION="$1"; shift ;;
@@ -54,8 +78,11 @@ while [ $# -gt 0 ]; do
       [ "$#" -ge 2 ] || { echo "pod-auto: $1 requires a value" >&2; exit 2; }
       case "$1" in --pod) POD_ARG="$2" ;; --client) CLIENT="$2" ;; esac
       shift 2 ;;
+    --yes|-y)   ASSUME_YES=1; shift ;;
+    --reset)    RESET_FORCED=1; shift ;;
+    --no-reset) RESET_FORCED=0; shift ;;
     -h|--help|*)
-      echo "usage: pod-auto [on|off|toggle|status|install] [--pod <name>] [--client <name>]" >&2
+      echo "usage: pod-auto [on|off|toggle|status|install] [--pod <name>] [--client <name>] [--yes] [--reset|--no-reset]" >&2
       exit 2 ;;
   esac
 done
@@ -138,6 +165,117 @@ paused_task_for_pod() {
   return 0
 }
 
+# ---- the fresh-crew reset (human ON flips only) ------------------------------
+
+# A flip is HUMAN unless it came from inside an agent's own tool shell. Two
+# signals, the same pair pod-star's human-only gate trusts: CLAUDECODE (set in
+# every shell Claude Code runs) and the calling pane's detected @agent_id. The
+# tmux server's run-shell context (the pill, C-a a, M-a) carries neither, so
+# clicks and key bindings read as human. Fail-SAFE by construction: a misread
+# signal costs a skipped reset, never a manager clearing itself mid-loop.
+human_flip() {
+  [ -z "${CLAUDECODE:-}" ] || return 1
+  local ca=""
+  [ -n "${TMUX_PANE:-}" ] && ca="$("$T" show-options -wqv -t "$TMUX_PANE" @agent_id 2>/dev/null)"
+  case "$ca" in ""|generic-shell|shell) return 0 ;; *) return 1 ;; esac
+}
+
+resolve_client() {
+  [ -n "$CLIENT" ] && { printf '%s' "$CLIENT"; return 0; }
+  "$T" list-clients -t "=$POD" -F '#{client_name}' 2>/dev/null | head -1
+}
+
+# Clear commands are AGENT-OWNED: only a seat whose adapter declares a
+# lifecycle.clear_cmd (e.g. Claude Code's "/clear") is ever cleared. A window with
+# no detected agent is a plain shell and must never be typed into; an agent whose
+# adapter names no clear command is reported by name instead of guessed at.
+reset_seat() { # $1=window id  $2=display name
+  local aid ccmd
+  aid="$("$T" show-options -wqv -t "$1" @agent_id 2>/dev/null)"
+  [ -n "$aid" ] || aid="$("$POD_BIN/pod-detect" "$1" 2>/dev/null)"
+  case "$aid" in ""|generic-shell|shell) return 0 ;; esac
+  ccmd="$("$POD_ADAPTER" field "$aid" clear_cmd 2>/dev/null || true)"
+  [ -n "$ccmd" ] || { RESET_SKIPPED="${RESET_SKIPPED}${2:-$1} "; return 0; }
+  # Escape first: a seat mid-turn would otherwise queue the clear behind its
+  # current answer. The reset was consented to at the confirm, so interrupting is
+  # the intended behavior, not a clobber.
+  "$T" send-keys -t "$1" Escape 2>/dev/null || return 0
+  sleep 0.3
+  # literal type + gap + Enter: the send-keys submit race (docs/gotchas.md)
+  "$T" send-keys -t "$1" -l "$ccmd" 2>/dev/null || return 0
+  sleep 0.1
+  "$T" send-keys -t "$1" Enter 2>/dev/null || true
+  # Second Enter, measured on a live deck: a single Enter into a seat that is
+  # still settling types the text but does NOT submit it, leaving the clear
+  # command parked in the input box — and the next thing delivered there arrives
+  # concatenated onto it as one garbled prompt. Enter on an already-empty box is
+  # a no-op in these TUIs, so the retry is free insurance.
+  sleep 0.4
+  "$T" send-keys -t "$1" Enter 2>/dev/null || true
+  return 0
+}
+
+reset_pod_contexts() {
+  local mgrwin table wid wname
+  mgrwin="$(mgr_manager_window "$POD")"
+  table="$("$T" list-windows -t "=$POD" -F '#{window_id}|#{window_name}' 2>/dev/null)"
+  # Workers first, manager LAST, so the boot brief is the final thing delivered
+  # and cannot be swallowed by the manager's own clear.
+  while IFS='|' read -r wid wname; do
+    [ -n "$wid" ] || continue
+    [ "$wid" = "$mgrwin" ] && continue
+    reset_seat "$wid" "$wname"
+  done <<EOF
+$table
+EOF
+  [ -n "$mgrwin" ] && reset_seat "$mgrwin" "manager"
+  return 0
+}
+
+# A cleared seat is normally idle within a beat (a slash command is not a model
+# turn), but an interrupted one needs a moment for its own lifecycle hook to land.
+wait_manager_idle() { # $1=manager window
+  local i st
+  [ -n "${1:-}" ] || return 1
+  for i in 1 2 3 4 5 6 7 8; do
+    st="$("$T" show-options -wqv -t "$1" @cc_state 2>/dev/null)"
+    [ "$st" = "idle" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+queue_depth_numeric() {
+  local qd d
+  qd="$(mgr_queue_dir "$POD" 2>/dev/null)" || { printf '0'; return 0; }
+  [ -d "$qd" ] || { printf '0'; return 0; }
+  d="$(ls -1 "$qd" 2>/dev/null | wc -l | tr -d ' ')"
+  case "$d" in ''|*[!0-9]*) d=0 ;; esac
+  printf '%s' "$d"
+}
+
+# One self-contained brief into a context that was just emptied: what it owns and
+# an explicit hold, so it greets instead of immediately spawning workers. Durable
+# mailbox first; the guarded pod-deliver submit wakes an idle manager now, and the
+# native prompt hook surfaces the same mail if the gates say not yet.
+send_boot_brief() {
+  local mgrwin agent_id depth pending=""
+  depth="$(queue_depth_numeric)"
+  case "$depth" in
+    ''|0) ;;
+    *) pending=" There are ${depth} task(s) still queued from before the reset: mention that in your greeting and ask whether to drain or drop them." ;;
+  esac
+  notify_manager "FULL AUTO turned ON and every seat was just reset — you are this pod's manager with a fresh crew. You own the roster (pod-add-worker to hire a seat, pod-kill-worker to retire one, the queue module's mgr-stage / mgr-queue / mgr-pick-next to assign work, pod-task-wait to sleep until a seat frees), and the operator now talks only to you.${pending} RIGHT NOW: greet the operator in ONE short line and stand by for an objective — do not spawn workers or start any work yet."
+  mgrwin="$(mgr_manager_window "$POD")"
+  [ -n "$mgrwin" ] || return 0
+  agent_id="$("$T" show-options -w -t "$mgrwin" -qv @agent_id 2>/dev/null || true)"
+  case "$agent_id" in ""|generic-shell) return 0 ;; esac
+  wait_manager_idle "$mgrwin" || true
+  POD_DELIVER_SUBMIT=1 POD_DELIVER_REQUIRE_EMPTY=1 \
+    "$POD_BIN/pod-deliver" "$mgrwin" --mode submit >/dev/null 2>&1 || true
+  return 0
+}
+
 queue_resume_trigger() {  # durable mailbox first; guarded delivery wakes an idle seat
   local mgrwin agent_id
   notify_manager "FULL AUTO turned ON — resume the paused pod-task: read ${STATE}, set status to running, run mgr-pick-next --all-idle, then re-arm pod-task-wait in the background."
@@ -198,6 +336,36 @@ if [ "$new" = "$cur" ]; then
   exit 0
 fi
 
+# ---- the ON confirmation: warn BEFORE anything is cleared --------------------
+# Confirmation and reset are welded together on purpose: the operator only ever
+# loses a context they were warned about, and a warning they answered always does
+# what it said.
+if [ "$new" = "on" ]; then
+  if [ -n "$RESET_FORCED" ]; then
+    RESET="$RESET_FORCED"
+  elif [ "$ASSUME_YES" = "0" ] && human_flip; then
+    CONFIRM_CLIENT="$(resolve_client)"
+    if [ -n "$CONFIRM_CLIENT" ]; then
+      # Answering y re-enters this script with the decision already made; answering
+      # n exits confirm-before nonzero, which we deliberately do not propagate. The
+      # re-entry redirects its output: any stdout from a run-shell pops a full-pane
+      # copy-mode overlay a human must dismiss (docs/gotchas.md).
+      "$T" confirm-before -t "$CONFIRM_CLIENT" \
+        -p "⚡ FULL AUTO: clears the manager + every agent context in ${POD}. y/n " \
+        "run-shell -b '${POD_BIN}/pod-auto on --yes --reset --pod ${POD} --client ${CONFIRM_CLIENT} >/dev/null 2>&1'"
+      exit 0
+    elif [ -t 0 ]; then
+      printf '⚡ FULL AUTO on %s clears the MANAGER context and EVERY agent context in the pod.\nContinue? [y/N] ' "$POD"
+      read -r _ans
+      case "$_ans" in
+        y|Y|yes|YES) RESET=1 ;;
+        *) echo "aborted; pod '$POD' stays manual"; exit 0 ;;
+      esac
+    fi
+    # No client and no TTY: a headless human-context flip. Flip, don't reset.
+  fi
+fi
+
 if [ "$new" = "on" ]; then
   "$T" set -t "$POD" @full_auto 1
   play_full_auto_animation
@@ -205,9 +373,29 @@ if [ "$new" = "on" ]; then
   refresh_pod_clients
   journal "⚡ FULL AUTO ON"
   flash "${POD}: ⚡ FULL AUTO ON"
+  if [ "$RESET" = "1" ]; then
+    reset_pod_contexts
+    if [ -n "$RESET_SKIPPED" ]; then
+      journal "⚡ pod contexts reset (no clear_cmd, left as-is: ${RESET_SKIPPED% })"
+    else
+      journal "⚡ pod contexts reset (manager + all agent seats)"
+    fi
+    wait_manager_idle "$(mgr_manager_window "$POD")" || true
+  fi
   if paused_task_for_pod; then
     queue_resume_trigger
     echo "pod '$POD': full-auto ON ⚡ — resume queued and the manager was nudged if idle"
+  elif [ "$RESET" = "1" ]; then
+    # A reset flip GREETS rather than auto-starting: the operator asked for a
+    # manager that reports for duty and waits for the objective. Leftover queue
+    # depth is named in the brief instead of silently ground through on a
+    # cleared context.
+    send_boot_brief
+    if [ -n "$RESET_SKIPPED" ]; then
+      echo "pod '$POD': full-auto ON ⚡ — pod reset, manager briefed; left as-is (no clear_cmd): ${RESET_SKIPPED% }"
+    else
+      echo "pod '$POD': full-auto ON ⚡ — pod reset, manager briefed and standing by"
+    fi
   else
     notify_manager "FULL AUTO turned ON — treat work objectives as autonomous-loop objectives from here."
     echo "pod '$POD': full-auto ON ⚡"
