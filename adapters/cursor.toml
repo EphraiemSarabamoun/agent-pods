@@ -30,11 +30,21 @@ state_source    = "poll"
 # Live discovery: ask cursor-agent itself what it serves. Output lines look like
 # "gpt-5.3-codex-high - Codex 5.3 High" and "auto - Auto (current)"; the regex takes
 # the slug (group 1) and the pretty label (group 2), dropping the "Available models"
-# header and the trailing "(current)" marker. Cursor encodes reasoning effort INTO
-# the model slug (…-low / …-high / …-xhigh), so there is no separate effort axis.
+# header and the trailing "(current)" marker.
+#
+# Cursor encodes reasoning effort INTO the model id (…-low / …-high / …-xhigh)
+# rather than taking an effort flag, which used to leave the picker with a wall of
+# near-duplicate ids and no effort axis. effort_suffixes folds those into one family
+# per base id with a real effort ladder built from exactly the rungs discovery
+# proved; each chosen rung launches as its full baked id (effort_arg stays empty —
+# there is no flag to pass). Spelling quirks ride along for free: a family that
+# ships "-extra-high" gets an "extra-high" rung, one that ships "-xhigh" gets
+# "xhigh", and nothing is renamed or minted. Ids with no effort suffix (auto,
+# composer-…) pass through unchanged.
 [discover]
 models_cmd   = "cursor-agent --list-models"
 models_regex = '^(\S+)\s+-\s+(.+?)(?:\s+\(current\))?$'
 timeout_s    = 30
 ttl_s        = 300
 efforts      = []
+effort_suffixes = ["max", "xhigh", "extra-high", "high", "medium", "low", "none"]

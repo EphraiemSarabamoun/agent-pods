@@ -105,6 +105,8 @@ def _validate_adapter(data):
             return "[[models]].efforts must be an array of tables"
     if not _table_list(data.get("discover", {}).get("efforts", []) or []):
         return "[discover].efforts must be an array of tables"
+    if not _str_list(data.get("discover", {}).get("effort_suffixes", []) or []):
+        return "[discover].effort_suffixes must be an array of strings"
     return None
 
 
@@ -337,9 +339,86 @@ def _cached_discovery(aid, disc):
     return models
 
 
+def _collapse_effort_suffixes(discovered, disc):
+    """Fold effort-suffixed vendor ids into one family per base id.
+
+    Some CLIs (Cursor) encode reasoning effort INTO the model id (grok-4.6-xhigh)
+    instead of taking an effort flag, which turns the picker's model list into a wall
+    of near-duplicates and leaves its effort axis empty. When
+    [discover].effort_suffixes is set, every discovered id ending in "-<suffix>"
+    joins a family keyed by the base id; the family becomes ONE selectable model
+    whose effort ladder is exactly the suffixes discovery proved, each rung carrying
+    the full baked vendor id in its `model` field — cmd_launch substitutes that id
+    into {model} when the rung is chosen. A bare base id that discovery also
+    returned becomes the family's own model and a leading "default" rung; when the
+    base was never returned, the family's model falls back to its first-discovered
+    rung so a model-only pick still names an id the vendor actually serves. Ids
+    matching no suffix pass through untouched.
+
+    Two deliberate details: suffixes are matched LONGEST-FIRST so "-extra-high" can
+    never be mis-split as base "…-extra" + "high", and the ladder renders in the
+    adapter's declared suffix order (best-first by convention). Availability is
+    preserved by construction — every rung's baked id came from discovery; the
+    collapse never mints a launchable id.
+    """
+    suffixes = [s for s in (disc.get("effort_suffixes", []) or [])
+                if isinstance(s, str) and s]
+    if not suffixes or not discovered:
+        return discovered
+    by_len = sorted(suffixes, key=len, reverse=True)
+
+    def split(slug):
+        for suf in by_len:
+            if slug.endswith("-" + suf) and len(slug) > len(suf) + 1:
+                return slug[: -(len(suf) + 1)], suf
+        return None, None
+
+    members = {}       # base -> {suffix: row}
+    first_rung = {}    # base -> first-discovered member row (the model fallback)
+    for d in discovered:
+        base, suf = split(d.get("slug") or "")
+        if base is None:
+            continue
+        members.setdefault(base, {})[suf] = d
+        first_rung.setdefault(base, d)
+    if not members:
+        return discovered
+    bare = {d.get("slug"): d for d in discovered if d.get("slug") in members}
+
+    out, emitted = [], set()
+    for d in discovered:
+        slug = d.get("slug") or ""
+        base, _suf = split(slug)
+        fam = base if base is not None else (slug if slug in members else None)
+        if fam is None:
+            out.append(d)
+            continue
+        if fam in emitted:
+            continue
+        emitted.add(fam)
+        efforts = []
+        if fam in bare:
+            efforts.append({"slug": "default", "label": "default", "value": "default",
+                            "model": bare[fam].get("model") or fam})
+        for suf in suffixes:               # declared order = display order
+            row = members[fam].get(suf)
+            if row is not None:
+                efforts.append({"slug": suf, "label": suf, "value": suf,
+                                "model": row.get("model") or ("%s-%s" % (fam, suf))})
+        fam_model = (bare[fam].get("model") if fam in bare else "") \
+            or first_rung[fam].get("model") or fam
+        label = (bare[fam].get("label") if fam in bare else "") or fam
+        out.append({"slug": fam, "label": label, "model": fam_model,
+                    "efforts": efforts})
+    return out
+
+
 def _merge_discovered(discovered, static, disc):
     """Discovered models are the spine; a static entry with the same slug lends its
-    prettier label and its effort ladder. Otherwise the [discover].efforts default."""
+    prettier label and its effort ladder. Otherwise the [discover].efforts default.
+    A row the suffix collapse built arrives with its own proven effort ladder, which
+    wins over both — a static ladder could otherwise assert baked ids discovery
+    never returned."""
     by_slug = {m.get("slug"): m for m in (static or [])}
     default_efforts = disc.get("efforts", []) or []
     out = []
@@ -349,7 +428,7 @@ def _merge_discovered(discovered, static, disc):
             "slug": d["slug"],
             "model": d["model"],
             "label": s.get("label") or d["label"],
-            "efforts": s.get("efforts") or default_efforts,
+            "efforts": d.get("efforts") or s.get("efforts") or default_efforts,
         })
     return out
 
@@ -378,6 +457,7 @@ def models_of(adapter):
     if disc.get("models_cmd"):
         discovered = _cached_discovery(adapter.get("_id", ""), disc)
         if discovered:
+            discovered = _collapse_effort_suffixes(discovered, disc)
             resolved += [m for m in _merge_discovered(discovered, static, disc)
                          if m.get("slug") != "inherit"]
     adapter["_models"] = resolved
@@ -531,14 +611,19 @@ def cmd_launch(adapters, args):
     m = _model(a, requested) if requested else None
     if requested and not m:
         sys.exit(1)
-    if m and m.get("model"):
-        for t in launch.get("model_arg", []) or []:
-            tokens.append(t.replace("{model}", m["model"]))
     # effort is a CLI-side knob independent of which backend serves the model —
+    # resolved BEFORE the model tokens because a baked-effort rung (built by the
+    # suffix collapse) carries the full vendor id and replaces the family's own.
     em = m or _model(a, a.get("defaults", {}).get("model", ""))
     e = _effort(em, args.effort) if (em and args.effort) else None
     if args.effort and not e:
         sys.exit(1)
+    if m and m.get("model"):
+        model_value = m["model"]
+        if e and e.get("model"):
+            model_value = e["model"]
+        for t in launch.get("model_arg", []) or []:
+            tokens.append(t.replace("{model}", model_value))
     if e and e.get("value"):
         for t in launch.get("effort_arg", []) or []:
             tokens.append(t.replace("{effort}", e["value"]))

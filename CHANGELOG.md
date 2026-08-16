@@ -1,5 +1,24 @@
 # Changelog
 
+## Baked-effort model ids get a real effort axis
+
+- **`[discover].effort_suffixes` collapses Cursor-style baked ids into families.**
+  Cursor encodes reasoning effort INTO the model id (`grok-4.6-low` …
+  `grok-4.6-xhigh`), so the picker showed a wall of near-duplicate "models" and an
+  empty effort axis. With the new key, discovered ids ending in a declared suffix
+  fold into one family per base id whose effort ladder is exactly the rungs
+  discovery proved; picking a rung launches the full baked vendor id (there is no
+  flag to pass, so `effort_arg` stays empty). The details that keep it honest:
+  suffixes match longest-first so `-extra-high` can never be mis-split as base
+  `…-extra` + `high`; a discovered bare base id becomes a leading `default` rung;
+  a family discovery only ever returned rungs for launches as its first proven rung
+  rather than a minted bare id; a collapsed family's ladder wins over a static
+  `[[models]]` ladder, which could otherwise assert rungs discovery never returned;
+  and an unproven rung is rejected at launch. Ids matching no suffix pass through
+  untouched, so `auto` and friends are exactly as before. The bundled cursor
+  adapter turns it on; `test/check-effort-collapse.sh` pins the whole matrix with a
+  printf-backed fake vendor.
+
 ## Workflow-aware state dots, the fresh-crew FULL AUTO reset, and pod-kill
 
 - **A seat that launched a background workflow no longer reads idle mid-run.** Claude

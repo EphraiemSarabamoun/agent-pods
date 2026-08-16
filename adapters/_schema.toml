@@ -70,6 +70,13 @@ auth         = ""                       # "" | "anthropic" | "openai" | <your pr
 # Effort ladder applied to EVERY discovered model (efforts aren't CLI-enumerable, so
 # they stay declarative here). Empty [] = the agent has no effort axis.
 efforts = []
+# For CLIs that bake effort INTO the model id instead of taking a flag (Cursor's
+# grok-4.6-xhigh): discovered ids ending in "-<suffix>" fold into ONE family per
+# base id, whose effort ladder is exactly the rungs discovery proved; a chosen rung
+# launches as its full baked id. Listed best-first (that is the display order);
+# longer suffixes match first, so "extra-high" is safe alongside "high". Empty = no
+# collapsing. Keep effort_arg = [] with this — the effort lives inside {model}.
+effort_suffixes = []
 
 # Optional annotations for discovered slugs. These can improve labels or effort
 # ladders, but they NEVER make a model available if discovery did not return it.
