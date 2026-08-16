@@ -97,6 +97,19 @@ if [ "$tmux_major" -eq 3 ] && [ "$tmux_minor" -lt 3 ]; then
   fi
 fi
 
+# WSL + a checkout on the Windows filesystem is the single most-reported broken combo:
+# /mnt/* rides the 9P interop mount, which is slow and mangles exec bits, so the hook
+# and strip commands whose ABSOLUTE paths this installer bakes can fail on every fire —
+# the visible symptom is a flickering, "blinking" deck as tmux flashes the error line a
+# few hundred ms at a time, forever. Nothing here can make 9P reliable, so warn loudly
+# and name the fix. (Not a die: the clone might be deliberate for a quick look around.)
+if grep -qi microsoft /proc/version 2>/dev/null; then
+  case "$REPO" in
+    /mnt/*)
+      warn "this checkout lives on the WINDOWS filesystem ($REPO). Under WSL the /mnt drives are slow and drop exec bits, so the hook + status-strip commands installed with absolute paths into this tree tend to fail on every fire — the classic symptom is a flashing/blinking pod. Re-clone inside the Linux filesystem (e.g. cd ~ && git clone <repo>) and re-run this installer from there; it will re-point every symlink and prune hook entries left aiming at this copy." ;;
+  esac
+fi
+
 # jq is OPTIONAL — advisory only, matching pod-doctor. The core deck routes every JSON
 # read through pod_json_get's jq -> python3 -> raw-stdout chain (bin/_pod-paths.sh), and
 # the handful of bin/ scripts that shell out to jq directly all degrade gracefully. Only
