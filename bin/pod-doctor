@@ -6,7 +6,10 @@
 # state dots) while every model-facing injection (roster, journal, pod-mail) dies
 # quietly at a broken link. This walks each link and names the broken one:
 #
-#   1. environment   tmux present, inside a pod session, @is_pod stamp
+#   1. environment   tmux present, inside a pod session, @is_pod stamp; host +
+#                    rendering (a WSL checkout on /mnt, a legacy-console hint, a
+#                    non-UTF-8 locale — the three field-reported causes of a
+#                    "blinking"/glitching deck that reads as an agent-pods bug)
 #   2. json tooling  jq / python3 — which emitter path context injection will use
 #   3. this window   @agent_id / @card / @cc_state stamps
 #   4. roster        `pod` runs and prints the "instance(s):" shape hooks match on
@@ -15,6 +18,9 @@
 #                    (a moved/re-cloned repo strands dead paths there silently)
 #   6. live emit     run pod-awareness.sh exactly as the hook would; validate JSON
 #   7. manager name  POD_MANAGER_NAME / POD_MANAGER_NAME_AUTO vs the live tab
+#   8. server log    tmux show-messages tail — a command failing on EVERY fire
+#                    flashes the message line over the strip repeatedly, and THAT
+#                    is what a "blinking deck" usually is
 #
 # Read-only: no state writes, no renames, no deliveries. (The live-emit probe
 # re-applies the same idempotent window stamps the real SessionStart hook applies —
@@ -54,6 +60,35 @@ if [ -n "${TMUX:-}" ] && [ -n "$T" ]; then
   fi
 else
   fail "not inside tmux — run pod-doctor from a pane INSIDE the pod (every awareness hook exits silently outside tmux)"
+fi
+
+# Host + rendering. The deck's redraw-heavy strip surfaces host-layer problems as a
+# "blinking"/glitching pod, which reads as an agent-pods bug and never is. Catch the
+# three field-reported causes: a WSL checkout on the Windows filesystem (the 9P mount
+# is slow and drops exec bits, so hook/strip commands fail on every fire and the error
+# line flashes forever), the legacy Windows console (slow VT interpreter, non-atomic
+# repaints), and a non-UTF-8 locale (tmux and the terminal disagree on wide-glyph
+# widths, so the strip shimmers on every redraw).
+charmap="$(locale charmap 2>/dev/null)"
+case "$charmap" in
+  UTF-8) pass "locale charmap UTF-8" ;;
+  *) warn "locale charmap is '${charmap:-unknown}', not UTF-8 — the strip's wide glyphs (● ◐ ⚡ ⭐) can render at the wrong width and the status bar jitters on every redraw. Fix: export a UTF-8 locale (e.g. LANG=C.UTF-8)." ;;
+esac
+if grep -qi microsoft /proc/version 2>/dev/null; then
+  pass "WSL detected"
+  case "$POD_REPO" in
+    /mnt/*) fail "this checkout lives on the WINDOWS filesystem ($POD_REPO) — /mnt rides the 9P mount, which is slow and drops exec bits, so the hook + strip commands baked with absolute paths fail on every fire (the classic symptom is a flashing deck). Re-clone inside the Linux filesystem and re-run install.sh." ;;
+    *) pass "checkout is on the Linux filesystem ($POD_REPO)" ;;
+  esac
+  __pd_lnk="$(readlink "$HOME/.local/bin/pod-launch" 2>/dev/null)"
+  case "$__pd_lnk" in
+    /mnt/*) fail "~/.local/bin/pod-launch still points at a Windows-filesystem checkout ($__pd_lnk) — re-run install.sh from the Linux-side clone so every symlink re-points." ;;
+  esac
+  if [ -z "${WT_SESSION:-}" ]; then
+    warn "no Windows Terminal marker in this environment — if the deck flickers, you may be in the legacy console (conhost), whose VT interpreter repaints non-atomically; use the Windows Terminal Ubuntu profile. (The marker reflects where the tmux server/agent STARTED, so treat this as a hint, not proof.)"
+  else
+    pass "Windows Terminal environment marker present"
+  fi
 fi
 
 # --- 2. json tooling ---------------------------------------------------------------
@@ -224,6 +259,20 @@ if [ "$IN_TMUX" = 1 ] && [ -n "$T" ]; then
     if [ "$curname" != "$POD_MANAGER_NAME" ] && [ "$curname" != "$POD_MANAGER_NAME_AUTO" ]; then
       warn "manager tab name matches neither configured name — launched before the config was set (the next pod-auto toggle heals a default 'manager' tab), or hand-renamed"
     fi
+  fi
+fi
+
+# --- 8. server message log -----------------------------------------------------------------
+if [ "$IN_TMUX" = 1 ] && [ -n "$T" ]; then
+  say "server message log"
+  msgs="$("$T" show-messages 2>/dev/null | tail -10)"
+  if [ -z "$msgs" ]; then
+    pass "no recent server messages"
+  elif printf '%s' "$msgs" | grep -qiE "error|failed|not found|returned [1-9]|no such"; then
+    warn "the tmux server log holds error-looking lines — a command that fails on EVERY fire flashes the message line over the strip a few hundred ms at a time, which looks like a blinking deck. Most recent:"
+    printf '%s\n' "$msgs" | sed 's/^/      /'
+  else
+    pass "recent server messages contain nothing error-looking"
   fi
 fi
 

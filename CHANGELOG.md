@@ -1,5 +1,21 @@
 # Changelog
 
+## pod-doctor learns why decks blink
+
+- **`pod-doctor` now runs host/rendering checks**, born from a live Windows debugging
+  session. A redraw-heavy deck surfaces host-layer problems as a "blinking" or
+  glitching pod, which reads as an agent-pods bug and never is. The doctor now names
+  the three observed causes: a WSL checkout on the Windows filesystem (`/mnt` rides
+  the 9P mount, which drops exec bits, so hook and strip commands fail on every fire
+  — FAIL, with the re-clone fix; the launcher symlink is checked separately so a
+  half-healed move is caught too), a legacy-console hint (no Windows Terminal marker
+  — WARN, with the caveat that the marker reflects where the server started), and a
+  non-UTF-8 locale (wide-glyph width disagreement makes the strip shimmer — WARN).
+  A new final section tails the tmux server's message log, because a command that
+  fails on every fire flashes the message line over the strip a few hundred
+  milliseconds at a time — and THAT, most often, is what "the pod is blinking"
+  actually is.
+
 ## Baked-effort model ids get a real effort axis
 
 - **`[discover].effort_suffixes` collapses Cursor-style baked ids into families.**
