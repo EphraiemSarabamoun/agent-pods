@@ -248,7 +248,9 @@ state dots stuck grey — run **`pod-doctor`** from a pane inside the pod. It wa
 whole awareness chain end to end (tmux reachability, json tooling, this window's identity
 stamps, the roster shape the hooks match on, whether your Claude Code `settings.json`
 actually wires the hooks and points at live paths, plus a live emit probe) and names the
-first broken link. It's read-only. Common causes it catches:
+first broken link. It also runs host/rendering checks — a WSL checkout on `/mnt`, a
+legacy-console hint, a non-UTF-8 locale, and the tmux server's error log — which cover
+the causes of a "blinking"/glitching deck. It's read-only. Common causes it catches:
 
 - **Hooks not loaded yet.** Lifecycle hooks load when an agent *starts* — a session
   launched before you ran the hook installer stays blind until you restart it.
