@@ -53,12 +53,14 @@ unstyle_host() {
 do_on() {
   [ -n "$(find_pane)" ] && return 0
   # column width: 62 cols fits "idx name dot summary…", clamped to half the window
-  local winw w pane
+  local winw w pane summary_q sess_q
   winw="$("$T" display-message -p -t "=$sess:" '#{window_width}' 2>/dev/null)"
   w=62; [ -n "$winw" ] && [ "$w" -gt $((winw / 2)) ] && w=$((winw / 2)); [ "$w" -lt 30 ] && w=30
   # -h right of the agent pane, -d keep focus in the agent pane
+  summary_q="$(printf '%q' "$POD_BIN/pod-summary")"
+  sess_q="$(printf '%q' "$sess")"
   pane="$("$T" split-window -h -d -l "$w" -t "=$sess:" -P -F '#{pane_id}' \
-        "$POD_BIN/pod-summary --pane $sess")" || return 1
+        "$summary_q --pane $sess_q")" || return 1
   "$T" set -p -t "$pane" @pod_summary 1
   # per-pane style overrides the pod's per-worker window body color -> black card.
   # NB: `select-pane -P` would also FOCUS the pane (it's still a select); the
@@ -70,7 +72,7 @@ do_on() {
   "$T" set -p -t "$pane" window-active-style 'fg=colour231,bg=black'
   style_host "$("$T" display-message -p -t "$pane" '#{window_id}' 2>/dev/null)"
   "$T" set-hook -t "$sess" session-window-changed \
-       "run-shell -b '$POD_BIN/pod-summary-pane follow $sess'"
+       "run-shell -b '$(printf '%q' "$POD_BIN/pod-summary-pane") follow $sess_q'"
 }
 
 do_off() {

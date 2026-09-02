@@ -83,9 +83,24 @@ check "finished workflow clears its registry" test ! -e "$REG"
 stamp idle
 check "idle stamp lands once the workflow is done" test "$(dot)" = idle
 
+# Every terminal journal event balances a started agent. A failed/cancelled child
+# is finished work, not an immortal workflow that pins the seat orange for two hours.
+mkdir -p "$TMP/run2"
+printf '%s' "{\"tool_name\":\"Workflow\",\"tool_response\":{\"status\":\"async_launched\",\"runId\":\"wf_test2\",\"transcriptDir\":\"$TMP/run2\"}}" | wfs record
+printf '%s\n' '{"type":"started","agentId":"a2"}' '{"type":"failed","agentId":"a2"}' > "$TMP/run2/journal.jsonl"
+touch -t 202601010101 "$TMP/run2/journal.jsonl"
+if wfs check; then
+  bad "failed terminal event leaves workflow in flight"
+else
+  ok "failed terminal event completes the workflow"
+fi
+check "failed workflow clears its registry" test ! -e "$REG"
+
 # --- reset: a fresh process owns nothing its predecessor launched ---------------
 mkdir -p "$(dirname "$REG")"
 printf 'wf_stale\t%s\t%s\n' "$TMP/run1/journal.jsonl" "$(date +%s)" > "$REG"
+printf '%s' '{"source":"compact"}' | wfs reset
+check "compact reset preserves the live process registry" test -e "$REG"
 wfs reset
 check "reset drops the inherited registry" test ! -e "$REG"
 

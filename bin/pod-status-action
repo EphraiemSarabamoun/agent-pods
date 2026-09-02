@@ -61,8 +61,9 @@ case "$range" in
     # copy-mode overlay (feedback belongs in the strip/feed, never stdout).
     win="${range#kill_}"
     name="$("$T" display-message -p -t "$win" '#{window_name}' 2>/dev/null || echo "$win")"
+    kill_q="$(printf '%q' "$POD_BIN/pod-kill-worker")"
     "$T" confirm-before -p "terminate agent $name ($win)? (y/n) " \
-         "run-shell -b '$POD_BIN/pod-kill-worker $range >/dev/null 2>&1'"
+         "run-shell -b '$kill_q $range >/dev/null 2>&1'"
     exit 0 ;;
   *)
     : ;;   # no-op; normal tab-select is handled in the binding

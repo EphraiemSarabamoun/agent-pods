@@ -29,7 +29,7 @@ calls them. You can delete `modules/` entirely and the deck still runs.
 ## State layout
 
 Everything ephemeral lives under one private per-user tmp tree, `$POD_TMP` (default
-`${TMPDIR:-/tmp}/agent-pods-$(id -u)`), split
+`/tmp/agent-pods-$(id -u)`), split
 into three subdirs:
 
 ```

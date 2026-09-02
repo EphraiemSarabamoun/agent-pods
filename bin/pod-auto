@@ -175,6 +175,10 @@ paused_task_for_pod() {
 # signal costs a skipped reset, never a manager clearing itself mid-loop.
 human_flip() {
   [ -z "${CLAUDECODE:-}" ] || return 1
+  # Strip/key actions always carry either the clicking client or a live pane. A
+  # launchd/cron/script call has neither; even if some unrelated client is attached,
+  # it is programmatic and must never open a confirm dialog on that human's screen.
+  { [ -n "${TMUX_PANE:-}" ] || [ -n "$CLIENT" ]; } || return 1
   local ca=""
   [ -n "${TMUX_PANE:-}" ] && ca="$("$T" show-options -wqv -t "$TMUX_PANE" @agent_id 2>/dev/null)"
   case "$ca" in ""|generic-shell|shell) return 0 ;; *) return 1 ;; esac
@@ -350,9 +354,12 @@ if [ "$new" = "on" ]; then
       # n exits confirm-before nonzero, which we deliberately do not propagate. The
       # re-entry redirects its output: any stdout from a run-shell pops a full-pane
       # copy-mode overlay a human must dismiss (docs/gotchas.md).
+      auto_q="$(printf '%q' "$POD_BIN/pod-auto")"
+      pod_q="$(printf '%q' "$POD")"
+      client_q="$(printf '%q' "$CONFIRM_CLIENT")"
       "$T" confirm-before -t "$CONFIRM_CLIENT" \
         -p "⚡ FULL AUTO: clears the manager + every agent context in ${POD}. y/n " \
-        "run-shell -b '${POD_BIN}/pod-auto on --yes --reset --pod ${POD} --client ${CONFIRM_CLIENT} >/dev/null 2>&1'"
+        "run-shell -b '$auto_q on --yes --reset --pod $pod_q --client $client_q >/dev/null 2>&1'"
       exit 0
     elif [ -t 0 ]; then
       printf '⚡ FULL AUTO on %s clears the MANAGER context and EVERY agent context in the pod.\nContinue? [y/N] ' "$POD"

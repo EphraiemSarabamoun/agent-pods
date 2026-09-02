@@ -201,8 +201,11 @@ def pod_hook_script(cmd):
         return path
     return None
 
-# Entries pointing at THIS checkout are handled by the idempotent merge below; anything
-# else is an orphan from a checkout that has moved, and gets pruned.
+# Entries pointing at THIS checkout are handled by the idempotent merge below. A hook
+# from another checkout is not automatically stale: two independently configured
+# Claude homes may deliberately share one settings file. Prune only a path that no
+# longer exists, which still heals a moved/deleted checkout without dismantling a live
+# second installation.
 CURRENT_DIRS = {pod_bin, os.path.dirname(awareness)}
 
 pruned = []
@@ -219,7 +222,8 @@ for event in list(hooks.keys()):
         for h in group["hooks"]:
             script = pod_hook_script(h.get("command")) \
                 if isinstance(h, dict) and h.get("type") == "command" else None
-            if script is not None and os.path.dirname(script) not in CURRENT_DIRS:
+            if script is not None and os.path.dirname(script) not in CURRENT_DIRS \
+                    and not os.path.exists(script):
                 pruned.append("%s: %s" % (event, h.get("command")))
                 continue
             kept.append(h)

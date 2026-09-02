@@ -91,24 +91,43 @@ esac
 
 # --- 5. hook wiring (claude-code settings.json) ----------------------------------------
 say "hook wiring"
-if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
-  SETTINGS="$CLAUDE_CONFIG_DIR/settings.json"
-  echo "      CLAUDE_CONFIG_DIR is set -> $SETTINGS"
+case "$AGENT" in
+  ""|claude|claude-code) HOOK_KIND=claude ;;
+  codex)                  HOOK_KIND=codex ;;
+  *)                      HOOK_KIND=poller ;;
+esac
+if [ "$HOOK_KIND" = poller ]; then
+  pass "agent '${AGENT:-unknown}' is poll-owned; no lifecycle-hook installation is required"
 else
-  SETTINGS="$HOME/.claude/settings.json"
-fi
-if [ ! -f "$SETTINGS" ]; then
-  fail "$SETTINGS does not exist — hooks were never installed here. If your agent uses a different CLAUDE_CONFIG_DIR at runtime, re-run hooks/claude-code/install.sh with that env var set (or --settings <path>)."
-else
+  if [ "$HOOK_KIND" = codex ]; then
+    SETTINGS="${CODEX_HOME:-$HOME/.codex}/hooks.json"
+    HOOK_PROBES="pod-codex-state pod-awareness.sh pod-mail-check"
+    HOOK_EXPECT=3
+    HOOK_INSTALL="hooks/codex/install.sh"
+  elif [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    SETTINGS="$CLAUDE_CONFIG_DIR/settings.json"
+    HOOK_PROBES="pod-awareness.sh pod-state pod-brief pod-mail-check"
+    HOOK_EXPECT=4
+    HOOK_INSTALL="hooks/claude-code/install.sh"
+    echo "      CLAUDE_CONFIG_DIR is set -> $SETTINGS"
+  else
+    SETTINGS="$HOME/.claude/settings.json"
+    HOOK_PROBES="pod-awareness.sh pod-state pod-brief pod-mail-check"
+    HOOK_EXPECT=4
+    HOOK_INSTALL="hooks/claude-code/install.sh"
+  fi
+  if [ ! -f "$SETTINGS" ]; then
+    fail "$SETTINGS does not exist — hooks were never installed for $HOOK_KIND. Run $HOOK_INSTALL for this agent home."
+  else
   wired=0
-  for probe in pod-awareness.sh pod-state pod-brief pod-mail-check; do
+  for probe in $HOOK_PROBES; do
     if grep -q "$probe" "$SETTINGS" 2>/dev/null; then
       wired=$((wired + 1))
     else
-      fail "settings.json has no '$probe' hook — run hooks/claude-code/install.sh --settings $SETTINGS"
+      fail "$SETTINGS has no '$probe' hook — run $HOOK_INSTALL for this agent home"
     fi
   done
-  [ "$wired" = 4 ] && pass "all 4 pod hook families present in $SETTINGS"
+  [ "$wired" = "$HOOK_EXPECT" ] && pass "all $HOOK_EXPECT pod hook families present in $SETTINGS"
   # every absolute pod path referenced must still exist (repo moved = dead hooks).
   # This has to PARSE settings.json, not scrape it. The installer writes each command
   # as `bash "<path>" <args>`, so inside the JSON string those quotes are escaped:
@@ -184,8 +203,9 @@ EOF
     warn "dead-path audit skipped — it needs python3 to read $SETTINGS as JSON (python3 is a hard dep of hooks/claude-code/install.sh, so its absence here is itself worth fixing)"
   fi
   [ "$scan_ok" = 1 ] && [ "$dead" = 0 ] && pass "every pod path referenced by settings.json exists on disk"
-  if [ "$wired" = 4 ] && [ "$scan_ok" = 1 ] && [ "$dead" = 0 ]; then
+  if [ "$wired" = "$HOOK_EXPECT" ] && [ "$scan_ok" = 1 ] && [ "$dead" = 0 ]; then
     echo "      note: hooks load at agent START — a session launched before install stays blind until restarted."
+  fi
   fi
 fi
 

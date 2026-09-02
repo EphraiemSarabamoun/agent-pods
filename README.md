@@ -217,7 +217,7 @@ POD_CITIES="Rome Kyoto Cairo Oslo"     # your own pool (single words)
 ### State location
 
 All ephemeral state lives under one private per-user tmp tree
-(`${TMPDIR:-/tmp}/agent-pods-$(id -u)` by default). Override it when needed:
+(`/tmp/agent-pods-$(id -u)` by default). Override it when needed:
 
 ```sh
 POD_TMP="$HOME/.cache/agent-pods/runtime"

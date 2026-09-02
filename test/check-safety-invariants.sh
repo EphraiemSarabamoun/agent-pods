@@ -8,6 +8,12 @@ SOCK="pod-safety-$$"
 TMUX_BIN="$(command -v tmux)"
 trap '"$TMUX_BIN" -L "$SOCK" kill-server >/dev/null 2>&1 || true; rm -rf "$TMP"' EXIT
 
+# The fixture uses a private tmux server. Inheriting the developer's live pane id
+# lets a coincidentally equal pane id on the scratch server override POD_SESSION,
+# which can turn the cross-pod refusal check into a real kill. Individual cases
+# that exercise inside-pane behavior set these variables explicitly below.
+unset TMUX TMUX_PANE
+
 pass=0; fail=0
 ok() { echo "  ok: $*"; pass=$((pass + 1)); }
 bad() { echo "  FAIL: $*" >&2; fail=$((fail + 1)); }

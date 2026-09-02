@@ -183,8 +183,10 @@ def load_adapters():
 # cache that only remembers successes has nothing to short-circuit on.
 
 def _state_dir():
-    runtime = os.environ.get("POD_TMP") or os.path.join(
-        os.environ.get("TMPDIR", "/tmp"), "agent-pods-%d" % os.getuid())
+    # Keep discovery on the same cross-context root as _pod-paths.sh. TMPDIR differs
+    # between GUI shells, ssh, launchd and command sandboxes on macOS, which otherwise
+    # forks one live deck into multiple caches.
+    runtime = os.environ.get("POD_TMP") or "/tmp/agent-pods-%d" % os.getuid()
     return os.environ.get("POD_STATE") or os.path.join(runtime, "state")
 
 

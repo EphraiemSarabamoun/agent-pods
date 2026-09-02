@@ -51,7 +51,7 @@
 
 # --- state location ------------------------------------------------------------
 # All ephemeral state lives under one private per-user tmp tree. Override the base if
-# the system temp directory is unusual. Default: ${TMPDIR:-/tmp}/agent-pods-$(id -u).
+# the system temp directory is unusual. Default: /tmp/agent-pods-$(id -u).
 # POD_TMP=
 
 # Model choices are not configured here. Each adapter queries the locally installed

@@ -196,7 +196,9 @@ unset __pod_owner __pod_uid
 POD_TMUX_SOCKET="${POD_TMUX_SOCKET-agent-pods}"
 POD_TMUX_DEDICATED=0
 if [ -n "$POD_TMUX_SOCKET" ]; then
-  __pod_sock="$(LC_ALL=C printf '%s' "$POD_TMUX_SOCKET" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
+  # Pure bash: this path bootstrap is what repairs a minimal PATH, so it cannot
+  # itself depend on a bare external `tr` before the tmux shim exists.
+  __pod_sock="${POD_TMUX_SOCKET//[^A-Za-z0-9._-]/_}"
   __pod_shim="$POD_TMP/tmux-$__pod_sock"
   # A seat that is ALREADY inside a pod pane talks to the server it actually lives on,
   # never to a socket named by config: plain tmux honors $TMUX, so leaving POD_TMUX

@@ -59,14 +59,15 @@ fi
 # resolve it through the rename trail instead of depositing mail in a directory the pod
 # has moved away from (and that the next launch sweeps).
 [ -n "$sess" ] || sess="$(pod_resolve_stale_pod "${POD_SESSION:-$POD_SESSION_PREFIX}")"
+# --- pod window table: ONE list-windows. Exact-match (=) so a sibling pod whose name
+# is a prefix can't leak in. ---
+TABLE="$("$T" list-windows -t "=$sess" -F '#{window_id}|#{window_name}' 2>/dev/null)"
+[ -n "$TABLE" ] || { echo "pod-tell: pod '$sess' has no windows (not a live pod?)"; exit 1; }
+
 [ -n "$me" ] || me="?"                 # a name that was pure control characters
 MAILDIR="$(pod_dir_for "$sess")"; CHAN="$(pod_chan_for "$sess")"
 mkdir -p "$MAILDIR" || { echo "pod-tell: cannot create mail dir $MAILDIR"; exit 1; }
 ts="$(date +%H:%M)"
-
-# --- pod window table: ONE list-windows. Exact-match (=) so a sibling pod whose name
-# is a prefix can't leak in. ---
-TABLE="$("$T" list-windows -t "=$sess" -F '#{window_id}|#{window_name}' 2>/dev/null)"
 
 # --- resolve targets from the snapshot ---
 disp="$to"; targets=""
@@ -91,7 +92,7 @@ esac
 
 # --- deposit + nudge delivery, one pass over the snapshot ---
 tset=" $(printf '%s ' $targets)"
-n=0; badge=()
+n=0; badge=(); badge_targets=()
 while IFS='|' read -r wid wn; do
   [ -n "$wid" ] || continue
   case "$tset" in *" $wid "*) : ;; *) continue ;; esac   # not addressed
@@ -109,14 +110,24 @@ while IFS='|' read -r wid wn; do
     cnt="$(grep -c '^\[' "$MAILDIR/${wid}.mbox" 2>/dev/null)"
     case "$cnt" in (*[!0-9]*|""|0) cnt=1 ;; esac
     badge+=(set-option -w -t "$wid" @unread "$cnt" ";")
+    badge_targets+=("$wid|$cnt")
   fi
   # nudge: surface it now (idle recipients get it immediately; pod-deliver no-ops for
   # native-delivery agents and defers busy ones). The 3s poller is the backstop.
   ( "$POD_BIN/pod-deliver" "$wid" >/dev/null 2>&1 & )
   n=$((n + 1))
 done < <(printf '%s\n' "$TABLE")
-# one tmux invocation: N chained @unread set-options + an immediate strip repaint
-[ "${#badge[@]}" -gt 0 ] && "$T" "${badge[@]}" refresh-client -S 2>/dev/null || true
+# One chained call normally. If a recipient dies after the snapshot, tmux aborts
+# the remainder, so retry each stamp independently without duplicating mail writes.
+if [ "${#badge[@]}" -gt 0 ]; then
+  if ! "$T" "${badge[@]}" refresh-client -S 2>/dev/null; then
+    for item in "${badge_targets[@]}"; do
+      bwid="${item%%|*}"; bcnt="${item#*|}"
+      "$T" set-option -w -t "$bwid" @unread "$bcnt" 2>/dev/null || true
+    done
+    "$T" refresh-client -S 2>/dev/null || true
+  fi
+fi
 
 echo "[$ts] $me → $disp: $msg" >> "$CHAN"     # always log for visibility
 echo "delivered to $disp ($n recipient(s))"

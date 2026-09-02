@@ -90,8 +90,8 @@ pod_resolve_stale_pod() {
 # current pod (tmux session) from the calling pane, else inherited env, else the prefix.
 pod_name() {
   local s=""
-  if [ -n "${TMUX:-}" ]; then
-    s="$("$POD_TMUX" display-message -p -t "${TMUX_PANE:-}" '#{session_name}' 2>/dev/null)"
+  if [ -n "${TMUX_PANE:-}" ]; then
+    s="$("$POD_TMUX" display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null)"
   fi
   # No live answer: POD_SESSION is only a snapshot, so validate it against the rename
   # trail before trusting it.

@@ -50,6 +50,20 @@ print("idle" if nt == "idle_prompt" or "waiting for your input" in msg else "wai
   [ "$decided" = "idle" ] && state="idle"
 fi
 
+# SessionStart source=compact fires mid-turn. The process keeps working, so never
+# publish an idle state from that event.
+if [ "$state" = "idle" ] && [ ! -t 0 ]; then
+  payload="$(cat 2>/dev/null)"
+  case "$payload" in *SessionStart*|*'"source"'*)
+    start_source="$(printf '%s' "$payload" | python3 -c '
+import json, sys
+try: print(json.load(sys.stdin).get("source") or "")
+except Exception: print("")
+' 2>/dev/null)"
+    [ "$start_source" = "compact" ] && exit 0 ;;
+  esac
+fi
+
 # window + session in ONE round-trip (session scopes the workflow registry below)
 meta="$("$T" display-message -p -t "$pane" '#{window_id}|#{session_name}' 2>/dev/null)"
 win="${meta%%|*}"; sess="${meta#*|}"
@@ -57,10 +71,10 @@ win="${meta%%|*}"; sess="${meta#*|}"
 # Stamp @state_since (epoch) ONLY on a real transition, so the summary pane's activity
 # timer ("busy 12m") measures the current state, not the last hook fire.
 prev="$("$T" show-options -w -t "$win" -qv @cc_state 2>/dev/null)"
-# posttool exists only to clear a stuck "wait" (see header): if we weren't
-# waiting, do nothing — a one-read no-op on every ordinary tool call.
+# posttool clears a stuck wait and repairs a false idle: a tool result proves the
+# turn is active. If already busy, remain a one-read no-op.
 if [ "$source" = "posttool" ]; then
-  [ "$prev" = "wait" ] || exit 0
+  case "$prev" in wait|idle) : ;; *) exit 0 ;; esac
 fi
 # A seat that launched a background workflow (Claude Code's Workflow tool) is NOT free
 # the moment its turn ends: the workflow grinds on for minutes after. Every path that

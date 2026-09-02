@@ -44,17 +44,31 @@ DIR="$(pod_dir_for "$POD")"
 BRIEF="$DIR/.brief"
 JOURNAL="$DIR/journal.md"
 
-now_hm() { date +%H:%M; }
+NOW_EPOCH=""; NOW_HM=""
+now_hm() { [ -n "$NOW_HM" ] && printf '%s' "$NOW_HM" || date +%H:%M; }
 age_of() {  # epoch -> compact age (45s / 14m / 2h3m); empty for non-numeric/blank
   case "${1:-}" in ''|*[!0-9]*) return ;; esac
-  d=$(( $(date +%s) - $1 )); [ "$d" -lt 0 ] && d=0
+  now="${NOW_EPOCH:-$(date +%s)}"
+  d=$(( now - $1 )); [ "$d" -lt 0 ] && d=0
   if   [ "$d" -lt 60 ];   then printf '%ds' "$d"
   elif [ "$d" -lt 3600 ]; then printf '%dm' $(( d / 60 ))
   else printf '%dh%dm' $(( d / 3600 )) $(( (d % 3600) / 60 )); fi
 }
 b64()     { printf '%s' "${1:-}" | base64 2>/dev/null | tr -d '\n'; }
+b64d()    { printf '%s' "${1:-}" | base64 -D 2>/dev/null || printf '%s' "${1:-}" | base64 -d 2>/dev/null; }
 get_opt() { "$T" show-options -wqv -t "$1" "$2" 2>/dev/null; }
 lookup()  { awk -F'\t' -v w="$1" '$1==w{print $2; exit}' "$2" 2>/dev/null; }  # $1=wid $2=file
+
+sig_raw() {
+  local s="$1|$2|$3|$4"
+  s="${s//$'\n'/ }"; s="${s//$'\t'/ }"
+  printf '%s' "$s"
+}
+sig_matches() {
+  [ "$1" = "v2:$2" ] && return 0
+  case "$1" in v2:*) return 1 ;; esac
+  [ "$(b64d "$1")" = "$2" ]
+}
 
 # headline for a window: prefer the one-line summary (@summary, stamped by
 # pod-summarize); else, while the agent is actively working, an "in flight"
@@ -73,13 +87,13 @@ emit_ctx() {  # $1=event  $2=text  -> additionalContext JSON (the proven deliver
   pod_emit_ctx "$1" "$2"   # _pod-paths.sh: jq -> python3 -> raw stdout, never jq-gated
 }
 
-# Every window is an agent. Structured fields carry no '|'; @card rides LAST so the
-# read's final variable absorbs the remainder. The free-form @work/@last/@summary are
-# fetched per-window via get_opt to dodge delimiter hell.
+# Every field rides one tmux round-trip. Unit separator preserves empty fields in
+# bash 3.2 and avoids collisions with ordinary prose; free-text fields ride last.
+SEP=$'\x1f'
 list_wins() {
   [ "$in_tmux" = 1 ] || return 0
-  "$T" list-windows -t "$POD" \
-    -F '#{window_id}|#{window_name}|#{@cc_state}|#{@work_at}|#{@last_at}|#{@card}' \
+  "$T" list-windows -t "=$POD" \
+    -F "#{window_id}${SEP}#{window_name}${SEP}#{@cc_state}${SEP}#{@work_at}${SEP}#{@last_at}${SEP}#{@card}${SEP}#{@summary}${SEP}#{@work}${SEP}#{@last}" \
     2>/dev/null
 }
 
@@ -129,11 +143,12 @@ $tailtxt"
     EVENT="${1:-UserPromptSubmit}"
     wins="$(list_wins)"
     [ -n "$wins" ] || exit 0
+    NOW_EPOCH="$(date +%s)"; NOW_HM="$(date +%H:%M)"
     mkdir -p "$BRIEF" 2>/dev/null
     cursor="$BRIEF/cursor.$(printf '%s' "$me_id" | tr -c 'A-Za-z0-9' '_')"
     journaled="$BRIEF/journaled"
     touch "$cursor" "$journaled" 2>/dev/null
-    cur_wids="$(printf '%s\n' "$wins" | cut -d'|' -f1)"
+    cur_wids="$(printf '%s\n' "$wins" | cut -d"$SEP" -f1)"
 
     # ---------- auto-journal: shared, mkdir-locked, best-effort ----------
     # Whichever observer notices a transition first writes it; the shared `journaled`
@@ -149,7 +164,7 @@ $tailtxt"
       # arithmetic and kills the shell here under set -u, taking the journal, the
       # podmate delta AND every future refresh (the lock is then never stolen) with it.
       lock_mtime="$(pod_file_mtime "$lock")"
-      lock_age=$(( $(date +%s) - lock_mtime ))
+      lock_age=$(( NOW_EPOCH - lock_mtime ))
       if [ "$lock_age" -gt 30 ] 2>/dev/null; then
         stale="$lock.stale.$$"
         if mv "$lock" "$stale" 2>/dev/null; then rmdir "$stale" 2>/dev/null || true; fi
@@ -158,17 +173,17 @@ $tailtxt"
     done
     if [ "$got" = 1 ]; then
       trap 'rmdir "$lock" 2>/dev/null || true' EXIT
-      trap 'exit 0' INT TERM
+      trap 'exit 0' INT TERM HUP
       tmpj="$BRIEF/.journaled.tmp.$$"; : > "$tmpj"
-      printf '%s\n' "$wins" | while IFS='|' read -r wid wname state work_at last_at card; do
+      printf '%s\n' "$wins" | while IFS="$SEP" read -r wid wname state work_at last_at card summ work last; do
         [ -n "$wid" ] || continue
-        work="$(get_opt "$wid" @work)"; last="$(get_opt "$wid" @last)"; summ="$(get_opt "$wid" @summary)"
-        sig="$(b64 "$state|$summ|$work|$last")"
+        case "$wid" in @*[0-9]) : ;; *) continue ;; esac
+        raw="$(sig_raw "$state" "$summ" "$work" "$last")"; sig="v2:$raw"
         printf '%s\t%s\n' "$wid" "$sig" >> "$tmpj"
         prev="$(lookup "$wid" "$journaled")"
         if [ -z "$prev" ]; then
           printf '[%s] + %s joined (%s)\n' "$(now_hm)" "$wname" "${card:-agent}" >> "$JOURNAL"
-        elif [ "$prev" != "$sig" ]; then
+        elif ! sig_matches "$prev" "$raw"; then
           printf '[%s] %s · %s · %s\n' "$(now_hm)" "$wname" "$state" \
             "$(headline "$state" "$summ" "$work" "$last")" >> "$JOURNAL"
         fi
@@ -186,20 +201,20 @@ $tailtxt"
         tail -n 400 "$JOURNAL" > "$JOURNAL.tmp" 2>/dev/null && mv "$JOURNAL.tmp" "$JOURNAL"
       fi
       rmdir "$lock" 2>/dev/null
-      trap - EXIT INT TERM
+      trap - EXIT INT TERM HUP
     fi
 
     # ---------- per-reader injection: OTHER agents only, delta vs my cursor ----------
     newcursor="$BRIEF/.cursor.tmp.$$"; : > "$newcursor"
     inj="$BRIEF/.inject.tmp.$$"; : > "$inj"
-    printf '%s\n' "$wins" | while IFS='|' read -r wid wname state work_at last_at card; do
+    printf '%s\n' "$wins" | while IFS="$SEP" read -r wid wname state work_at last_at card summ work last; do
       [ -n "$wid" ] || continue
-      work="$(get_opt "$wid" @work)"; last="$(get_opt "$wid" @last)"; summ="$(get_opt "$wid" @summary)"
-      sig="$(b64 "$state|$summ|$work|$last")"
+      case "$wid" in @*[0-9]) : ;; *) continue ;; esac
+      raw="$(sig_raw "$state" "$summ" "$work" "$last")"; sig="v2:$raw"
       printf '%s\t%s\n' "$wid" "$sig" >> "$newcursor"
       [ "$wid" = "$me_id" ] && continue
       prev="$(lookup "$wid" "$cursor")"
-      [ "$prev" = "$sig" ] && continue
+      sig_matches "$prev" "$raw" && continue
       ag="$(age_of "${work_at:-$last_at}")"; [ -n "$ag" ] && ag=" $ag"
       if [ -z "$prev" ]; then
         printf '  • %s spawned — %s (%s)\n' "$wname" "${card:-agent}" "${state:-?}" >> "$inj"

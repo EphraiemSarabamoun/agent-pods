@@ -99,6 +99,7 @@ jobs:
             check-install-modes \
             check-model-policy \
             check-context-emit \
+            check-hook-ownership \
             check-primer \
             test-adapter-discovery-timeout \
             check-effort-collapse \

@@ -45,6 +45,12 @@ rm -f "$snap"
 # delivered -> the tab badge clears NOW (this prompt = the read). Unset, never
 # "0" (#{?} treats the string "0" as true).
 "$T" set-option -uw -t "$me_id" @unread 2>/dev/null || true
+# A concurrent sender can recreate the mailbox between the mv and the unset.
+# Re-stamp from that fresh file before repainting; fyi-only mail stays unbadged.
+if [ -s "$mbox" ]; then
+  fresh="$(grep -c '^\[' "$mbox" 2>/dev/null)"; fresh="${fresh:-0}"
+  [ "$fresh" -gt 0 ] 2>/dev/null && "$T" set-option -w -t "$me_id" @unread "$fresh" 2>/dev/null || true
+fi
 "$T" refresh-client -S 2>/dev/null || true
 msg="You have ${n} pod-mail message(s), delivered here and cleared (archived to your .read log):
 ${body}"

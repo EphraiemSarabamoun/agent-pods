@@ -20,6 +20,7 @@
 # _mgr-runtime's manager fallback rely on). Refused as src OR tgt.
 set -uo pipefail
 POD_BIN="$(cd "$(dirname "$0")" && pwd)"; . "$POD_BIN/_pod-paths.sh"
+. "$POD_BIN/_pod-common.sh"
 T="$POD_TMUX"
 
 mode=drag tgt="" sess=""
@@ -65,7 +66,7 @@ mgr="$("$T" display-message -p -t "=${sess}:" '#{@pod_manager_win}' 2>/dev/null)
 mkdir -p "$POD_STATE/locks" 2>/dev/null || exit 0
 lock="$POD_STATE/locks/pod-drag-reorder.${sess//[!A-Za-z0-9._-]/_}.lock"
 if ! mkdir "$lock" 2>/dev/null; then
-  mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
+  mtime="$(pod_file_mtime "$lock")"
   age=$(( $(date +%s) - mtime ))
   [ "$age" -gt 3 ] 2>/dev/null || exit 0
   stale="$lock.stale.$$"

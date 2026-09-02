@@ -117,23 +117,6 @@ if [ -z "$win" ]; then
   [ -n "$last" ] && tgt="${S}:${last}" || tgt="$S"
   win="$("$T" new-window -a -t "$tgt" -n "$wname" -P -F '#{window_id}' "cd \"\$HOME\" && $launch")"
   [ -n "$win" ] && SPAWNED=1
-  # pod-name draws from a SNAPSHOT of the tabs taken before this window existed, so a
-  # burst of concurrent spawns can hand two live seats the same name. tmux is the
-  # arbiter once the window exists: suffix ours if the name is now taken, because
-  # name-based targeting (pod-kill-worker/pod-tell "Ivy") resolves the FIRST match and
-  # would otherwise silently act on the wrong seat.
-  if [ -n "$win" ]; then
-    dupes="$("$T" list-windows -t "$S" -F '#{window_id}|#{window_name}' 2>/dev/null \
-             | awk -F'|' -v w="$win" -v n="$wname" '$1!=w && $2==n{c++} END{print c+0}')"
-    if [ "${dupes:-0}" != "0" ]; then
-      k=2
-      while [ "$k" -lt 50 ] && "$T" list-windows -t "$S" -F '#{window_name}' 2>/dev/null \
-              | grep -qxF "${wname}-${k}"; do
-        k=$((k + 1))
-      done
-      "$T" rename-window -t "$win" "${wname}-${k}" 2>/dev/null || true
-    fi
-  fi
 fi
 
 # EMPTY-TARGET FOOTGUN guard: with no window id, every `setw -t "$win"` below would
@@ -142,6 +125,19 @@ fi
 if [ -z "$win" ]; then
   echo "$(date +%H:%M:%S) ERROR new-window failed (pod=$S tgt=${tgt:-?})" >> "$POD_STATE/pod-add-worker.log"
   exit 1
+fi
+
+# pod-name reads a pre-creation snapshot. Concurrent spawns can therefore draw the
+# same name. Keep the oldest holder and suffix each later one with its unique window
+# id; two racers can never both re-pick the same replacement.
+if [ "$SPAWNED" -eq 1 ]; then
+  older="$("$T" list-windows -t "=$S" -F '#{window_id}|#{window_name}' 2>/dev/null \
+    | awk -F'|' -v n="$wname" -v me="$win" '
+        $2==n && $1!=me && substr($1,2)+0 < substr(me,2)+0 {print $1; exit}')"
+  if [ -n "$older" ]; then
+    wname="${wname}-${win#@}"
+    "$T" rename-window -t "$win" "$wname" 2>/dev/null || true
+  fi
 fi
 
 # Color from the window's own numeric id as the STARTING index, then probe for a free

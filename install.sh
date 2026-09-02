@@ -91,7 +91,7 @@ if [ "$tmux_major" -lt 3 ]; then
 fi
 ok "tmux $tmux_ver_raw ($TMUX_BIN)"
 if [ "$tmux_major" -eq 3 ] && [ "$tmux_minor" -lt 3 ]; then
-  warn "tmux $tmux_ver_raw predates 3.3, so the CLICKABLE status line is off: + / ⚙ / ☰ / ✕ and the ⚡ AUTO pill won't respond to the mouse (they ride #{mouse_status_range}, new in 3.3). Every one of them has a keyboard chord that pod-launch binds anyway (C-a n, C-a s, C-a a, ...), so the deck is fully usable — this is a UX downgrade, not a blocker. Note that only 3.3+ is exercised by our test suite."
+  warn "tmux $tmux_ver_raw predates 3.3, so the CLICKABLE status line is off: + / ⚙ / ☰ / ✕ and the ⚡ AUTO pill won't respond to the mouse (they ride #{mouse_status_range}, new in 3.3). Every one of them has a keyboard chord that pod-launch binds anyway (C-a +, C-a s, C-a a, ...), so the deck is fully usable — this is a UX downgrade, not a blocker. Note that only 3.3+ is exercised by our test suite."
   if [ "$tmux_minor" -lt 2 ]; then
     warn "tmux $tmux_ver_raw is also below 3.2: display-popup is missing, so the ⭐ standings board and the FULL AUTO flip animation will silently do nothing."
   fi
@@ -270,6 +270,14 @@ clear_dest() {
     case "$cd_res" in
       "$REPO"/*) return 0 ;;      # our own link from a previous run: refresh in place
     esac
+    # A checkout relocated twice leaves our prior link dangling while the preserved
+    # original already occupies .pre-agent-pods. Recognize the installer's own link
+    # shape so it can be refreshed instead of treating the backup as a fatal collision.
+    if [ ! -e "$cd_dest" ]; then
+      case "$cd_res" in
+        */bin/"$cd_base"|*/modules/queue/bin/"$cd_base") return 0 ;;
+      esac
+    fi
   elif [ ! -e "$cd_dest" ]; then
     return 0                      # nothing in the way (also covers a dangling non-link)
   elif is_our_shim "$cd_dest"; then

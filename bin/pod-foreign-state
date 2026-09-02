@@ -74,10 +74,11 @@ while :; do
     while IFS='|' read -r wid wname _cmd; do
       [ -n "$wid" ] || continue
 
-      # identify (cached; cheap re-detect when the pane command is unchanged).
-      "$POD_BIN/pod-detect" "$wid" >/dev/null 2>&1 || true
       ssrc="$("$T" show-options -w -t "$wid" -qv @state_source 2>/dev/null)"
       [ "$ssrc" = "hooks" ] && continue       # hook agent owns its state + delivery
+      # Identify only poll-owned/unknown seats. Running the Python detector for every
+      # hook-owned Claude/Codex seat on every 3s tick was pure CPU churn.
+      "$POD_BIN/pod-detect" "$wid" >/dev/null 2>&1 || true
 
       # idle/busy from the transcript hash (drop the bottom $TRIM input/footer lines).
       cap="$("$T" capture-pane -p -t "$wid" 2>/dev/null)"

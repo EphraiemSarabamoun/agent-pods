@@ -36,9 +36,14 @@ mk_sandbox() {  # $1=dir  $2...=tools to link
     ln -s "$src" "$d/$t" 2>/dev/null
   done
 }
-BASE_TOOLS="bash sh python3 cat printf env dirname readlink uname mktemp"
+BASE_TOOLS="bash sh python3 cat printf env dirname readlink uname mktemp mv rm"
 mk_sandbox "$TMP/nojq" $BASE_TOOLS
 mk_sandbox "$TMP/withjq" $BASE_TOOLS jq
+
+# A tiny tmux stand-in lets _pod-paths verify and retain its dedicated-socket shim.
+# The bootstrap must sanitize the socket name before a general PATH is available.
+printf '#!/bin/sh\ncase "$*" in *" -V"|-V) echo "tmux 3.3"; exit 0;; esac\nexit 0\n' > "$TMP/nojq/tmux"
+chmod +x "$TMP/nojq/tmux"
 
 validate_emit() {  # $1=label $2=json-ish output
   printf '%s' "$2" | python3 -c '
@@ -57,6 +62,15 @@ assert h["additionalContext"] == expect, repr(h["additionalContext"])
 out="$(env -i PATH="$TMP/nojq" HOME="$TMP" POD_CONFIG=/dev/null POD_TMP="$TMP/podtmp" \
   PAYLOAD="$PAYLOAD" bash -c ". '$REPO/bin/_pod-paths.sh'; pod_emit_ctx SessionStart \"\$PAYLOAD\"")"
 validate_emit "pod_emit_ctx (python3 fallback)" "$out"
+
+err="$TMP/minimal-path.err"
+shim="$(env -i PATH="$TMP/nojq" HOME="$TMP" POD_CONFIG=/dev/null POD_TMP="$TMP/socket-root" \
+  POD_TMUX_SOCKET='socket with spaces' bash -c ". '$REPO/bin/_pod-paths.sh'; printf '%s' \"\$POD_TMUX\"" 2>"$err")"
+if [ -x "$shim" ] && [ "$(basename "$shim")" = "tmux-socket_with_spaces" ] && [ ! -s "$err" ]; then
+  ok "minimal PATH creates the sanitized tmux shim without tr"
+else
+  bad "minimal PATH shim bootstrap failed: shim=$(printf '%q' "$shim") err=$(tr '\n' ' ' < "$err" 2>/dev/null)"
+fi
 
 # --- 2. pod_emit_ctx via jq (skip silently if the host has no jq) -------------------
 if [ -x "$TMP/withjq/jq" ]; then

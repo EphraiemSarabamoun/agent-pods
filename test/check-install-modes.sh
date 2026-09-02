@@ -13,6 +13,8 @@ set -u
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 fails=0
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
 note() { echo "check-install-modes: $*" >&2; }
 ok()   { echo "  ok: $*"; }
 bad()  { echo "  FAIL: $*"; fails=$((fails + 1)); }
@@ -57,6 +59,24 @@ decide() {  # echoes "chmod" or "skip" for a basename, per install.sh's case
 [ "$(decide _pod-paths.sh)" = skip ]  && ok "_pod-paths.sh -> skip"  || bad "_pod-paths.sh not skipped"
 [ "$(decide _mgr-runtime.sh)" = skip ] && ok "_mgr-runtime.sh -> skip" || bad "_mgr-runtime.sh not skipped"
 [ "$(decide pod-launch)" = chmod ]    && ok "pod-launch -> chmod"    || bad "pod-launch wrongly skipped"
+
+# --- 4. a twice-relocated installer link refreshes without deleting its backup ---
+mkdir -p "$TMP/home/.local/bin" "$TMP/config"
+printf 'original user command\n' > "$TMP/home/.local/bin/pod.pre-agent-pods"
+ln -s "$TMP/deleted-checkout/bin/pod" "$TMP/home/.local/bin/pod"
+if HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/config" \
+   "$REPO/install.sh" --no-claude-hooks --no-codex-hooks --no-logins \
+   >"$TMP/install.out" 2>"$TMP/install.err"; then
+  target="$(readlink "$TMP/home/.local/bin/pod" 2>/dev/null || true)"
+  [ "$target" = "$REPO/bin/pod" ] \
+    && ok "dangling prior installer link refreshes after a second relocation" \
+    || bad "dangling prior installer link was not refreshed (target=$target)"
+  grep -Fxq 'original user command' "$TMP/home/.local/bin/pod.pre-agent-pods" \
+    && ok "relocation refresh preserves the original backup" \
+    || bad "relocation refresh changed the preserved original backup"
+else
+  bad "hermetic installer relocation run failed: $(tr '\n' ' ' < "$TMP/install.err")"
+fi
 [ "$(decide pod)" = chmod ]           && ok "pod -> chmod"           || bad "pod wrongly skipped"
 
 if [ "$fails" -gt 0 ]; then note "$fails failure(s)"; exit 1; fi

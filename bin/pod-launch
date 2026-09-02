@@ -134,10 +134,22 @@ fi
 # The kill-session is deliberately BARE (no -t): it resolves the session from the
 # pane's own $TMUX at exit time, so it still kills the right pod after a RENAME —
 # a baked-in "-t =$S" targets the launch-time name and leaves a zombie session.
-"$T" new-session -d -s "$S" -n "$MGRNAME" -e "POD_SESSION=$S" \
+new_pod_session() {
+  # A dedicated server may be born from inside an agent tool shell. Do not freeze
+  # those caller-only markers into the server environment: later run-shell handlers
+  # use their absence to distinguish a human strip click from an agent action, and a
+  # stale TMUX_PANE points at an unrelated server-global pane id.
+  if [ "${POD_TMUX_DEDICATED:-0}" = "1" ]; then
+    env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u TMUX -u TMUX_PANE "$T" "$@"
+  else
+    "$T" "$@"
+  fi
+}
+new_pod_session new-session -d -s "$S" -n "$MGRNAME" -e "POD_SESSION=$S" \
   -e "POD_TMP=$POD_TMP" -e "POD_CONFIG_DIR=$POD_CONFIG_DIR" \
   -e "POD_INBOX=$POD_INBOX" -e "POD_COMMS=$POD_COMMS" -e "POD_TMUX=$T" \
   "$MANAGER_CMD; '$T' kill-session"
+unset -f new_pod_session
 
 # Server-level rendering. These are SERVER options (tmux has no session-scoped
 # equivalent), so they are applied only on our OWN server — the dedicated socket
