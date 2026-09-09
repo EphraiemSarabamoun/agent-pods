@@ -227,6 +227,7 @@ def _run_mgr(script: str, args: list[str], check: bool = True) -> dict[str, Any]
     return result
 
 
+# Read persisted JSON, returning the caller default when absent or an explicit error object when unreadable.
 def _read_json(path: Path, default: Any = None) -> Any:
     if not path.exists():
         return default
@@ -236,6 +237,7 @@ def _read_json(path: Path, default: Any = None) -> Any:
         return {"_error": f"invalid JSON at {path}: {e}"}
 
 
+# Flush JSON to a private temporary file, then atomically replace the destination.
 def _write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
@@ -334,6 +336,7 @@ def _ensure_initialized() -> dict[str, Any] | None:
     return None
 
 
+# Convert a UTC start timestamp into elapsed seconds; return None for missing or invalid input.
 def _elapsed_seconds(iso_ts: str | None) -> int | None:
     if not iso_ts:
         return None
@@ -373,6 +376,7 @@ def _load_palette() -> list[tuple[str, str]]:
     return out
 
 
+# Resolve the pod-specific tmux command before falling back to the system command.
 def _tmux_bin() -> str:
     grp = _read_json(TMUX_GROUP_PATH, {}) or {}
     if isinstance(grp, dict) and grp.get("tmux_bin"):
@@ -391,6 +395,7 @@ def _run_tmux(args: list[str]) -> dict[str, Any]:
     return {"stdout": proc.stdout.strip(), "stderr": proc.stderr.strip(), "returncode": proc.returncode}
 
 
+# Find the stamped manager window, falling back to window index zero in the requested session.
 def _manager_window(session: str) -> str:
     stamped = _run_tmux(["show-options", "-t", session, "-qv", "@pod_manager_win"])
     if stamped["stdout"]:
@@ -501,6 +506,7 @@ def _scoped_dispatched_dir() -> Path:
     return DISPATCHED_DIR / _current_pod_component()
 
 
+# Find the first worker matching a supplied identity, optionally restricted to one session.
 def _find_worker(
     window_id: int | None = None,
     tmux_window: str | None = None,
@@ -574,6 +580,7 @@ def _pick_worker_color(session: str, win_id: str) -> tuple[str, str]:
     return palette[base]   # all colors in use (> palette size) -> accept our base slot
 
 
+# Ask the agent adapter for one setting, using the caller default if the query fails.
 def _adapter_field(agent_id: str, key: str, default: str = "") -> str:
     try:
         r = subprocess.run([POD_ADAPTER, "field", agent_id, key],
@@ -585,6 +592,7 @@ def _adapter_field(agent_id: str, key: str, default: str = "") -> str:
     return default
 
 
+# Request the adapter launch card with optional model and effort overrides; return empty on failure.
 def _adapter_card(agent_id: str, model: str = "", effort: str = "") -> str:
     try:
         args = [POD_ADAPTER, "card", agent_id]
@@ -1076,6 +1084,7 @@ def pod_register_worker(
         "started_at": None,
         "registered_at": _now_iso(),
     }
+    # Update the matching worker identity while preserving its assignment, or append a new registration.
     def register(workers: list[dict[str, Any]]) -> dict[str, Any]:
         workers[:] = [w for w in workers if not (
             w.get("tmux_window") == tmux_window and w.get("tmux_session") != session
