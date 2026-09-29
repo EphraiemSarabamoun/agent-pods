@@ -218,6 +218,7 @@ chk "chord C-a , (rename wk)" 'key_bound prefix [,]'
 for m in M-a M-s M-d M-f M-g M-x M-r M-c M-v M-C M-V; do
   chk "chord $m" "key_bound root $m"
 done
+chk "M-a spawns (not FULL AUTO)" 'printf %s "$lk" | grep -qE "bind-key +-T root +M-a +.*newwin"'
 chk "MouseDrag1Status bound" 'printf %s "$lk" | grep -q MouseDrag1Status'
 chk "DoubleClick1StatusLeft (pod rename) bound" 'printf %s "$lk" | grep -q DoubleClick1StatusLeft'
 

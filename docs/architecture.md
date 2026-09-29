@@ -151,7 +151,7 @@ feed) resolve the same paths the launcher did.
 
 Each pod has a **FULL AUTO** switch: the session option `@full_auto` (`1`/`0`), rendered as
 the strip's `⚡ AUTO` / `✋ MAN` pill plus an orange status-left badge tint when on. Flip it
-with the pill, `C-a a`, or `M-a` (all route through `pod-auto`).
+with the pill or `C-a a` (both route through `pod-auto`).
 
 The switch **gates automatic dispatch** in the queue module. In MANUAL mode (`@full_auto`
 unset/`0`) `mgr-pick-next` holds the queue — it still polls completions but won't auto-pick

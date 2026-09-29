@@ -59,7 +59,7 @@ durable mailbox resumes the loop through the manager's next native prompt hook i
 
 ## A human flip to ON resets the pod (the fresh-crew reset)
 
-A **human** flip to ON — the pill, `C-a a`, `M-a`, or `pod-auto on` typed at a terminal —
+A **human** flip to ON — the pill, `C-a a`, or `pod-auto on` typed at a terminal —
 offers to hand the manager a **fresh crew**: it confirms first (a tmux `confirm-before`
 prompt on the flipping client, or a y/N prompt on a TTY), then clears the manager's
 context and every agent seat's context, then delivers a boot brief so the manager greets

@@ -83,7 +83,7 @@ pod-launch mypod        # create-or-attach a pod named "mypod"
 1. **Launch.** `pod-launch` opens a pod named after a random free city (`Rome Pod`); the
    numeric `pod-2`, `pod-3`, … series is the fallback when the city pool runs out. Window 0
    is the manager.
-2. **Spawn workers.** Click `+` (or `C-a +` / `M-d`) to open the agent/model picker; pick
+2. **Spawn workers.** Click `+` (or `C-a +` / `M-a`) to open the agent/model picker; pick
    one and it appears as a new colored tab. Or from any window:
    ```sh
    pod-add-worker --agent claude-code --model opus --effort high
@@ -103,7 +103,7 @@ pod-launch mypod        # create-or-attach a pod named "mypod"
 6. **Watch.** Hit `☰` (or `C-a s` / `M-s`) to dock the **summary pane** on the right edge:
    the roster on top, the live chat feed below. It follows you as you switch windows; click
    into it to scroll and navigate.
-7. **Go autonomous.** Flip `✋ MAN` to `⚡ AUTO` (the pill, `C-a a`, or `M-a`) to let the
+7. **Go autonomous.** Flip `✋ MAN` to `⚡ AUTO` (the pill or `C-a a`) to let the
    manager run the pod on its own — see [docs/autonomy.md](docs/autonomy.md).
 8. **Reward.** Award a `⭐` with the gold-star button (`C-a *` / `M-g`). Stars are
    human-only; the awardee gets a real "gold star!" prompt the next time it's idle.

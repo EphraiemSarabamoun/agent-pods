@@ -1,5 +1,13 @@
 # Changelog
 
+## `M-a` opens the spawn picker
+
+- **`M-a` now spawns an agent; FULL AUTO keeps `C-a a` and the pill.** Adding a
+  worker is the chord you reach for most, and the old `M-a` flipped a switch whose
+  human flip to ON offers to reset the pod, so the two traded places. `M-d` still
+  opens the spawn picker as an alias. `pod-auto install` no longer re-binds `M-a`,
+  so a retrofit cannot quietly undo the remap, and `test/parity-sandbox.sh` pins it.
+
 ## Baked-effort model ids get a real effort axis
 
 - **`[discover].effort_suffixes` collapses Cursor-style baked ids into families.**
