@@ -46,9 +46,9 @@ Hold Meta/Option with the key (no prefix). See Option-as-Meta above.
 
 | Chord | Action |
 | --- | --- |
-| `M-a` | toggle **FULL AUTO** |
+| `M-a` | open the **spawn** picker (`+`) |
 | `M-s` | toggle the docked **summary pane** |
-| `M-d` | open the **spawn** picker (`+`) |
+| `M-d` | same as `M-a` (older alias) |
 | `M-f` | open the **settings** slot editor (`⚙`) |
 | `M-g` / `M-*` | open the gold-**star** picker |
 | `M-x` | terminate the **focused** worker |

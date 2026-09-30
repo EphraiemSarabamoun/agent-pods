@@ -170,7 +170,7 @@ paused_task_for_pod() {
 # A flip is HUMAN unless it came from inside an agent's own tool shell. Two
 # signals, the same pair pod-star's human-only gate trusts: CLAUDECODE (set in
 # every shell Claude Code runs) and the calling pane's detected @agent_id. The
-# tmux server's run-shell context (the pill, C-a a, M-a) carries neither, so
+# tmux server's run-shell context (the pill, C-a a) carries neither, so
 # clicks and key bindings read as human. Fail-SAFE by construction: a misread
 # signal costs a skipped reset, never a manager clearing itself mid-loop.
 human_flip() {
@@ -315,7 +315,6 @@ case "$ACTION" in
     "$T" set -t "$POD" status-right-length "$POD_STRIP_RIGHT_LEN"
     # server-global like the launcher's chord block; rebinding is idempotent
     "$T" bind-key    a   run-shell -b "$POD_BIN/pod-status-action fullauto '#{session_name}' '#{client_name}'"
-    "$T" bind-key -n M-a run-shell -b "$POD_BIN/pod-status-action fullauto '#{session_name}' '#{client_name}'"
     refresh_pod_clients
     echo "installed the full-auto pill on pod '$POD' (mode: $(mgr_pod_auto_state "$POD"))"
     exit 0 ;;

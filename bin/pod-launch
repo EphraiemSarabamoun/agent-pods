@@ -230,13 +230,12 @@ fi
 # pushes the new name into the worker registry's `label`. -b so stdout can't pop an overlay.
 "$T" bind-key -n DoubleClick1Status command-prompt -p "rename worker:" -I "#{window_name}" "rename-window -- '%%'"
 "$T" set-hook -g window-renamed "run-shell -b \"'$POD_BIN/pod-sync-label' '#{window_id}' '#{window_name}'\""
-# FULL AUTO switch: prefix chord C-a a, or the one-beat M-a. Both route through
-# pod-status-action (same code path as the ⚡/✋ pill click). -b so the handler's
+# FULL AUTO switch: prefix chord C-a a (no one-beat chord; M-a spawns, below). Routes
+# through pod-status-action (same code path as the ⚡/✋ pill click). -b so the handler's
 # stdout can't pop a copy-mode overlay; pod-status-action also redirects it.
 # Server-global (like send-prefix above); #{session_name} scopes the flip to the pod
 # the keypress came from, so it's multi-pod safe.
 "$T" bind-key    a   run-shell -b "'$POD_BIN/pod-status-action' fullauto '#{session_name}' '#{client_name}'"
-"$T" bind-key -n M-a run-shell -b "'$POD_BIN/pod-status-action' fullauto '#{session_name}' '#{client_name}'"
 # Gold star picker: prefix chord C-a *, or one-beat M-g / M-* (human-only; pod-star
 # refuses agent callers). The picker is keyed by tab index, so C-a * <digit> works.
 "$T" bind-key    '*'   run-shell -b "'$POD_BIN/pod-status-action' star '#{session_name}' '#{client_name}'"
@@ -245,10 +244,11 @@ fi
 # The rest of the button chords: prefix C-a <key> + one-beat M-<key>, all routed
 # through pod-status-action (the same backend as the mouse buttons — ONE code path per
 # action). s = ☰ summary (shadows tmux's prefix-s session chooser; choose-tree is on
-# prefix-w) · + / d = spawn agent · g / f = ⚙ settings · X / x = kill focused.
+# prefix-w) · + / a (M-d alias) = spawn agent · g / f = ⚙ settings · X / x = kill focused.
 "$T" bind-key    s   run-shell -b "'$POD_BIN/pod-status-action' summary  '#{session_name}' '#{client_name}'"
 "$T" bind-key -n M-s run-shell -b "'$POD_BIN/pod-status-action' summary  '#{session_name}' '#{client_name}'"
 "$T" bind-key    +   run-shell -b "'$POD_BIN/pod-status-action' newwin   '#{session_name}' '#{client_name}'"
+"$T" bind-key -n M-a run-shell -b "'$POD_BIN/pod-status-action' newwin   '#{session_name}' '#{client_name}'"
 "$T" bind-key -n M-d run-shell -b "'$POD_BIN/pod-status-action' newwin   '#{session_name}' '#{client_name}'"
 "$T" bind-key    g   run-shell -b "'$POD_BIN/pod-status-action' settings '#{session_name}' '#{client_name}'"
 "$T" bind-key -n M-f run-shell -b "'$POD_BIN/pod-status-action' settings '#{session_name}' '#{client_name}'"

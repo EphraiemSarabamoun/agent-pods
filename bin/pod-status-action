@@ -44,7 +44,7 @@ case "$range" in
     # (the "+"/pod-spawn-menu-build lesson); forcing -c makes display-menu return 1.
     exec "$POD_BIN/pod-star-menu" "${2:-}" "$client" ;;
   fullauto)
-    # the ⚡/✋ pill (or C-a a / M-a) flips this pod's FULL AUTO switch. Suppress all
+    # the ⚡/✋ pill (or C-a a) flips this pod's FULL AUTO switch. Suppress all
     # output: pod-auto echoes for CLI callers, and ANY stdout from a backgrounded
     # run-shell pops a copy-mode overlay (even with -b). The flash + strip redraw are
     # the user-visible feedback, not stdout.
